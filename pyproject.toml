@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "grizzly"
+version = "0.1.0"
+description = "Fast schema/column/type detection for arbitrary Python data, powered by Rust."
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "MIT" }
+authors = [{ name = "Grizzly Contributors" }]
+keywords = ["schema", "dtype", "inference", "pyo3", "rust"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Rust",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+numpy = ["numpy>=2.0"]
+pandas = ["pandas>=2.2"]
+pyarrow = ["pyarrow>=15.0"]
+all = ["numpy>=2.0", "pandas>=2.2", "pyarrow>=15.0"]
+
+[tool.maturin]
+module-name = "grizzly._grizzly"
+python-source = "src"
+features = ["pyo3/extension-module"]
+
+

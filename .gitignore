@@ -1,0 +1,31 @@
+### Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.pytest_cache/
+
+### Rust
+target/
+
+### Native build artifacts (maturin / pyo3)
+*.so
+*.dylib
+*.dll
+
+### Packaging
+dist/
+build/
+*.whl
+
+### Local data / playground (kept out of git)
+*.csv
+*.csv.gz
+playground/
+
+### OS / IDE
+.DS_Store
+.vscode/
+.idea/
