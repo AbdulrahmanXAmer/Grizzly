@@ -3,6 +3,7 @@
   <p><strong>Rust-powered data profiling and schema inference for Python.</strong></p>
   <p>
     <a href="#quickstart">Quickstart</a> ·
+    <a href="#ml-regression-workflows">ML</a> ·
     <a href="#performance-local-benchmark-results">Performance</a> ·
     <a href="#generate-synthetic-csvs-quick--repeatable">Synthetic data</a> ·
     <a href="#troubleshooting">Troubleshooting</a>
@@ -134,6 +135,79 @@ g = grizzly.Grizzly("playground/large_100k.csv.gz", sample_size=1_000_000)
 res = g.fit_linear_regression(target="col_9", train_frac=0.8, seed=0, ridge_lambda=0.0)
 print(res["r2"], len(res["coef"]), res["intercept"])
 ```
+
+### ML: regression workflows
+
+Grizzly currently focuses on **fast linear models** with a pragmatic API:
+
+- **Rust-native**: train directly from CSV/CSV.GZ without NumPy (`csv_linear_regression` / `Grizzly.fit_linear_regression`)
+- **NumPy-based**: bring data into arrays and use lightweight sklearn-style models (`grizzly.ml`)
+
+#### Rust-native regression (no NumPy)
+
+Use this when you want the fastest path from a CSV file to a baseline model:
+
+```python
+import grizzly
+
+g = grizzly.Grizzly("data.csv.gz", sample_size=1_000_000, fast_csv=True)
+
+# Optional: restrict to a subset of columns (like a projection)
+g = g.select(["col_0", "col_3", "col_9"])
+
+res = g.fit_linear_regression(
+    target="col_9",
+    features=["col_0", "col_3"],   # optional; default = all except target (and respects select())
+    train_frac=0.8,
+    seed=0,
+    shuffle=True,
+    ridge_lambda=0.0,
+    return_debug=False,
+)
+
+print("r2:", res["r2"])
+print("coef_len:", len(res["coef"]), "intercept:", res["intercept"])
+print("train_n:", res["train_n"], "test_n:", res["test_n"])
+```
+
+**What you get back**
+
+- `r2`: test-set \(R^2\)
+- `coef`: list of feature coefficients (same order as `features`)
+- `intercept`: float
+- `train_n`, `test_n`: row counts actually used for scoring (rows with parse failures are skipped)
+
+If you pass `return_debug=True`, the result also includes:
+
+- `test_n_assigned`: how many rows were assigned to test before skipping parse failures
+- `ss_res`, `ss_tot`, `y_mean_test`: debug stats for the \(R^2\) calculation
+
+**Notes / gotchas**
+
+- **`sample_size` matters**: the model is trained on up to `sample_size` rows.
+- **`fast_csv=True`** is faster but assumes “simple” CSVs (no quoted newlines). Use `fast_csv=False` for maximum CSV correctness.
+- **Numeric-only**: non-numeric cells in numeric columns can cause a row to be skipped for training/scoring.
+
+#### NumPy regression (arrays + lightweight models)
+
+If you want to do preprocessing or compare with array-based baselines, convert to NumPy first:
+
+```python
+import grizzly
+
+g = grizzly.Grizzly("data.csv.gz", sample_size=200_000, fast_csv=True)
+X, y = g.to_numpy(sampled=True, dtype="float32", target="col_9")
+
+from grizzly.ml import LinearRegression, RidgeRegression
+
+lr = LinearRegression().fit(X, y)
+print("lr r2:", lr.score(X, y))
+
+ridge = RidgeRegression(alpha=1.0).fit(X, y)
+print("ridge r2:", ridge.score(X, y))
+```
+
+If you do scaling, prefer **train-only** scaling in NumPy to avoid leakage. `csv_transform_minmax` is great for speed demos and pipelines, but it scales using min/max derived from the sampled profile (not a strict train-only fit).
 
 ### Performance knobs (important)
 
