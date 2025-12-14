@@ -1,66 +1,155 @@
 <div align="center">
-  <h2>Grizzly</h2>
-  <p><strong>Rust-powered data profiling and schema inference for Python.</strong></p>
-  <p>
-    <a href="#quickstart">Quickstart</a> ·
-    <a href="#ml-regression-workflows">ML</a> ·
-    <a href="#performance-local-benchmark-results">Performance</a> ·
-    <a href="#generate-synthetic-csvs-quick--repeatable">Synthetic data</a> ·
-    <a href="#troubleshooting">Troubleshooting</a>
-  </p>
+
+# Grizzly
+
+<p align="center">
+  <strong>Rust-powered data profiling and schema inference for Python</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust">
+  <img src="https://img.shields.io/badge/Python-3.14+-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/PyO3-FFD43B?style=for-the-badge&logo=python&logoColor=black" alt="PyO3">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Transform-4.55x_faster-success?style=flat-square" alt="Transform Speed">
+  <img src="https://img.shields.io/badge/Profile-1.96x_faster-blue?style=flat-square" alt="Profile Speed">
+  <img src="https://img.shields.io/badge/No_NumPy-Required-orange?style=flat-square" alt="No NumPy">
+  <img src="https://img.shields.io/badge/Native_ML-Linear_Regression-purple?style=flat-square" alt="Native ML">
+</p>
+
+---
+
+<p align="center">
+  <a href="#-quickstart">Quickstart</a> •
+  <a href="#-features">Features</a> •
+  <a href="#-performance">Performance</a> •
+  <a href="#-ml-workflows">ML Workflows</a> •
+  <a href="#-api-reference">API</a>
+</p>
+
 </div>
 
-<hr />
+---
 
-Grizzly is a Python package with a Rust (PyO3) core for:
+## Overview
 
-- **Schema / column detection** from arbitrary Python data (nested dicts/lists/iterables)
-- **CSV/CSV.GZ profiling** (delimiter/header sniffing, dtypes, missingness, numeric stats, percentiles, simple outliers)
-- **Fast CSV transforms** (min-max scaling)
-- **Rust-native linear regression from CSV** (no NumPy required)
+Grizzly is a Python package with a **Rust (PyO3) core** for high-performance data operations:
+
+<table>
+<tr>
+<td width="50%">
+
+### What It Does
+
+- Schema/column detection from any Python data
+- CSV/CSV.GZ profiling with stats & percentiles
+- Fast min-max scaling transforms
+- Rust-native linear regression (no NumPy!)
+
+</td>
+<td width="50%">
+
+### Why It's Fast
+
+- Rust core via PyO3 bindings
+- Sampling-first design
+- Parallel chunked CSV processing
+- Zero-copy where possible
+
+</td>
+</tr>
+</table>
+
+---
+
+## Features
+
+<table>
+<tr>
+<td align="center" width="25%">
+<br>
+<strong>Schema Inference</strong>
+<br><br>
+<sub>Detect types from nested dicts, lists, iterables</sub>
+</td>
+<td align="center" width="25%">
+<br>
+<strong>CSV Profiling</strong>
+<br><br>
+<sub>Stats, percentiles, outliers, missing data</sub>
+</td>
+<td align="center" width="25%">
+<br>
+<strong>Fast Transforms</strong>
+<br><br>
+<sub>Min-max scaling 4.5x faster than Pandas</sub>
+</td>
+<td align="center" width="25%">
+<br>
+<strong>Native ML</strong>
+<br><br>
+<sub>Linear regression without NumPy</sub>
+</td>
+</tr>
+</table>
 
 <details>
-  <summary><strong>Path notation (schema inference)</strong></summary>
-  <br />
-  <ul>
-    <li>Dict keys join with <code>.</code>: <code>user.name</code></li>
-    <li>Arrays add <code>[]</code>: <code>items[].id</code>, <code>matrix[][].value</code></li>
-  </ul>
+<summary><strong>Path Notation (Schema Inference)</strong></summary>
+<br>
+
+| Pattern | Example | Description |
+|---------|---------|-------------|
+| Dict keys | `user.name` | Keys joined with `.` |
+| Arrays | `items[].id` | Arrays add `[]` |
+| Nested | `matrix[][].value` | Multi-dimensional |
+
 </details>
+
+---
+
+## Quickstart
 
 ### Requirements
 
-- **Python**: `>=3.14` (see `pyproject.toml`)
-- **Rust** toolchain (for the native extension): `rustup` recommended
+```
+Python >= 3.14
+Rust toolchain (rustup recommended)
+```
 
-### Install (dev build)
-
-From the `grizzly/` directory:
+### Installation
 
 ```bash
+# Clone and setup
+cd grizzly
 python3.14 -m venv .venv
 source .venv/bin/activate
 
-python -m pip install -U pip
-python -m pip install maturin pytest
+# Install build tools
+python -m pip install -U pip maturin pytest
 
-# Build + install the native extension into the active venv
+# Build native extension
 maturin develop --release
 
-# Quick sanity
+# Verify installation
 python -c "import grizzly; print('native:', grizzly.is_native())"
-pytest -q
 ```
 
-Optional extras (normalization helpers):
+<details>
+<summary><strong>Optional: Install all extras</strong></summary>
 
 ```bash
 python -m pip install ".[all]"
 ```
 
-### Quickstart
+</details>
 
-#### 1) Schema inference (any Python data)
+---
+
+## API Reference
+
+### 1. Schema Inference
 
 ```python
 import grizzly
@@ -75,39 +164,37 @@ cols = grizzly.detect_columns(data)
 grizzly.info(data, show_examples=True)
 ```
 
-Grizzly can also normalize common DS inputs (pandas/numpy/pyarrow/CSV paths) into sampled Python-native records:
+<details>
+<summary><strong>Normalize various data sources</strong></summary>
 
 ```python
 import grizzly
 
+# Works with pandas, numpy, pyarrow, CSV paths
 records = grizzly.normalize("data.parquet", sample_size=1000)
 schema = grizzly.detect_schema(records)
 ```
 
-#### 2) CSV profiling / EDA (Rust)
+</details>
+
+### 2. CSV Profiling / EDA
 
 ```python
 import grizzly
 
-g = grizzly.Grizzly("playground/diabetes_data_raw.csv.gz", sample_size=100_000)
+g = grizzly.Grizzly("data.csv.gz", sample_size=100_000)
 
-# Full profile (types + examples + mode) OR lite profile (numeric stats only)
+# Full profile (types + examples + mode)
 prof = g.csv_profile(lite=False)
-rep = g.eda(lite=True, return_json=True)  # fast report dict
 
+# Fast EDA report
+rep = g.eda(lite=True, return_json=True)
 print(rep["dataset"])
 print(rep["missing"][:3])
 print(rep["numeric"][:1])
 ```
 
-#### 3) Column naming (header vs no header)
-
-- If the file **has a header**, column names come from that header.
-- If the file **does not have a header**, Grizzly uses synthetic names: **`col_0 ... col_{n-1}`**.
-
-This is why your whitespace datasets benchmark with targets like `col_9`.
-
-#### 4) Min-max scaling (transform to a new CSV)
+### 3. Min-Max Scaling
 
 ```python
 import grizzly
@@ -117,7 +204,8 @@ scaler = g.fit_minmax()
 scaler.transform("data_scaled.csv")
 ```
 
-You can also call the lower-level functions:
+<details>
+<summary><strong>Lower-level API</strong></summary>
 
 ```python
 import grizzly
@@ -126,38 +214,65 @@ params = grizzly.csv_minmax_params("data.csv.gz", sample_size=100_000)["params"]
 grizzly.csv_transform_minmax("data.csv.gz", "data_scaled.csv", params, delimiter=None)
 ```
 
-#### 5) Train a model (Rust-native linear regression from CSV)
+</details>
+
+### 4. Linear Regression (Rust-Native)
 
 ```python
 import grizzly
 
-g = grizzly.Grizzly("playground/large_100k.csv.gz", sample_size=1_000_000)
-res = g.fit_linear_regression(target="col_9", train_frac=0.8, seed=0, ridge_lambda=0.0)
-print(res["r2"], len(res["coef"]), res["intercept"])
+g = grizzly.Grizzly("data.csv.gz", sample_size=1_000_000)
+res = g.fit_linear_regression(target="col_9", train_frac=0.8, seed=0)
+
+print(f"R²: {res['r2']}")
+print(f"Coefficients: {len(res['coef'])}")
+print(f"Intercept: {res['intercept']}")
 ```
 
-### ML: regression workflows
+---
 
-Grizzly currently focuses on **fast linear models** with a pragmatic API:
+## ML Workflows
 
-- **Rust-native**: train directly from CSV/CSV.GZ without NumPy (`csv_linear_regression` / `Grizzly.fit_linear_regression`)
-- **NumPy-based**: bring data into arrays and use lightweight sklearn-style models (`grizzly.ml`)
+Grizzly focuses on **fast linear models** with a pragmatic API:
 
-#### Rust-native regression (no NumPy)
+<table>
+<tr>
+<th width="50%">Rust-Native (No NumPy)</th>
+<th width="50%">NumPy-Based</th>
+</tr>
+<tr>
+<td>
 
-Use this when you want the fastest path from a CSV file to a baseline model:
+Train directly from CSV/CSV.GZ
+- Fastest path to baseline model
+- No array conversion overhead
+- Built-in train/test split
+
+</td>
+<td>
+
+Convert to arrays first
+- Sklearn-style API
+- More preprocessing options
+- Ridge regression included
+
+</td>
+</tr>
+</table>
+
+### Rust-Native Regression
 
 ```python
 import grizzly
 
 g = grizzly.Grizzly("data.csv.gz", sample_size=1_000_000, fast_csv=True)
 
-# Optional: restrict to a subset of columns (like a projection)
+# Optional: select specific columns
 g = g.select(["col_0", "col_3", "col_9"])
 
 res = g.fit_linear_regression(
     target="col_9",
-    features=["col_0", "col_3"],   # optional; default = all except target (and respects select())
+    features=["col_0", "col_3"],  # default: all except target
     train_frac=0.8,
     seed=0,
     shuffle=True,
@@ -165,210 +280,151 @@ res = g.fit_linear_regression(
     return_debug=False,
 )
 
-print("r2:", res["r2"])
-print("coef_len:", len(res["coef"]), "intercept:", res["intercept"])
-print("train_n:", res["train_n"], "test_n:", res["test_n"])
+print(f"R²: {res['r2']:.4f}")
+print(f"Train: {res['train_n']}, Test: {res['test_n']}")
 ```
 
-**What you get back**
+<details>
+<summary><strong>Return Values</strong></summary>
 
-- `r2`: test-set \(R^2\)
-- `coef`: list of feature coefficients (same order as `features`)
-- `intercept`: float
-- `train_n`, `test_n`: row counts actually used for scoring (rows with parse failures are skipped)
+| Key | Type | Description |
+|-----|------|-------------|
+| `r2` | float | Test-set R² |
+| `coef` | list | Feature coefficients |
+| `intercept` | float | Model intercept |
+| `train_n` | int | Training rows used |
+| `test_n` | int | Test rows used |
 
-If you pass `return_debug=True`, the result also includes:
+With `return_debug=True`:
+- `test_n_assigned`, `ss_res`, `ss_tot`, `y_mean_test`
 
-- `test_n_assigned`: how many rows were assigned to test before skipping parse failures
-- `ss_res`, `ss_tot`, `y_mean_test`: debug stats for the \(R^2\) calculation
+</details>
 
-**Notes / gotchas**
-
-- **`sample_size` matters**: the model is trained on up to `sample_size` rows.
-- **`fast_csv=True`** is faster but assumes “simple” CSVs (no quoted newlines). Use `fast_csv=False` for maximum CSV correctness.
-- **Numeric-only**: non-numeric cells in numeric columns can cause a row to be skipped for training/scoring.
-
-#### NumPy regression (arrays + lightweight models)
-
-If you want to do preprocessing or compare with array-based baselines, convert to NumPy first:
+### NumPy Regression
 
 ```python
 import grizzly
+from grizzly.ml import LinearRegression, RidgeRegression
 
 g = grizzly.Grizzly("data.csv.gz", sample_size=200_000, fast_csv=True)
 X, y = g.to_numpy(sampled=True, dtype="float32", target="col_9")
 
-from grizzly.ml import LinearRegression, RidgeRegression
-
 lr = LinearRegression().fit(X, y)
-print("lr r2:", lr.score(X, y))
+print(f"LR R²: {lr.score(X, y):.4f}")
 
 ridge = RidgeRegression(alpha=1.0).fit(X, y)
-print("ridge r2:", ridge.score(X, y))
+print(f"Ridge R²: {ridge.score(X, y):.4f}")
 ```
 
-If you do scaling, prefer **train-only** scaling in NumPy to avoid leakage. `csv_transform_minmax` is great for speed demos and pipelines, but it scales using min/max derived from the sampled profile (not a strict train-only fit).
+---
 
-### Performance knobs (important)
+## Performance
 
-- **`sample_size`**: Grizzly is sampling-first by design. Many operations stop after `sample_size` rows.
-- **`fast_csv`**:
-  - `fast_csv=True` is faster (parallel chunking) but assumes CSV is “simple”.
-  - If you need maximum correctness (e.g., tricky quoting / quoted newlines), use **`fast_csv=False`**.
+<div align="center">
 
-### Performance (local benchmark results)
+### Benchmark Summary
 
-Below are real-world numbers from a local benchmark run (not a shipped benchmark harness).
+| Metric | vs Pandas | vs Polars |
+|:------:|:---------:|:---------:|
+| **Transform** | **4.55x faster** | **1.30x faster** |
+| **Profile** | **1.96x faster** | 1.87x slower |
+| **Total** | **3.18x faster** | 1.12x slower |
 
-- **Metric**: median of **5 runs**
-- **Sample size**: **1,000,000** rows (profiling/transform are sampling-first)
-- **Mode**: full (type inference + examples + frequency tracking)
-- **Workloads**:
-  - **Profile**: read + compute stats
-  - **Transform**: read + min-max scale + write
-  - **Total**: end-to-end (profile + transform)
+<sub>500K rows, 32 MB dataset, median of 5 runs</sub>
 
-#### 100k rows (6.41 MB) 
+</div>
 
-<table>
-  <thead>
-    <tr>
-      <th align="left">Workload</th>
-      <th align="right">Pandas (ms)</th>
-      <th align="right">Polars (ms)</th>
-      <th align="right">Grizzly (ms)</th>
-      <th align="right">Grizzly vs Pandas</th>
-      <th align="right">Grizzly vs Polars</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><strong>Profile</strong></td>
-      <td align="right">134.03</td>
-      <td align="right">41.39</td>
-      <td align="right"><strong>81.00</strong></td>
-      <td align="right">1.65× faster</td>
-      <td align="right">1.96× slower</td>
-    </tr>
-    <tr>
-      <td><strong>Transform</strong></td>
-      <td align="right">301.22</td>
-      <td align="right">91.22</td>
-      <td align="right"><strong>69.92</strong></td>
-      <td align="right">4.31× faster</td>
-      <td align="right">1.30× faster</td>
-    </tr>
-    <tr>
-      <td><strong>Total</strong></td>
-      <td align="right">435.25</td>
-      <td align="right">132.62</td>
-      <td align="right"><strong>150.92</strong></td>
-      <td align="right">2.88× faster</td>
-      <td align="right">1.14× slower</td>
-    </tr>
-  </tbody>
-</table>
+<details>
+<summary><strong>100K Rows (6.41 MB)</strong></summary>
+<br>
 
-#### Small demo (0.01 MB) 
+| Workload | Pandas (ms) | Polars (ms) | Grizzly (ms) | vs Pandas | vs Polars |
+|----------|------------:|------------:|-------------:|----------:|----------:|
+| **Profile** | 134.03 | 41.39 | **81.00** | 1.65x faster | 1.96x slower |
+| **Transform** | 301.22 | 91.22 | **69.92** | 4.31x faster | 1.30x faster |
+| **Total** | 435.25 | 132.62 | **150.92** | 2.88x faster | 1.14x slower |
+
+</details>
+
+<details>
+<summary><strong>500K Rows (32.02 MB)</strong></summary>
+<br>
+
+| Workload | Pandas (ms) | Polars (ms) | Grizzly (ms) | vs Pandas | vs Polars |
+|----------|------------:|------------:|-------------:|----------:|----------:|
+| **Profile** | 784.30 | 213.53 | **399.30** | 1.96x faster | 1.87x slower |
+| **Transform** | 1605.27 | 456.70 | **352.62** | 4.55x faster | 1.30x faster |
+| **Total** | 2389.57 | 670.23 | **751.92** | 3.18x faster | 1.12x slower |
+
+</details>
+
+<details>
+<summary><strong>Small Demo (0.01 MB)</strong></summary>
+<br>
+
+| Workload | Pandas (ms) | Polars (ms) | Grizzly (ms) | vs Pandas | vs Polars |
+|----------|------------:|------------:|-------------:|----------:|----------:|
+| **Profile** | 0.82 | 0.35 | **0.46** | 1.77x faster | 1.32x slower |
+| **Transform** | 0.99 | 0.53 | **0.27** | 3.73x faster | 1.99x faster |
+| **Total** | 1.82 | 0.88 | **0.73** | 2.48x faster | 1.21x faster |
+
+</details>
+
+> **Takeaway**: Grizzly consistently beats Pandas end-to-end. Transform operations are competitive with (often faster than) Polars. Full profiling is where Polars leads on larger inputs.
+
+---
+
+## Performance Knobs
 
 <table>
-  <thead>
-    <tr>
-      <th align="left">Workload</th>
-      <th align="right">Pandas (ms)</th>
-      <th align="right">Polars (ms)</th>
-      <th align="right">Grizzly (ms)</th>
-      <th align="right">Grizzly vs Pandas</th>
-      <th align="right">Grizzly vs Polars</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><strong>Profile</strong></td>
-      <td align="right">0.82</td>
-      <td align="right">0.35</td>
-      <td align="right"><strong>0.46</strong></td>
-      <td align="right">1.77× faster</td>
-      <td align="right">1.32× slower</td>
-    </tr>
-    <tr>
-      <td><strong>Transform</strong></td>
-      <td align="right">0.99</td>
-      <td align="right">0.53</td>
-      <td align="right"><strong>0.27</strong></td>
-      <td align="right">3.73× faster</td>
-      <td align="right">1.99× faster</td>
-    </tr>
-    <tr>
-      <td><strong>Total</strong></td>
-      <td align="right">1.82</td>
-      <td align="right">0.88</td>
-      <td align="right"><strong>0.73</strong></td>
-      <td align="right">2.48× faster</td>
-      <td align="right">1.21× faster</td>
-    </tr>
-  </tbody>
+<tr>
+<td width="50%">
+
+### `sample_size`
+
+Grizzly is **sampling-first** by design. Many operations stop after `sample_size` rows.
+
+```python
+g = grizzly.Grizzly("big.csv", sample_size=100_000)
+```
+
+</td>
+<td width="50%">
+
+### `fast_csv`
+
+| Mode | Speed | Compatibility |
+|------|-------|---------------|
+| `True` | Faster (parallel) | Simple CSVs |
+| `False` | Slower | Quoted newlines, tricky CSVs |
+
+</td>
+</tr>
 </table>
 
-#### 500k rows (32.02 MB) 
+---
 
-<table>
-  <thead>
-    <tr>
-      <th align="left">Workload</th>
-      <th align="right">Pandas (ms)</th>
-      <th align="right">Polars (ms)</th>
-      <th align="right">Grizzly (ms)</th>
-      <th align="right">Grizzly vs Pandas</th>
-      <th align="right">Grizzly vs Polars</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><strong>Profile</strong></td>
-      <td align="right">784.30</td>
-      <td align="right">213.53</td>
-      <td align="right"><strong>399.30</strong></td>
-      <td align="right">1.96× faster</td>
-      <td align="right">1.87× slower</td>
-    </tr>
-    <tr>
-      <td><strong>Transform</strong></td>
-      <td align="right">1605.27</td>
-      <td align="right">456.70</td>
-      <td align="right"><strong>352.62</strong></td>
-      <td align="right">4.55× faster</td>
-      <td align="right">1.30× faster</td>
-    </tr>
-    <tr>
-      <td><strong>Total</strong></td>
-      <td align="right">2389.57</td>
-      <td align="right">670.23</td>
-      <td align="right"><strong>751.92</strong></td>
-      <td align="right">3.18× faster</td>
-      <td align="right">1.12× slower</td>
-    </tr>
-  </tbody>
-</table>
+## Column Naming
 
-**Takeaway**: Grizzly is consistently faster than pandas end-to-end here, and the min-max transform is competitive with (and often faster than) Polars, while the full-profile workload is where Polars still leads on larger inputs.
+| File Type | Column Names |
+|-----------|--------------|
+| **With header** | From header row |
+| **No header** | `col_0`, `col_1`, ... `col_{n-1}` |
 
-### Generate synthetic CSVs (quick + repeatable)
+This is why headerless datasets use targets like `col_9`.
 
-If you want fast, repeatable datasets for local testing, use this snippet.
-It can generate:
+---
 
-- **Delimited CSV** (comma/tab/etc.) optionally with a header
-- **Whitespace-separated headerless** files (Grizzly will name columns `col_0..col_{n-1}`)
-- **`.csv` or `.csv.gz`**
+## Generate Synthetic Data
+
+<details>
+<summary><strong>Synthetic CSV Generator</strong></summary>
 
 ```python
 from __future__ import annotations
-
 import gzip
 import random
 from pathlib import Path
-
 
 def make_regression_csv(
     out_path: str | Path,
@@ -376,29 +432,21 @@ def make_regression_csv(
     n_rows: int = 100_000,
     n_features: int = 20,
     seed: int = 0,
-    delimiter: str = "whitespace",  # "whitespace" or "," or "\t" ...
+    delimiter: str = "whitespace",
     header: bool = False,
     noise: float = 0.1,
 ) -> Path:
-    """
-    Create a synthetic regression dataset with columns:
-      - features: col_0..col_{n_features-1}
-      - target:   col_{n_features}
-    """
+    """Create synthetic regression dataset."""
     rng = random.Random(seed)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Fixed underlying linear model
     w = [rng.uniform(-2.0, 2.0) for _ in range(n_features)]
     b = rng.uniform(-1.0, 1.0)
-
     cols = [f"col_{i}" for i in range(n_features + 1)]
-    # Target column name is always the last one:
-    #   target = f"col_{n_features}"
 
     opener = gzip.open if out_path.suffix == ".gz" else open
-    with opener(out_path, "wt", newline="") as f:  # type: ignore[arg-type]
+    with opener(out_path, "wt", newline="") as f:
         if delimiter == "whitespace":
             if header:
                 f.write(" ".join(cols) + "\n")
@@ -416,57 +464,80 @@ def make_regression_csv(
 
     return out_path
 
-
-if __name__ == "__main__":
-    p = make_regression_csv("data/synth_100k.csv.gz", n_rows=100_000, n_features=20, delimiter="whitespace", header=False)
-    print("wrote:", p)
-    print("target:", "col_20")
+# Usage
+p = make_regression_csv("data/synth_100k.csv.gz", n_rows=100_000, n_features=20)
+print(f"wrote: {p}, target: col_20")
 ```
 
-### Pipe generated CSVs into Grizzly (profile + EDA + train)
+</details>
 
-This is the simplest “end-to-end” local flow:
+<details>
+<summary><strong>End-to-End Example</strong></summary>
 
 ```python
 import grizzly
 
 path = "data/synth_100k.csv.gz"
-
 g = grizzly.Grizzly(path, sample_size=1_000_000, fast_csv=True)
 
-# Quick EDA snapshot (JSON)
+# Quick EDA
 rep = g.eda(lite=True, return_json=True)
 print(rep["dataset"])
 print("top missing:", rep["missing"][:3])
 
-# Train rust-native linear regression directly from the CSV (no numpy)
-res = g.fit_linear_regression(target="col_20", train_frac=0.8, seed=0, ridge_lambda=0.0)
-print("r2:", res["r2"], "coef_len:", len(res["coef"]))
+# Train model directly from CSV
+res = g.fit_linear_regression(target="col_20", train_frac=0.8, seed=0)
+print(f"R²: {res['r2']:.4f}, coefficients: {len(res['coef'])}")
 ```
 
-If you generated a **headerless whitespace** file, use `col_0..col_{n-1}` names as shown above.
+</details>
 
-### Tip: always run with the venv interpreter
+---
 
-If you ever see `ModuleNotFoundError: No module named 'grizzly'`, you’re almost certainly running with the
-system Python instead of the venv.
+## Troubleshooting
 
-Prefer these forms (they avoid any shell activation issues):
+<details>
+<summary><strong>"native: False" or extension not loaded</strong></summary>
+
+1. Ensure Python 3.14: `python --version`
+2. Rebuild: `maturin develop --release`
+3. Verify: `python -c "import grizzly; print(grizzly.is_native())"`
+
+</details>
+
+<details>
+<summary><strong>KeyError / "target not found" for headerless CSVs</strong></summary>
+
+Use synthetic column names: `col_0`, `col_1`, ... `col_{n-1}`
+
+```python
+res = g.fit_linear_regression(target="col_9")  # Not "target" or custom name
+```
+
+</details>
+
+<details>
+<summary><strong>ModuleNotFoundError: No module named 'grizzly'</strong></summary>
+
+You're using system Python instead of venv. Use explicit paths:
 
 ```bash
 .venv/bin/python -c "import grizzly; print(grizzly.is_native())"
 .venv/bin/python your_script.py
 ```
 
-### Troubleshooting
+</details>
 
-- **`native: False` / “native extension not loaded”**:
-  - Ensure you’re on **Python 3.14** (`python --version`)
-  - Rebuild: `maturin develop --release`
-  - Confirm: `python -c "import grizzly; print(grizzly.is_native())"`
+---
 
-- **`KeyError` / “target not found” for headerless CSVs**:
-  - Use `col_0..col_{n-1}` naming (see “Column naming” above).
+<div align="center">
 
-### License
-(see `LICENSE`).
+## License
+
+See `LICENSE` file.
+
+---
+
+<sub>Built with Rust and PyO3</sub>
+
+</div>
