@@ -320,6 +320,36 @@ def test_a_realistic_outlier_still_leaves_the_signal_learnable(tmp_path):
     assert result["coef"][0] == pytest.approx(3.0, rel=0.25)
 
 
+def test_sgd_cache_and_streaming_are_bit_identical(regression_csv):
+    """The epoch cache is a pure speed trade, never a numeric one.
+
+    Epoch 0 fills the cache while streaming; later epochs replay the exact
+    f64s streaming would have recomputed, through the same update function.
+    So a cached fit and a forced-streaming fit (cache_budget_mb=0) must agree
+    on every output bit — not approximately, exactly. Any drift here means the
+    two code paths have diverged.
+    """
+    path, _, _ = regression_csv
+    kwargs = dict(
+        target="target",
+        epochs=8,
+        learning_rate=0.1,
+        l2=0.01,
+        sample_size=FULL_COVERAGE,
+        seed=3,
+    )
+
+    cached = grizzly.csv_sgd_regression(path, cache_budget_mb=512, **kwargs)
+    streamed = grizzly.csv_sgd_regression(path, cache_budget_mb=0, **kwargs)
+
+    assert cached["coef"] == streamed["coef"], "coefficients diverged"
+    assert cached["intercept"] == streamed["intercept"]
+    assert cached["r2"] == streamed["r2"]
+    assert cached["final_train_mse"] == streamed["final_train_mse"]
+    assert cached["train_n"] == streamed["train_n"]
+    assert cached["test_n"] == streamed["test_n"]
+
+
 def test_grad_clip_is_validated(regression_csv):
     path, _, _ = regression_csv
     with pytest.raises(ValueError, match="grad_clip"):

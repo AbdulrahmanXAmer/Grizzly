@@ -539,19 +539,25 @@ fn get_fields_collapses_runs_of_whitespace() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn fast_line_iter_matches_fast_row_iter() {
-    // FastLineIter exists to avoid FastRowIter's per-row Vec allocation, so the
-    // two must agree on what constitutes a row. A divergence would silently
-    // change what the transform writes.
+fn fast_line_iter_rows_survive_blank_lines_and_crlf() {
+    // The regression that motivated FastLineIter: a hand-rolled scan treated a
+    // blank line as end-of-input and silently dropped everything after it.
+    // Every reader now shares this iterator, so this pins the row semantics
+    // directly: blank lines are skipped, CRLF is stripped, iteration reaches
+    // the final unterminated line.
     let data = b"a,b,c\n1,2,3\n\n4,5,6\r\n7,8,9";
 
-    let via_lines: Vec<Vec<&[u8]>> = FastLineIter::new(data)
+    let rows: Vec<Vec<&[u8]>> = FastLineIter::new(data)
         .map(|line| get_fields(line, SplitMode::Delim(b',')))
         .collect();
-    let via_rows: Vec<Vec<&[u8]>> = FastRowIter::new(data, SplitMode::Delim(b',')).collect();
 
-    assert_eq!(via_lines, via_rows);
-    assert_eq!(via_lines.len(), 4, "the blank line should not be a row");
+    let expected: Vec<Vec<&[u8]>> = vec![
+        vec![b"a", b"b", b"c"],
+        vec![b"1", b"2", b"3"],
+        vec![b"4", b"5", b"6"],
+        vec![b"7", b"8", b"9"],
+    ];
+    assert_eq!(rows, expected, "the blank line must not be a row or a wall");
 }
 
 #[test]

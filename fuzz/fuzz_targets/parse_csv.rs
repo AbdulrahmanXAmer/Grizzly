@@ -21,7 +21,8 @@ mod parse;
 
 use parse::{
     detect_header_smart, get_fields, has_alphabetic, is_integer_bytes, maybe_float_bytes,
-    needs_quote_simd, sniff_delimiter_simd, trim_bytes, write_field_csv, FastRowIter, SplitMode,
+    for_each_field, needs_quote_simd, sniff_delimiter_simd, trim_bytes, write_field_csv,
+    FastLineIter, SplitMode,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -33,10 +34,11 @@ fuzz_target!(|data: &[u8]| {
     let _ = has_alphabetic(data);
     let _ = detect_header_smart(data, delim, 8);
 
-    // Row iteration over both split strategies.
+    // Row iteration over both split strategies, through the same
+    // FastLineIter + for_each_field pair every production reader uses.
     for mode in [SplitMode::Delim(delim), SplitMode::Whitespace] {
         let mut rows = 0usize;
-        for fields in FastRowIter::new(data, mode) {
+        for line in FastLineIter::new(data) {
             // Bound the work per input so a pathological case is reported as a
             // timeout rather than running forever inside one execution.
             rows += 1;
@@ -44,7 +46,10 @@ fuzz_target!(|data: &[u8]| {
                 break;
             }
 
-            for field in fields.iter().take(64) {
+            for_each_field(line, mode, |i, field| {
+                if i >= 64 {
+                    return;
+                }
                 let trimmed = trim_bytes(field);
 
                 // Trimming may only ever shrink the slice, and must stay
@@ -60,7 +65,7 @@ fuzz_target!(|data: &[u8]| {
                 // back out to disk; quoting must not panic on any input.
                 let mut out = Vec::new();
                 write_field_csv(&mut out, field, delim);
-            }
+            });
         }
     }
 

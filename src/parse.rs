@@ -319,41 +319,10 @@ pub fn for_each_field<'a, F: FnMut(usize, &'a [u8])>(
     }
 }
 
-/// Fast row iterator - splits on newlines, yields field slices.
-///
-/// Allocates a `Vec` per row, which buys random access by column index. Use it
-/// where that access pattern is needed (selecting a target column, say) and
-/// `FastLineIter` + `for_each_field` where fields are consumed in order.
-///
-/// Defined in terms of `FastLineIter` deliberately. It previously duplicated
-/// the line-scanning logic and got it wrong: an empty line made `next()` return
-/// `None`, which ends iteration rather than skipping the line, so a single
-/// blank line anywhere in a file silently truncated everything after it. On a
-/// 1,000-row file with one stray blank line, regression and SGD trained on 500
-/// rows and reported nothing unusual. Sharing one implementation means the two
-/// cannot disagree about what a row is.
-///
-/// ⚠️ Assumes no quoted newlines (fast-CSV mode only).
-pub struct FastRowIter<'a> {
-    lines: FastLineIter<'a>,
-    split_mode: SplitMode,
-}
-
-impl<'a> FastRowIter<'a> {
-    pub fn new(bytes: &'a [u8], split_mode: SplitMode) -> Self {
-        Self {
-            lines: FastLineIter::new(bytes),
-            split_mode,
-        }
-    }
-}
-
-impl<'a> Iterator for FastRowIter<'a> {
-    type Item = Vec<&'a [u8]>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.lines
-            .next()
-            .map(|line| get_fields(line, self.split_mode))
-    }
-}
+// A `FastRowIter` used to live here, yielding a freshly allocated
+// `Vec<&[u8]>` of fields per row. Every reader has since moved to
+// `FastLineIter` + `for_each_field` (streaming) or a caller-owned scratch
+// buffer (random access), so the per-row allocation — and the type that
+// encouraged it — is gone. It is also the type whose hand-rolled line scan
+// once treated a blank line as end-of-input; `FastLineIter` is the single
+// definition of what a row is now.

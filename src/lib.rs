@@ -1387,6 +1387,53 @@ fn csv_layout(
 /// epochs run, final training MSE).
 type SgdFit = (Vec<String>, Vec<f64>, f64, usize, usize, f64, usize, f64);
 
+/// One SGD update, shared verbatim by the streaming and replay paths.
+///
+/// Kept as a single function so the cached-epoch replay cannot drift from the
+/// streaming arithmetic: identical inputs through identical operations is what
+/// makes the two paths bit-identical, and the tests assert exactly that.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn sgd_step(
+    x: &[f64],
+    y: f64,
+    w: &mut [f64],
+    b: &mut f64,
+    lr: f64,
+    l2: f64,
+    grad_clip: f64,
+    sq_err: &mut f64,
+    seen: &mut usize,
+) {
+    let p = w.len();
+    let mut pred = *b;
+    for j in 0..p {
+        pred += w[j] * x[j];
+    }
+    let err = pred - y;
+    *sq_err += err * err;
+    *seen += 1;
+
+    // Clip the per-sample gradient. Real data has outliers that survive
+    // standardization -- a mis-metered taxi trip of 100,000 miles sits a
+    // thousand standard deviations out -- and a single such row produces a
+    // step large enough to diverge the fit. Clipping bounds any one row's
+    // influence without the caller hand-tuning the learning rate per dataset.
+    // intercept gradient is err * 1, hence the leading 1.0
+    let grad_sq = 1.0 + x.iter().map(|v| v * v).sum::<f64>();
+    let grad_norm = err.abs() * grad_sq.sqrt();
+    let step = if grad_norm > grad_clip && grad_norm > 0.0 {
+        lr * (grad_clip / grad_norm)
+    } else {
+        lr
+    };
+
+    for j in 0..p {
+        w[j] -= step * (err * x[j] + l2 * w[j]);
+    }
+    *b -= step * err;
+}
+
 /// Fit a linear model by stochastic gradient descent, streaming from CSV.
 ///
 /// The closed-form solver in `csv_linear_regression` accumulates an X'X matrix,
@@ -1408,7 +1455,7 @@ type SgdFit = (Vec<String>, Vec<f64>, f64, usize, usize, f64, usize, f64);
 /// first.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (path, target, features=None, epochs=5, learning_rate=0.05, l2=0.0, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, grad_clip=10.0))]
+#[pyo3(signature = (path, target, features=None, epochs=5, learning_rate=0.05, l2=0.0, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, grad_clip=10.0, cache_budget_mb=512))]
 fn csv_sgd_regression(
     py: Python<'_>,
     path: String,
@@ -1424,6 +1471,7 @@ fn csv_sgd_regression(
     has_header: Option<bool>,
     shuffle: bool,
     grad_clip: f64,
+    cache_budget_mb: usize,
 ) -> PyResult<PyObject> {
     if !(0.0 < train_frac && train_frac < 1.0) {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1520,13 +1568,7 @@ fn csv_sgd_regression(
         let split_mode = layout.split_mode;
 
         // Row count, for a split defined against the data rather than the cap.
-        let mut counted = 0usize;
-        {
-            let mut it = FastRowIter::new(data_bytes, split_mode);
-            while it.next().is_some() && counted < sample_size {
-                counted += 1;
-            }
-        }
+        let counted = FastLineIter::new(data_bytes).take(sample_size).count();
         let n_rows = counted.max(1);
         let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
 
@@ -1561,6 +1603,30 @@ fn csv_sgd_regression(
         let mut train_n = 0usize;
         let mut final_mse = 0.0f64;
 
+        // Multi-epoch training re-reads the file per epoch, and parsing is
+        // most of an epoch's cost. When the standardized training matrix fits
+        // under the caller's budget, epoch 0 fills a cache while it streams
+        // and later epochs replay from memory: parse once, train N times.
+        //
+        // The budget decision uses train_cut (an upper bound on train rows),
+        // so it is made before any parsing. Over budget, or with the budget
+        // set to 0, every epoch streams — the bounded-memory behavior is the
+        // caller's to keep. Replay feeds the exact f64s streaming would have
+        // recomputed through the same sgd_step, so the fitted weights are
+        // bit-identical either way; the tests assert that.
+        let cache_bytes = train_cut.saturating_mul(p + 1).saturating_mul(8);
+        let use_cache = epochs > 1
+            && cache_budget_mb > 0
+            && cache_bytes <= cache_budget_mb.saturating_mul(1024 * 1024);
+        let mut cache_x: Vec<f64> = Vec::new();
+        let mut cache_y: Vec<f64> = Vec::new();
+        if use_cache {
+            cache_x.reserve_exact(train_cut.saturating_mul(p));
+            cache_y.reserve_exact(train_cut);
+        }
+
+        let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
+
         for epoch in 0..epochs {
             // Decay the step size each epoch so later passes refine rather
             // than bounce around the optimum.
@@ -1568,61 +1634,74 @@ fn csv_sgd_regression(
             let mut sq_err = 0.0f64;
             let mut seen = 0usize;
 
-            for (this_row, fields) in FastRowIter::new(data_bytes, split_mode).enumerate() {
-                if this_row >= n_rows {
-                    break;
+            if epoch > 0 && use_cache {
+                // Replay from the cache filled during epoch 0.
+                for (xrow, &y) in cache_x.chunks_exact(p).zip(cache_y.iter()) {
+                    sgd_step(
+                        xrow,
+                        y,
+                        &mut w,
+                        &mut b,
+                        lr,
+                        l2,
+                        grad_clip,
+                        &mut sq_err,
+                        &mut seen,
+                    );
                 }
-                if fields.len() <= target_idx || !is_train(this_row) {
-                    continue;
-                }
+            } else {
+                for (this_row, line) in FastLineIter::new(data_bytes).enumerate() {
+                    if this_row >= n_rows {
+                        break;
+                    }
+                    // Split first: nothing is needed from a test row here, so
+                    // it is not worth splitting into fields.
+                    if !is_train(this_row) {
+                        continue;
+                    }
 
-                let Some(y) = parse_f64_opt(fields[target_idx]) else {
-                    continue;
-                };
-                let mut usable = true;
-                for (j, &idx) in feature_idx.iter().enumerate() {
-                    match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
-                        Some(v) => x[j] = (v - mean[j]) / scale[j],
-                        None => {
-                            usable = false;
-                            break;
+                    fields.clear();
+                    for_each_field(line, split_mode, |_, f| fields.push(f));
+                    if fields.len() <= target_idx {
+                        continue;
+                    }
+
+                    let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                        continue;
+                    };
+                    let mut usable = true;
+                    for (j, &idx) in feature_idx.iter().enumerate() {
+                        match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                            Some(v) => x[j] = (v - mean[j]) / scale[j],
+                            None => {
+                                usable = false;
+                                break;
+                            }
                         }
                     }
-                }
-                if !usable {
-                    continue;
-                }
+                    if !usable {
+                        continue;
+                    }
 
-                let mut pred = b;
-                for j in 0..p {
-                    pred += w[j] * x[j];
-                }
-                let err = pred - y;
-                sq_err += err * err;
-                seen += 1;
+                    sgd_step(
+                        &x,
+                        y,
+                        &mut w,
+                        &mut b,
+                        lr,
+                        l2,
+                        grad_clip,
+                        &mut sq_err,
+                        &mut seen,
+                    );
 
-                // Clip the per-sample gradient. Real data has outliers that
-                // survive standardization -- a mis-metered taxi trip of 100,000
-                // miles sits a thousand standard deviations out -- and a single
-                // such row produces a step large enough to diverge the fit.
-                // Clipping bounds any one row's influence without needing the
-                // caller to hand-tune the learning rate per dataset.
-                // intercept gradient is err * 1, hence the leading 1.0
-                let grad_sq = 1.0 + x.iter().map(|v| v * v).sum::<f64>();
-                let grad_norm = err.abs() * grad_sq.sqrt();
-                let step = if grad_norm > grad_clip && grad_norm > 0.0 {
-                    lr * (grad_clip / grad_norm)
-                } else {
-                    lr
-                };
-
-                for j in 0..p {
-                    w[j] -= step * (err * x[j] + l2 * w[j]);
-                }
-                b -= step * err;
-
-                if epoch == 0 {
-                    train_n += 1;
+                    if epoch == 0 {
+                        train_n += 1;
+                        if use_cache {
+                            cache_x.extend_from_slice(&x);
+                            cache_y.push(y);
+                        }
+                    }
                 }
             }
 
@@ -1648,11 +1727,16 @@ fn csv_sgd_regression(
         let mut sum_y = 0.0f64;
         let mut sum_y2 = 0.0f64;
         let mut test_n = 0usize;
-        for (this_row, fields) in FastRowIter::new(data_bytes, split_mode).enumerate() {
+        for (this_row, line) in FastLineIter::new(data_bytes).enumerate() {
             if this_row >= n_rows {
                 break;
             }
-            if fields.len() <= target_idx || is_train(this_row) {
+            if is_train(this_row) {
+                continue;
+            }
+            fields.clear();
+            for_each_field(line, split_mode, |_, f| fields.push(f));
+            if fields.len() <= target_idx {
                 continue;
             }
             let Some(y) = parse_f64_opt(fields[target_idx]) else {

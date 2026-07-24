@@ -234,6 +234,7 @@ def csv_sgd_regression(
     has_header: bool | None = None,
     shuffle: bool = True,
     grad_clip: float = 10.0,
+    cache_budget_mb: int = 512,
 ) -> dict[str, Any]:
     """Fit a linear model by SGD, streaming from CSV in bounded memory.
 
@@ -262,6 +263,14 @@ def csv_sgd_regression(
     a property of z-score scaling rather than of SGD; winsorize such columns
     before fitting.
 
+    `cache_budget_mb` trades memory for epoch speed. Parsing is most of an
+    epoch's cost, so when the standardized training matrix fits under the
+    budget, epoch 0 fills a cache while it streams and later epochs replay
+    from memory — parse once, train N times. The fitted weights are
+    bit-identical either way, because replay feeds the exact values streaming
+    would have recomputed through the same update. Set 0 to always stream;
+    over-budget data falls back to streaming on its own.
+
     Returns a dict with `coef`, `intercept`, `r2` (test set), `train_n`,
     `test_n`, `epochs`, and `final_train_mse`.
 
@@ -288,6 +297,7 @@ def csv_sgd_regression(
         has_header=has_header,
         shuffle=shuffle,
         grad_clip=grad_clip,
+        cache_budget_mb=cache_budget_mb,
     )
 
 
