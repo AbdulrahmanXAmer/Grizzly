@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "environment": {
-    "timestamp_utc": "2026-07-24T20:11:03+00:00",
+    "timestamp_utc": "2026-07-24T21:25:09+00:00",
     "cpu": "unknown",
     "cpu_count": 8,
     "memory_bytes": 4108632064,
@@ -12,7 +12,7 @@
     "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14)",
     "cargo_profile": "release (lto=true, codegen-units=1, opt-level=3)",
     "git": {
-      "commit": "unknown",
+      "commit": "b90901674e0e5559281dd422f0a840aef17d2e24",
       "branch": "unknown",
       "dirty": false
     }
@@ -70,13 +70,13 @@
           "library_version": "0.1.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 65.2593330014497,
-            "min_ms": 49.45229200166068,
-            "max_ms": 80.0091249984689,
-            "mean_ms": 63.75476214244762,
-            "stdev_ms": 11.733601763997243
+            "median_ms": 49.412415999540826,
+            "min_ms": 41.08966700005112,
+            "max_ms": 82.64849999977741,
+            "mean_ms": 53.139112857544596,
+            "stdev_ms": 14.614202838394085
           },
-          "peak_rss_bytes": 40947712,
+          "peak_rss_bytes": 40955904,
           "fingerprint": {
             "rows": 100000,
             "columns": {
@@ -235,13 +235,13 @@
           "library_version": "3.0.5",
           "repetitions": 7,
           "timing": {
-            "median_ms": 314.9788330010779,
-            "min_ms": 261.38854199962225,
-            "max_ms": 395.9175409981981,
-            "mean_ms": 323.23218442823935,
-            "stdev_ms": 50.70775829205982
+            "median_ms": 302.0589169973391,
+            "min_ms": 265.14708399918163,
+            "max_ms": 487.72545799874933,
+            "mean_ms": 346.01972042894755,
+            "stdev_ms": 80.39707986076704
           },
-          "peak_rss_bytes": 136978432,
+          "peak_rss_bytes": 139776000,
           "fingerprint": {
             "rows": 100000,
             "columns": {
@@ -400,13 +400,13 @@
           "library_version": "1.43.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 93.39379100129008,
-            "min_ms": 81.75033400038956,
-            "max_ms": 416.2412090008729,
-            "mean_ms": 137.1614048574494,
-            "stdev_ms": 123.16233130312814
+            "median_ms": 77.32725000096252,
+            "min_ms": 72.85879100163584,
+            "max_ms": 103.08137500032899,
+            "mean_ms": 82.72238057127522,
+            "stdev_ms": 10.755774642562445
           },
-          "peak_rss_bytes": 91521024,
+          "peak_rss_bytes": 116834304,
           "fingerprint": {
             "rows": 100000,
             "columns": {
@@ -576,13 +576,13 @@
           "library_version": "0.1.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 297.3218339975574,
-            "min_ms": 256.61124999896856,
-            "max_ms": 606.3313340018794,
-            "mean_ms": 380.6461134284161,
-            "stdev_ms": 132.68575482824244
+            "median_ms": 188.97045899939258,
+            "min_ms": 169.67450000083772,
+            "max_ms": 358.67141599737806,
+            "mean_ms": 213.86463685692954,
+            "stdev_ms": 66.08484745701949
           },
-          "peak_rss_bytes": 120836096,
+          "peak_rss_bytes": 120913920,
           "fingerprint": {
             "rows": 500000,
             "columns": {
@@ -741,13 +741,13 @@
           "library_version": "3.0.5",
           "repetitions": 7,
           "timing": {
-            "median_ms": 1984.7552930004895,
-            "min_ms": 1501.2677920021815,
-            "max_ms": 2123.2390429977386,
-            "mean_ms": 1913.623006857441,
-            "stdev_ms": 228.4679244964939
+            "median_ms": 1395.7387920017936,
+            "min_ms": 1236.5519579980173,
+            "max_ms": 1712.4365839990787,
+            "mean_ms": 1428.0253457140393,
+            "stdev_ms": 177.65004625737046
           },
-          "peak_rss_bytes": 246063104,
+          "peak_rss_bytes": 245661696,
           "fingerprint": {
             "rows": 500000,
             "columns": {
@@ -906,13 +906,13 @@
           "library_version": "1.43.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 362.34574999980396,
-            "min_ms": 354.2255410029611,
-            "max_ms": 411.82616699734353,
-            "mean_ms": 374.39245828552106,
-            "stdev_ms": 21.453802680871704
+            "median_ms": 335.0609169974632,
+            "min_ms": 327.36950000253273,
+            "max_ms": 365.0871659992845,
+            "mean_ms": 336.96929757154845,
+            "stdev_ms": 12.82206754459179
           },
-          "peak_rss_bytes": 238698496,
+          "peak_rss_bytes": 258039808,
           "fingerprint": {
             "rows": 500000,
             "columns": {
@@ -1082,13 +1082,13 @@
           "library_version": "0.1.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 51.95195900159888,
-            "min_ms": 49.82812500020373,
-            "max_ms": 68.20254199919873,
-            "mean_ms": 54.066327714411145,
-            "stdev_ms": 6.301161340202758
+            "median_ms": 53.625250002369285,
+            "min_ms": 45.48924999835435,
+            "max_ms": 132.56995799747529,
+            "mean_ms": 68.34910714314901,
+            "stdev_ms": 31.11831324661443
           },
-          "peak_rss_bytes": 52412416,
+          "peak_rss_bytes": 51593216,
           "fingerprint": {
             "rows": 100000,
             "columns": {
@@ -1240,13 +1240,13 @@
           "library_version": "3.0.5",
           "repetitions": 7,
           "timing": {
-            "median_ms": 233.00887499863165,
-            "min_ms": 220.25433299859287,
-            "max_ms": 304.69254099807586,
-            "mean_ms": 250.4631902858299,
-            "stdev_ms": 32.99706876912859
+            "median_ms": 229.8043749979115,
+            "min_ms": 224.28212500017253,
+            "max_ms": 246.92387500181212,
+            "mean_ms": 232.24991071505687,
+            "stdev_ms": 7.94347912788607
           },
-          "peak_rss_bytes": 143835136,
+          "peak_rss_bytes": 143151104,
           "fingerprint": {
             "rows": 100000,
             "columns": {
@@ -1398,13 +1398,13 @@
           "library_version": "1.43.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 65.80766700062668,
-            "min_ms": 61.059957999532344,
-            "max_ms": 93.64808300233562,
-            "mean_ms": 69.2247381427608,
-            "stdev_ms": 11.13934343063472
+            "median_ms": 66.59600000057253,
+            "min_ms": 63.79491600091569,
+            "max_ms": 145.1119999983348,
+            "mean_ms": 78.56813085683305,
+            "stdev_ms": 29.692237026161255
           },
-          "peak_rss_bytes": 105861120,
+          "peak_rss_bytes": 128053248,
           "fingerprint": {
             "rows": 100000,
             "columns": {
@@ -1567,13 +1567,13 @@
           "library_version": "0.1.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 222.3132090002764,
-            "min_ms": 213.31812499920488,
-            "max_ms": 242.6196250016801,
-            "mean_ms": 224.69030371368197,
-            "stdev_ms": 10.472621674821104
+            "median_ms": 194.2799999997078,
+            "min_ms": 180.2077909997024,
+            "max_ms": 207.4157089991786,
+            "mean_ms": 193.84266671425263,
+            "stdev_ms": 10.539531238575979
           },
-          "peak_rss_bytes": 139972608,
+          "peak_rss_bytes": 138395648,
           "fingerprint": {
             "rows": 500000,
             "columns": {
@@ -1725,13 +1725,13 @@
           "library_version": "3.0.5",
           "repetitions": 7,
           "timing": {
-            "median_ms": 1386.167666001711,
-            "min_ms": 1098.3068749992526,
-            "max_ms": 1877.7130430025863,
-            "mean_ms": 1417.2367742856816,
-            "stdev_ms": 295.86398683018626
+            "median_ms": 1167.8554589998384,
+            "min_ms": 1100.7494170007703,
+            "max_ms": 1373.6953749976237,
+            "mean_ms": 1216.5343159997844,
+            "stdev_ms": 108.66747980998055
           },
-          "peak_rss_bytes": 290111488,
+          "peak_rss_bytes": 289607680,
           "fingerprint": {
             "rows": 500000,
             "columns": {
@@ -1883,13 +1883,13 @@
           "library_version": "1.43.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 409.51979199962807,
-            "min_ms": 391.74029100104235,
-            "max_ms": 662.4139579980692,
-            "mean_ms": 482.727898856995,
-            "stdev_ms": 123.02988122714565
+            "median_ms": 289.4957089993113,
+            "min_ms": 283.85562500261585,
+            "max_ms": 308.9728330014623,
+            "mean_ms": 292.02023828682803,
+            "stdev_ms": 8.648551553082239
           },
-          "peak_rss_bytes": 284303360,
+          "peak_rss_bytes": 288006144,
           "fingerprint": {
             "rows": 500000,
             "columns": {
@@ -2052,13 +2052,13 @@
           "library_version": "0.1.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 174.04249999890453,
-            "min_ms": 142.76666700243368,
-            "max_ms": 209.32212499974412,
-            "mean_ms": 174.35790471478998,
-            "stdev_ms": 20.61908091574563
+            "median_ms": 151.90900000015972,
+            "min_ms": 140.1757079984236,
+            "max_ms": 198.11704099993221,
+            "mean_ms": 161.941553570484,
+            "stdev_ms": 20.979455729221065
           },
-          "peak_rss_bytes": 83673088,
+          "peak_rss_bytes": 45236224,
           "fingerprint": {
             "rows_written": 100000,
             "cols_scaled": 21,
@@ -2156,13 +2156,13 @@
           "library_version": "3.0.5",
           "repetitions": 7,
           "timing": {
-            "median_ms": 2520.261918001779,
-            "min_ms": 2412.4550849992374,
-            "max_ms": 3249.8662100006186,
-            "mean_ms": 2678.5976917141984,
-            "stdev_ms": 326.68220707027723
+            "median_ms": 2480.390376000287,
+            "min_ms": 2352.3643339976843,
+            "max_ms": 2747.9430419989512,
+            "mean_ms": 2500.459953285567,
+            "stdev_ms": 155.79200755164823
           },
-          "peak_rss_bytes": 177352704,
+          "peak_rss_bytes": 176721920,
           "fingerprint": {
             "rows_written": 100000,
             "cols_scaled": 21,
@@ -2260,13 +2260,13 @@
           "library_version": "1.43.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 128.84904199745506,
-            "min_ms": 109.9484170008509,
-            "max_ms": 192.01766699916334,
-            "mean_ms": 134.7723810000129,
-            "stdev_ms": 27.52774768179115
+            "median_ms": 141.1065000029339,
+            "min_ms": 106.44699999829754,
+            "max_ms": 253.40383400180144,
+            "mean_ms": 149.80659528581393,
+            "stdev_ms": 49.92107134977995
           },
-          "peak_rss_bytes": 152825856,
+          "peak_rss_bytes": 136720384,
           "fingerprint": {
             "rows_written": 100000,
             "cols_scaled": 21,
@@ -2375,13 +2375,13 @@
           "library_version": "0.1.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 928.1725830005598,
-            "min_ms": 850.2315420009836,
-            "max_ms": 1519.7200839975267,
-            "mean_ms": 1032.634785857746,
-            "stdev_ms": 242.3262322510265
+            "median_ms": 765.1835010001378,
+            "min_ms": 715.3887090025819,
+            "max_ms": 912.0823749981355,
+            "mean_ms": 789.3109468578976,
+            "stdev_ms": 71.22006185768834
           },
-          "peak_rss_bytes": 327147520,
+          "peak_rss_bytes": 144732160,
           "fingerprint": {
             "rows_written": 500000,
             "cols_scaled": 21,
@@ -2479,13 +2479,13 @@
           "library_version": "3.0.5",
           "repetitions": 7,
           "timing": {
-            "median_ms": 13082.928005998838,
-            "min_ms": 12563.511131000269,
-            "max_ms": 13467.886798000109,
-            "mean_ms": 13013.029148857251,
-            "stdev_ms": 297.4001791199588
+            "median_ms": 12768.728089999058,
+            "min_ms": 12415.535590000218,
+            "max_ms": 13193.854755001666,
+            "mean_ms": 12784.485107286206,
+            "stdev_ms": 310.4433487512366
           },
-          "peak_rss_bytes": 453062656,
+          "peak_rss_bytes": 452878336,
           "fingerprint": {
             "rows_written": 500000,
             "cols_scaled": 21,
@@ -2583,13 +2583,13 @@
           "library_version": "1.43.0",
           "repetitions": 7,
           "timing": {
-            "median_ms": 855.9115420030139,
-            "min_ms": 780.7097509976302,
-            "max_ms": 1127.8972920008528,
-            "mean_ms": 896.5657507147365,
-            "stdev_ms": 135.1509034123862
+            "median_ms": 797.2543750001932,
+            "min_ms": 597.7052919988637,
+            "max_ms": 1206.587374999799,
+            "mean_ms": 840.0417741426542,
+            "stdev_ms": 204.7528970008201
           },
-          "peak_rss_bytes": 289222656,
+          "peak_rss_bytes": 294871040,
           "fingerprint": {
             "rows_written": 500000,
             "cols_scaled": 21,

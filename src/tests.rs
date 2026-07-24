@@ -535,6 +535,72 @@ fn get_fields_collapses_runs_of_whitespace() {
 }
 
 // ---------------------------------------------------------------------------
+// allocation-free line and field iteration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fast_line_iter_matches_fast_row_iter() {
+    // FastLineIter exists to avoid FastRowIter's per-row Vec allocation, so the
+    // two must agree on what constitutes a row. A divergence would silently
+    // change what the transform writes.
+    let data = b"a,b,c\n1,2,3\n\n4,5,6\r\n7,8,9";
+
+    let via_lines: Vec<Vec<&[u8]>> = FastLineIter::new(data)
+        .map(|line| get_fields(line, SplitMode::Delim(b',')))
+        .collect();
+    let via_rows: Vec<Vec<&[u8]>> = FastRowIter::new(data, SplitMode::Delim(b',')).collect();
+
+    assert_eq!(via_lines, via_rows);
+    assert_eq!(via_lines.len(), 4, "the blank line should not be a row");
+}
+
+#[test]
+fn fast_line_iter_strips_carriage_returns() {
+    let lines: Vec<&[u8]> = FastLineIter::new(b"a,b\r\n1,2\r\n").collect();
+    assert_eq!(lines, vec![&b"a,b"[..], b"1,2"]);
+}
+
+#[test]
+fn fast_line_iter_handles_degenerate_input() {
+    assert_eq!(FastLineIter::new(b"").count(), 0);
+    assert_eq!(FastLineIter::new(b"\n\n\n").count(), 0);
+    // A final line without a trailing newline is still a line.
+    assert_eq!(
+        FastLineIter::new(b"only").collect::<Vec<_>>(),
+        vec![&b"only"[..]]
+    );
+}
+
+#[test]
+fn fast_line_iter_survives_a_long_run_of_blank_lines() {
+    // Blank lines are skipped by looping rather than recursing; recursion here
+    // would overflow the stack on a file that is mostly newlines.
+    let data = vec![b'\n'; 200_000];
+    assert_eq!(FastLineIter::new(&data).count(), 0);
+}
+
+#[test]
+fn for_each_field_matches_get_fields() {
+    for (line, mode) in [
+        (&b"a,b,c"[..], SplitMode::Delim(b',')),
+        (b"a,,c", SplitMode::Delim(b',')),
+        (b"  a   b\tc ", SplitMode::Whitespace),
+        (b"", SplitMode::Delim(b',')),
+    ] {
+        let mut visited: Vec<(usize, Vec<u8>)> = Vec::new();
+        for_each_field(line, mode, |i, field| visited.push((i, field.to_vec())));
+
+        let expected: Vec<(usize, Vec<u8>)> = get_fields(line, mode)
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| (i, f.to_vec()))
+            .collect();
+
+        assert_eq!(visited, expected, "line {:?}", std::str::from_utf8(line));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // linear algebra
 // ---------------------------------------------------------------------------
 

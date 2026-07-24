@@ -246,19 +246,95 @@ pub fn write_field_csv(output: &mut Vec<u8>, field: &[u8], delim: u8) {
     output.push(b'"');
 }
 
-/// Fast row iterator - splits on newlines, yields field slices.
-/// ⚠️ Assumes no quoted fields (use only in fast_transform mode).
-pub struct FastRowIter<'a> {
+/// Yields raw lines, without splitting or allocating.
+///
+/// `FastRowIter` below is convenient when a row needs random access by column
+/// index, but it allocates a `Vec` per row to provide it. Streaming work that
+/// visits fields in order -- the transform writer, most obviously -- wants
+/// neither the Vec nor the allocation, and pairs this with `for_each_field`.
+/// At 500k rows a transform was paying half a million allocations for nothing.
+///
+/// ⚠️ Assumes no quoted newlines (fast-CSV mode only).
+pub struct FastLineIter<'a> {
     bytes: &'a [u8],
     pos: usize,
+}
+
+impl<'a> FastLineIter<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for FastLineIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Loops rather than recursing on blank lines: a file with a long run of
+        // them would otherwise blow the stack.
+        while self.pos < self.bytes.len() {
+            let line_end = memchr(b'\n', &self.bytes[self.pos..])
+                .map(|i| self.pos + i)
+                .unwrap_or(self.bytes.len());
+
+            let line_len = if line_end > self.pos && self.bytes.get(line_end - 1) == Some(&b'\r') {
+                line_end - 1
+            } else {
+                line_end
+            };
+
+            let line = &self.bytes[self.pos..line_len];
+            self.pos = line_end + 1;
+
+            if !line.is_empty() {
+                return Some(line);
+            }
+        }
+        None
+    }
+}
+
+/// Visit each field of a line in order, without allocating.
+#[inline]
+pub fn for_each_field<F: FnMut(usize, &[u8])>(line: &[u8], mode: SplitMode, mut visit: F) {
+    match mode {
+        SplitMode::Delim(d) => {
+            for (i, field) in iter_fields_delim(line, d).enumerate() {
+                visit(i, field);
+            }
+        }
+        SplitMode::Whitespace => {
+            for (i, field) in iter_fields_ws(line).enumerate() {
+                visit(i, field);
+            }
+        }
+    }
+}
+
+/// Fast row iterator - splits on newlines, yields field slices.
+///
+/// Allocates a `Vec` per row, which buys random access by column index. Use it
+/// where that access pattern is needed (selecting a target column, say) and
+/// `FastLineIter` + `for_each_field` where fields are consumed in order.
+///
+/// Defined in terms of `FastLineIter` deliberately. It previously duplicated
+/// the line-scanning logic and got it wrong: an empty line made `next()` return
+/// `None`, which ends iteration rather than skipping the line, so a single
+/// blank line anywhere in a file silently truncated everything after it. On a
+/// 1,000-row file with one stray blank line, regression and SGD trained on 500
+/// rows and reported nothing unusual. Sharing one implementation means the two
+/// cannot disagree about what a row is.
+///
+/// ⚠️ Assumes no quoted newlines (fast-CSV mode only).
+pub struct FastRowIter<'a> {
+    lines: FastLineIter<'a>,
     split_mode: SplitMode,
 }
 
 impl<'a> FastRowIter<'a> {
     pub fn new(bytes: &'a [u8], split_mode: SplitMode) -> Self {
         Self {
-            bytes,
-            pos: 0,
+            lines: FastLineIter::new(bytes),
             split_mode,
         }
     }
@@ -268,35 +344,8 @@ impl<'a> Iterator for FastRowIter<'a> {
     type Item = Vec<&'a [u8]>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.bytes.len() {
-            return None;
-        }
-
-        // Find end of line
-        let line_end = memchr(b'\n', &self.bytes[self.pos..])
-            .map(|i| self.pos + i)
-            .unwrap_or(self.bytes.len());
-
-        if line_end <= self.pos {
-            return None;
-        }
-
-        // Handle \r\n
-        let line_len = if line_end > self.pos && self.bytes.get(line_end - 1) == Some(&b'\r') {
-            line_end - 1
-        } else {
-            line_end
-        };
-
-        let line = &self.bytes[self.pos..line_len];
-        self.pos = line_end + 1;
-
-        if line.is_empty() {
-            return self.next(); // Skip empty lines
-        }
-
-        // Split by mode
-        let fields = get_fields(line, self.split_mode);
-        Some(fields)
+        self.lines
+            .next()
+            .map(|line| get_fields(line, self.split_mode))
     }
 }

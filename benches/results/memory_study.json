@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "dataset": {
+    "rows": 3000000,
+    "feature_columns": 20,
+    "input_bytes": 598697199
+  },
+  "methodology": {
+    "cpus": 4,
+    "oom_exit_code": 137,
+    "note": "Container memory limits are used because ulimit -v bounds address space rather than resident memory, which an mmap-based reader passes straight through."
+  },
+  "results": [
+    {
+      "status": "ok",
+      "exit_code": 0,
+      "seconds": 8.66185454600054,
+      "peak_rss_mb": 768.868352,
+      "input_bytes": 598697199,
+      "output_bytes": 1205683098,
+      "cap": "900m",
+      "library": "grizzly"
+    },
+    {
+      "status": "ok",
+      "exit_code": 0,
+      "seconds": 4.990644669000176,
+      "peak_rss_mb": 959.107072,
+      "input_bytes": 598697199,
+      "output_bytes": 1205674756,
+      "cap": "900m",
+      "library": "polars"
+    },
+    {
+      "status": "ok",
+      "exit_code": 0,
+      "seconds": 7.515609961999871,
+      "peak_rss_mb": 731.066368,
+      "input_bytes": 598697199,
+      "output_bytes": 1205683098,
+      "cap": "700m",
+      "library": "grizzly"
+    },
+    {
+      "status": "ok",
+      "exit_code": 0,
+      "seconds": 9.970520627997757,
+      "peak_rss_mb": 745.254912,
+      "input_bytes": 598697199,
+      "output_bytes": 1205674756,
+      "cap": "700m",
+      "library": "polars"
+    },
+    {
+      "status": "ok",
+      "exit_code": 0,
+      "seconds": 6.924747919998481,
+      "peak_rss_mb": 527.118336,
+      "input_bytes": 598697199,
+      "output_bytes": 1205683098,
+      "cap": "500m",
+      "library": "grizzly"
+    },
+    {
+      "status": "oom_killed",
+      "exit_code": 137,
+      "cap": "500m",
+      "library": "polars"
+    },
+    {
+      "status": "ok",
+      "exit_code": 0,
+      "seconds": 7.646891628999583,
+      "peak_rss_mb": 370.11456,
+      "input_bytes": 598697199,
+      "output_bytes": 1205683098,
+      "cap": "350m",
+      "library": "grizzly"
+    },
+    {
+      "status": "oom_killed",
+      "exit_code": 137,
+      "cap": "350m",
+      "library": "polars"
+    },
+    {
+      "status": "ok",
+      "exit_code": 0,
+      "seconds": 5.383761961002165,
+      "peak_rss_mb": 265.719808,
+      "input_bytes": 598697199,
+      "output_bytes": 1205683098,
+      "cap": "250m",
+      "library": "grizzly"
+    },
+    {
+      "status": "oom_killed",
+      "exit_code": 137,
+      "cap": "250m",
+      "library": "polars"
+    }
+  ]
+}

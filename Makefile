@@ -133,6 +133,13 @@ docker-study: docker-build  ## Run the sampling study in the container
 	$(DOCKER_RUN_PINNED) $(IMAGE) \
 	  python -m benches.study_sampling --out $(DATA_DIR)/container-sampling-study.json
 
+# Drives containers itself (one per memory limit), so it runs on the host and
+# builds the image as a dependency rather than executing inside one.
+.PHONY: docker-memory-study
+docker-memory-study: docker-build  ## Measure the memory ceiling vs polars
+	@mkdir -p $(DATA_DIR)
+	$(PYTHON) -m benches.study_memory --cpus $(BENCH_CPUS)
+
 .PHONY: docker-shell
 docker-shell: docker-build  ## Open a shell in the container
 	$(DOCKER_RUN) -it $(IMAGE) bash

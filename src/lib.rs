@@ -17,7 +17,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyIterator, PyList, PyMapping, PySequence, PyString, PyTuple};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufWriter, Read};
+use std::io::Read;
 
 use ahash::AHashMap;
 use csv::ReaderBuilder;
@@ -668,57 +668,36 @@ fn csv_profile(
                         .collect();
 
                     let mut rows_in_chunk = 0usize;
-                    let mut pos = 0usize;
 
-                    // Direct byte iteration.
-                    while pos < chunk_bytes.len() && rows_in_chunk < per_chunk_budget {
-                        // Find end of line
-                        let line_end = memchr(b'\n', &chunk_bytes[pos..])
-                            .map(|i| pos + i)
-                            .unwrap_or(chunk_bytes.len());
-
-                        if line_end <= pos {
+                    // Shares FastLineIter with every other reader. The
+                    // hand-rolled loop this replaces treated a blank line as
+                    // end-of-chunk rather than skipping it, so a stray empty
+                    // line silently dropped the rest of its chunk from the
+                    // profile. Fields are visited in order, so no per-row Vec
+                    // is allocated either.
+                    for line in FastLineIter::new(chunk_bytes) {
+                        if rows_in_chunk >= per_chunk_budget {
                             break;
                         }
 
-                        // Handle \r\n
-                        let line_len =
-                            if line_end > pos && chunk_bytes.get(line_end - 1) == Some(&b'\r') {
-                                line_end - 1
+                        for_each_field(line, split_mode, |i, field| {
+                            if i >= ncols {
+                                return;
+                            }
+                            if lite {
+                                // LITE MODE: Just numeric stats
+                                process_cell_lite(field, &mut local_stats[i]);
                             } else {
-                                line_end
-                            };
-
-                        let line = &chunk_bytes[pos..line_len];
-                        pos = line_end + 1;
-
-                        if line.is_empty() {
-                            continue;
-                        }
-
-                        // Split fields and process
-                        let fields = get_fields(line, split_mode);
-                        if lite {
-                            // LITE MODE: Just numeric stats
-                            for (i, field) in fields.iter().enumerate() {
-                                if i < ncols {
-                                    process_cell_lite(field, &mut local_stats[i]);
-                                }
+                                // FULL MODE: Type inference + examples + freq
+                                process_cell(
+                                    field,
+                                    &mut local_stats[i],
+                                    max_examples,
+                                    track_freq,
+                                    collect_examples,
+                                );
                             }
-                        } else {
-                            // FULL MODE: Type inference + examples + freq
-                            for (i, field) in fields.iter().enumerate() {
-                                if i < ncols {
-                                    process_cell(
-                                        field,
-                                        &mut local_stats[i],
-                                        max_examples,
-                                        track_freq,
-                                        collect_examples,
-                                    );
-                                }
-                            }
-                        }
+                        });
 
                         rows_in_chunk += 1;
                     }
@@ -909,6 +888,36 @@ fn csv_minmax_params(py: Python<'_>, path: String, sample_size: usize) -> PyResu
     Ok(out.into())
 }
 
+/// Write `buf` at an absolute file offset, without moving a shared cursor.
+///
+/// Positioned writes are what allow the output chunks to be written
+/// concurrently: each knows exactly where it belongs, so no writer has to wait
+/// for another to finish appending. `File::write_all_at` is Unix-only and
+/// `seek_write` is the Windows equivalent, hence the split.
+#[cfg(unix)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut written = 0usize;
+    while written < buf.len() {
+        // seek_write is not guaranteed to consume the whole buffer.
+        let n = file.seek_write(&buf[written..], offset + written as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "positioned write made no progress",
+            ));
+        }
+        written += n;
+    }
+    Ok(())
+}
+
 // Parallel streaming transforms.
 
 /// Apply a per-column affine transform `(x - offset) / scale`, streaming.
@@ -1027,72 +1036,114 @@ fn transform_affine(
             };
 
             // Collect per-chunk output buffers.
-            let chunk_results: Vec<(Vec<u8>, usize)> = byte_chunks
-                .into_par_iter()
-                .map(|chunk_bytes| {
-                    let mut output_buf =
-                        Vec::with_capacity(chunk_bytes.len() + chunk_bytes.len() / 4);
-                    let mut ryu_buf = ryu::Buffer::new();
-                    let mut rows = 0usize;
+            // Output capacity estimate. Scaling a value written with a handful
+            // of decimals produces a full round-trip double -- "3.141593"
+            // becomes "0.4724761615149732" -- so a scaled file is roughly twice
+            // its input. Reserving the old 1.25x guaranteed a reallocation and
+            // a full copy of a multi-megabyte buffer in every chunk.
+            let growth_numerator = if numeric_cols_to_scale > 0 { 9 } else { 5 };
+            let estimate_capacity = |len: usize| len.saturating_mul(growth_numerator) / 4 + 64;
 
-                    for fields in FastRowIter::new(chunk_bytes, split_mode) {
-                        for (i, field) in fields.iter().enumerate() {
-                            if i > 0 {
-                                output_buf.push(output_delim);
-                            }
-
-                            let trimmed = trim_bytes(field);
-
-                            if let Some(Some((offset, scale))) = col_params.get(i) {
-                                // Only parse columns with params (known numeric).
-                                if let Ok(x) = fast_float::parse::<f64, _>(trimmed) {
-                                    let scaled = if scale.is_finite() && scale.abs() > 1e-12 {
-                                        (x - offset) / scale
-                                    } else {
-                                        0.0
-                                    };
-                                    let s = ryu_buf.format(scaled);
-                                    output_buf.extend_from_slice(s.as_bytes());
-                                } else {
-                                    // Non-numeric value in numeric column, pass through
-                                    write_field_csv(&mut output_buf, trimmed, output_delim);
-                                }
-                            } else {
-                                // No transform, fast path for non-numeric columns
-                                write_field_csv(&mut output_buf, trimmed, output_delim);
-                            }
-                        }
-                        output_buf.push(b'\n');
-                        rows += 1;
-                    }
-
-                    (output_buf, rows)
-                })
-                .collect();
-
-            // Write header + all chunk buffers.
-            let file = File::create(&output_clone).map_err(|e| e.to_string())?;
-            let mut writer = BufWriter::with_capacity(8 << 20, file);
-
-            // Write header
+            // Build the header first: its length is the starting file offset,
+            // and every chunk's destination is derived from it.
+            let mut header = Vec::new();
             for (i, name) in col_names.iter().enumerate() {
                 if i > 0 {
-                    std::io::Write::write_all(&mut writer, &[output_delim])
-                        .map_err(|e| e.to_string())?;
+                    header.push(output_delim);
                 }
-                let mut header_buf = Vec::new();
-                write_field_csv(&mut header_buf, name.as_bytes(), output_delim);
-                std::io::Write::write_all(&mut writer, &header_buf).map_err(|e| e.to_string())?;
+                write_field_csv(&mut header, name.as_bytes(), output_delim);
             }
-            std::io::Write::write_all(&mut writer, b"\n").map_err(|e| e.to_string())?;
+            header.push(b'\n');
+
+            let file = File::create(&output_clone).map_err(|e| e.to_string())?;
+            write_at(&file, &header, 0).map_err(|e| e.to_string())?;
+
+            // Chunks are processed in batches rather than all at once.
+            //
+            // Formatting every chunk up front and only then writing meant the
+            // whole output existed in memory simultaneously: a 100 MB input
+            // produced 200 MB of live buffers and a 327 MB peak RSS, which also
+            // made the "memory bounded by chunk size" claim in the docs false.
+            // Batching bounds live output to one batch, and lets the allocator
+            // reuse the same blocks for every batch instead of faulting in
+            // fresh pages for each of ~128 chunks.
+            let batch_size = (rayon::current_num_threads() * 2).max(1);
 
             let mut total_rows = 0usize;
-            for (buffer, rows) in chunk_results {
-                std::io::Write::write_all(&mut writer, &buffer).map_err(|e| e.to_string())?;
-                total_rows += rows;
+            let mut cursor = header.len() as u64;
+
+            for batch in byte_chunks.chunks(batch_size) {
+                let batch_results: Vec<(Vec<u8>, usize)> = batch
+                    .par_iter()
+                    .map(|&chunk_bytes| {
+                        let mut output_buf =
+                            Vec::with_capacity(estimate_capacity(chunk_bytes.len()));
+                        let mut ryu_buf = ryu::Buffer::new();
+                        let mut rows = 0usize;
+
+                        // Fields are visited in order and written as they are seen,
+                        // so there is no reason to collect them into a Vec first.
+                        for line in FastLineIter::new(chunk_bytes) {
+                            for_each_field(line, split_mode, |i, field| {
+                                if i > 0 {
+                                    output_buf.push(output_delim);
+                                }
+
+                                let trimmed = trim_bytes(field);
+
+                                if let Some(Some((offset, scale))) = col_params.get(i) {
+                                    // Only parse columns with params (known numeric).
+                                    if let Ok(x) = fast_float::parse::<f64, _>(trimmed) {
+                                        let scaled = if scale.is_finite() && scale.abs() > 1e-12 {
+                                            (x - offset) / scale
+                                        } else {
+                                            0.0
+                                        };
+                                        // format(), not format_finite(): fast_float
+                                        // parses "inf" and "nan", so `scaled` is not
+                                        // guaranteed finite and format_finite's
+                                        // output would be unspecified for those.
+                                        let s = ryu_buf.format(scaled);
+                                        output_buf.extend_from_slice(s.as_bytes());
+                                    } else {
+                                        // Non-numeric value in numeric column, pass through
+                                        write_field_csv(&mut output_buf, trimmed, output_delim);
+                                    }
+                                } else {
+                                    // No transform, fast path for non-numeric columns
+                                    write_field_csv(&mut output_buf, trimmed, output_delim);
+                                }
+                            });
+                            output_buf.push(b'\n');
+                            rows += 1;
+                        }
+
+                        (output_buf, rows)
+                    })
+                    .collect();
+
+                // Offsets within the batch are known once it is formatted, so
+                // the batch is written in parallel too: each buffer knows
+                // exactly where it belongs and no writer waits on another.
+                let mut offsets = Vec::with_capacity(batch_results.len());
+                for (buffer, rows) in &batch_results {
+                    offsets.push(cursor);
+                    cursor += buffer.len() as u64;
+                    total_rows += rows;
+                }
+
+                batch_results
+                    .par_iter()
+                    .zip(offsets.par_iter())
+                    .try_for_each(|((buffer, _), &offset)| {
+                        write_at(&file, buffer, offset).map_err(|e| e.to_string())
+                    })?;
             }
 
-            std::io::Write::flush(&mut writer).map_err(|e| e.to_string())?;
+            // Deliberately no fsync. The previous implementation flushed a
+            // BufWriter, which only pushes into the page cache; forcing durable
+            // media writes would be a different guarantee and a much slower one,
+            // and it is not what the libraries this is measured against do.
             Ok((total_rows, numeric_cols_to_scale, has_header_actual))
         })
         .map_err(pyo3::exceptions::PyIOError::new_err)?;
