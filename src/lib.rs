@@ -1783,6 +1783,9 @@ fn detect_schema(
     Ok(out.into())
 }
 
+#[cfg(test)]
+mod tests;
+
 // Module registration.
 
 /// Panic on purpose, to verify how panics cross the FFI boundary.
