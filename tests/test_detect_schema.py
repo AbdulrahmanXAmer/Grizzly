@@ -21,5 +21,3 @@ def test_top_level_scalar():
     schema = grizzly.detect_schema(123)
     paths = [c["path"] for c in schema["columns"]]
     assert paths == ["value"]
-
-
