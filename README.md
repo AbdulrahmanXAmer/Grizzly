@@ -440,20 +440,16 @@ the transform. Both are reported.
 
 | Workload | Dataset | Grizzly | vs pandas | vs polars | Peak memory |
 |----------|---------|--------:|-----------|-----------|-------------|
-| **Profile** 📉 | numeric, 100,000 rows (19.0 MB) | 49.4 ms | 6.11x faster | 1.56x faster | 39.1 MB <sub>(2.9x less than polars)</sub> |
-| **Profile** 📉 | numeric, 500,000 rows (95.2 MB) | 189.0 ms | 7.39x faster | 1.77x faster | 115.3 MB <sub>(2.1x less than polars)</sub> |
-| **Profile** 📉 | mixed, 100,000 rows (14.2 MB) | 53.6 ms | 4.29x faster | 1.24x faster | 49.2 MB <sub>(2.5x less than polars)</sub> |
-| **Profile** | mixed, 500,000 rows (70.9 MB) | 194.3 ms | 6.01x faster | 1.49x faster | 132.0 MB <sub>(2.1x less than polars)</sub> |
-| **Transform** 📉 | numeric, 100,000 rows (19.0 MB) | 151.9 ms | 16.33x faster | 1.08x slower | 43.1 MB <sub>(3.0x less than polars)</sub> |
-| **Transform** 📉 | numeric, 500,000 rows (95.2 MB) | 765.2 ms | 16.69x faster | 1.04x faster | 138.0 MB <sub>(2.0x less than polars)</sub> |
+| **Profile** | numeric, 100,000 rows (19.0 MB) | 43.7 ms | 6.08x faster | 1.63x faster | 39.1 MB <sub>(3.1x less than polars)</sub> |
+| **Profile** | numeric, 500,000 rows (95.2 MB) | 165.1 ms | 7.14x faster | 1.98x faster | 115.2 MB <sub>(2.2x less than polars)</sub> |
+| **Profile** 📉 | mixed, 100,000 rows (14.2 MB) | 45.4 ms | 4.86x faster | 1.48x faster | 49.6 MB <sub>(2.7x less than polars)</sub> |
+| **Profile** | mixed, 500,000 rows (70.9 MB) | 169.6 ms | 6.51x faster | 1.75x faster | 134.3 MB <sub>(2.1x less than polars)</sub> |
+| **Transform** | numeric, 100,000 rows (19.0 MB) | 111.5 ms | 21.39x faster | 1.06x slower | 42.1 MB <sub>(3.9x less than polars)</sub> |
+| **Transform** | numeric, 500,000 rows (95.2 MB) | 573.6 ms | 21.19x faster | 1.01x faster | 137.0 MB <sub>(2.1x less than polars)</sub> |
 
 > 📉 **Noisy measurement.** In the cells below, at least one library's standard deviation exceeded 20% of its median, so the ratios are indicative rather than precise. Running `make docker-bench` pins the software environment and the CPU/memory allocation, which removes most of this; the rest is whatever else the host is doing, and only an idle machine fixes that.
 >
-> - Profile / numeric_100000 (grizzly, pandas)
-> - Profile / numeric_500000 (grizzly)
-> - Profile / mixed_100000 (grizzly, polars)
-> - Transform / numeric_100000 (polars)
-> - Transform / numeric_500000 (polars)
+> - Profile / mixed_100000 (polars)
 
 <details>
 <summary><strong>Measurement environment and methodology</strong></summary>
@@ -467,8 +463,8 @@ the transform. Both are reported.
 | Rust | rustc 1.90.0 (1159e78c4 2025-09-14) |
 | Cargo profile | release (lto=true, codegen-units=1, opt-level=3) |
 | Libraries | grizzly 0.1.0, pandas 3.0.5, polars 1.43.0 |
-| Grizzly commit | `b90901674e0e` |
-| Measured | 2026-07-24T21:25:09+00:00 |
+| Grizzly commit | `39b75d8498db` |
+| Measured | 2026-07-24T22:50:12+00:00 |
 
 - **Repetitions:** 7 timed runs per cell, 1 warmup run discarded; headline figure is the median.
 - **Isolation:** one fresh interpreter per repetition.
@@ -487,49 +483,49 @@ Reproduce with `python -m benches.bench --strict`. See [`benches/README.md`](ben
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| **grizzly** | 49.4 ms | 14.6 ms | 41.1 ms | 39.1 MB |
-| polars | 77.3 ms | 10.8 ms | 72.9 ms | 111.4 MB |
-| pandas | 302.1 ms | 80.4 ms | 265.1 ms | 133.3 MB |
+| **grizzly** | 43.7 ms | 3.0 ms | 38.2 ms | 39.1 MB |
+| polars | 71.3 ms | 1.6 ms | 68.9 ms | 121.6 MB |
+| pandas | 265.6 ms | 11.5 ms | 252.9 ms | 133.4 MB |
 
 **Profile — numeric, 500,000 rows (95.2 MB)**
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| **grizzly** | 189.0 ms | 66.1 ms | 169.7 ms | 115.3 MB |
-| polars | 335.1 ms | 12.8 ms | 327.4 ms | 246.1 MB |
-| pandas | 1395.7 ms | 177.7 ms | 1236.6 ms | 234.3 MB |
+| **grizzly** | 165.1 ms | 31.9 ms | 161.4 ms | 115.2 MB |
+| polars | 326.7 ms | 55.5 ms | 320.7 ms | 255.2 MB |
+| pandas | 1179.1 ms | 94.3 ms | 1152.7 ms | 234.8 MB |
 
 **Profile — mixed, 100,000 rows (14.2 MB)**
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| **grizzly** | 53.6 ms | 31.1 ms | 45.5 ms | 49.2 MB |
-| polars | 66.6 ms | 29.7 ms | 63.8 ms | 122.1 MB |
-| pandas | 229.8 ms | 7.9 ms | 224.3 ms | 136.5 MB |
+| **grizzly** | 45.4 ms | 0.9 ms | 44.7 ms | 49.6 MB |
+| polars | 67.0 ms | 15.1 ms | 61.9 ms | 132.8 MB |
+| pandas | 220.3 ms | 4.0 ms | 217.8 ms | 136.9 MB |
 
 **Profile — mixed, 500,000 rows (70.9 MB)**
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| **grizzly** | 194.3 ms | 10.5 ms | 180.2 ms | 132.0 MB |
-| polars | 289.5 ms | 8.6 ms | 283.9 ms | 274.7 MB |
-| pandas | 1167.9 ms | 108.7 ms | 1100.7 ms | 276.2 MB |
+| **grizzly** | 169.6 ms | 8.8 ms | 165.0 ms | 134.3 MB |
+| polars | 296.3 ms | 27.5 ms | 284.6 ms | 287.9 MB |
+| pandas | 1103.8 ms | 95.9 ms | 1031.5 ms | 276.5 MB |
 
 **Transform — numeric, 100,000 rows (19.0 MB)**
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| polars | 141.1 ms | 49.9 ms | 106.4 ms | 130.4 MB |
-| **grizzly** | 151.9 ms | 21.0 ms | 140.2 ms | 43.1 MB |
-| pandas | 2480.4 ms | 155.8 ms | 2352.4 ms | 168.5 MB |
+| polars | 105.1 ms | 11.8 ms | 102.4 ms | 162.7 MB |
+| **grizzly** | 111.5 ms | 15.6 ms | 105.5 ms | 42.1 MB |
+| pandas | 2385.9 ms | 209.7 ms | 2304.8 ms | 169.1 MB |
 
 **Transform — numeric, 500,000 rows (95.2 MB)**
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| **grizzly** | 765.2 ms | 71.2 ms | 715.4 ms | 138.0 MB |
-| polars | 797.3 ms | 204.8 ms | 597.7 ms | 281.2 MB |
-| pandas | 12768.7 ms | 310.4 ms | 12415.5 ms | 431.9 MB |
+| **grizzly** | 573.6 ms | 70.1 ms | 457.0 ms | 137.0 MB |
+| polars | 580.3 ms | 60.3 ms | 536.2 ms | 284.4 MB |
+| pandas | 12151.8 ms | 116.1 ms | 11921.3 ms | 432.5 MB |
 
 </details>
 

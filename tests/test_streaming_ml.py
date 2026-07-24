@@ -330,14 +330,14 @@ def test_sgd_cache_and_streaming_are_bit_identical(regression_csv):
     two code paths have diverged.
     """
     path, _, _ = regression_csv
-    kwargs = dict(
-        target="target",
-        epochs=8,
-        learning_rate=0.1,
-        l2=0.01,
-        sample_size=FULL_COVERAGE,
-        seed=3,
-    )
+    kwargs = {
+        "target": "target",
+        "epochs": 8,
+        "learning_rate": 0.1,
+        "l2": 0.01,
+        "sample_size": FULL_COVERAGE,
+        "seed": 3,
+    }
 
     cached = grizzly.csv_sgd_regression(path, cache_budget_mb=512, **kwargs)
     streamed = grizzly.csv_sgd_regression(path, cache_budget_mb=0, **kwargs)
