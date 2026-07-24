@@ -38,6 +38,53 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # Unit tests for the parser and statistics internals. These need no
+      # Python interpreter, so they run in the lint job rather than the matrix.
+      - name: cargo test
+        run: cargo test
+
+  fuzz:
+    name: Fuzz the parser
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-fuzz requires nightly for -Z sanitizer support.
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nfuzz -> fuzz/target"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # A short run on every push is a smoke test, not a fuzzing campaign: it
+      # catches a target that no longer builds and any crash reachable within
+      # a minute from the committed seeds. Deeper runs belong in a scheduled
+      # job with a persisted corpus.
+      - name: Fuzz CSV parsing
+        run: |
+          cargo fuzz run parse_csv fuzz/corpus/parse_csv fuzz/seeds/parse_csv \
+            -- -max_total_time=60 -print_final_stats=1
+
+      - name: Fuzz chunk alignment
+        run: |
+          cargo fuzz run chunk_alignment fuzz/corpus/chunk_alignment fuzz/seeds/chunk_alignment \
+            -- -max_total_time=60 -print_final_stats=1
+
+      # A crash reproducer is the whole point of the job, so make sure it
+      # leaves the runner even when the step above fails.
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
   python-lint:
     name: Python lint (ruff + mypy)
     runs-on: ubuntu-latest
