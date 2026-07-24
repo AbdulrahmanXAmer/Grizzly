@@ -5,19 +5,29 @@ build-backend = "maturin"
 [project]
 name = "grizzly"
 version = "0.1.0"
-description = "Fast schema/column/type detection for arbitrary Python data, powered by Rust."
+description = "Fast schema/column/type detection and CSV profiling for Python, powered by Rust."
 readme = "README.md"
-requires-python = ">=3.14"
+# Floor is 3.10 because the package uses @dataclass(slots=True), which was
+# added in 3.10. The native extension is built against the CPython stable ABI
+# (abi3-py310), so a single wheel per platform serves every version from here up.
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Grizzly Contributors" }]
-keywords = ["schema", "dtype", "inference", "pyo3", "rust"]
+keywords = ["schema", "dtype", "inference", "profiling", "csv", "pyo3", "rust"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering",
+  "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +40,65 @@ all = ["numpy>=2.0", "pandas>=2.2", "pyarrow>=15.0"]
 [tool.maturin]
 module-name = "grizzly._grizzly"
 python-source = "src"
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "pyo3/abi3-py310"]
 
+# --------------------------------------------------------------------------
+# Lint and type checking
+# --------------------------------------------------------------------------
 
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["target", ".venv", "data"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "W",   # pycodestyle warnings
+  "I",   # import sorting
+  "UP",  # pyupgrade
+  "B",   # bugbear
+  "C4",  # comprehensions
+]
+ignore = [
+  # The optional-dependency probes in normalize.py deliberately catch broad
+  # exceptions when a third-party conversion fails; failing soft is the
+  # documented behaviour there.
+  "B904",
+  # `ruff format` is the authority on line length and already wraps everything
+  # it can. E501 then only fires on strings and comments the formatter
+  # deliberately declined to split, where breaking them would hurt readability.
+  "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Benchmark runners import their comparison library inside the function under
+# test, so that the import cost is not attributed to a competitor.
+"benches/_runner.py" = ["PLC0415"]
+
+[tool.mypy]
+# Checked against 3.12 rather than the 3.10 support floor: numpy's bundled stubs
+# use `type` statements, which mypy only parses under 3.12+. Version-specific
+# behaviour on 3.10/3.11 is covered by the CI test matrix instead.
+python_version = "3.12"
+files = ["src/grizzly", "benches"]
+# Third-party data libraries are optional dependencies and are probed at
+# runtime; their absence is handled, so missing stubs are not an error.
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_configs = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+# The pure-Python fallback mirrors the Rust extension's dynamic shape and is
+# intentionally loosely typed.
+module = "grizzly.fallback"
+check_untyped_defs = false
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+filterwarnings = ["error"]
