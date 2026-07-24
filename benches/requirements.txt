@@ -20,3 +20,4 @@ pyarrow==25.0.0
 # Build + test tooling, pinned for the same reason.
 maturin==1.14.1
 pytest==9.1.1
+hypothesis==6.161.2

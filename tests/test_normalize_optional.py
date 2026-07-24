@@ -62,6 +62,54 @@ def test_normalize_valid_parquet_returns_records(tmp_path):
     assert out == [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]
 
 
+@pytest.mark.parametrize(
+    "value",
+    [".PARQUET", "report.csv", "archive.CSV.GZ", "s3://bucket/data.parquet", "notes.csv"],
+)
+def test_strings_that_look_like_paths_are_treated_as_data(value):
+    """A string is data unless it names a file that exists.
+
+    Found by the Hypothesis suite: `detect_schema(".PARQUET")` used to reach
+    the parquet reader and raise FileNotFoundError from deep inside pyarrow.
+    Filenames, URLs, and ordinary text ending in a data extension are common
+    real values, and describing them as strings is the only safe reading.
+    """
+    import grizzly
+
+    assert grizzly.normalize(value, sample_size=10) == value
+
+    schema = grizzly.detect_schema(value, sample_size=10)
+    assert [c["path"] for c in schema["columns"]] == ["value"]
+    assert schema["columns"][0]["inferred"] == "string"
+
+
+def test_existing_csv_path_is_still_read_as_a_file(tmp_path):
+    """The path behaviour is preserved when the file is really there."""
+    import grizzly
+
+    p = tmp_path / "real.csv"
+    p.write_text("a,b\n1,2\n3,4\n")
+
+    out = grizzly.normalize(str(p), sample_size=10)
+    assert isinstance(out, list), "an existing CSV path should be read into records"
+    assert out and set(out[0]) == {"a", "b"}
+
+
+def test_a_missing_path_object_raises_rather_than_becoming_data(tmp_path):
+    """Constructing a Path states intent, so a missing file must surface.
+
+    This is the deliberate asymmetry with the string case above: a `str` that
+    does not resolve is data, but a `Path` that does not resolve is a mistake
+    worth reporting rather than quietly describing as a one-column string
+    schema.
+    """
+    import grizzly
+
+    missing = tmp_path / "nope.csv"
+    with pytest.raises(FileNotFoundError):
+        grizzly.normalize(missing, sample_size=10)
+
+
 @pytest.mark.skipif(not HAS_NUMPY, reason="requires numpy")
 def test_normalize_numpy_ndarray():
     """A 2-D ndarray becomes records with synthetic col_N names."""

@@ -10,8 +10,29 @@ def _is_seq(x: Any) -> bool:
 
 
 def _path_like_to_str(x: Any) -> str | None:
-    if isinstance(x, (str, Path)):
+    """Return `x` as a filesystem path, or None if it should be treated as data.
+
+    A `Path` is always taken as a path: constructing one is an explicit
+    statement of intent, and a missing file should raise rather than be
+    silently reinterpreted.
+
+    A `str` is only taken as a path when the file actually exists. Strings are
+    ordinary data, and plenty of real values happen to end in a data-file
+    extension -- a filename stored in a column, a URL, or just the text
+    "report.csv". Treating those as paths made `detect_schema` raise
+    FileNotFoundError from inside the parquet reader instead of describing a
+    string. When the path does not resolve, the safe reading is "this is a
+    string", which shows up plainly in the schema as a string column.
+    """
+    if isinstance(x, Path):
         return str(x)
+    if isinstance(x, str):
+        try:
+            if Path(x).is_file():
+                return x
+        except (OSError, ValueError):
+            # Embedded null bytes, over-long names, and similar: not a path.
+            return None
     return None
 
 
