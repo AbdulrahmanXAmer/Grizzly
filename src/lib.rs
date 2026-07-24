@@ -1468,6 +1468,17 @@ fn add_example(_py: Python<'_>, col: &mut PyColStats, v: &Bound<'_, PyAny>, max_
     }
 }
 
+/// Maximum nesting depth `flatten_value` will descend into.
+///
+/// This is a stack-safety bound, not a stylistic one. `flatten_value` recurses
+/// once per level of nesting, so without a cap a sufficiently deep input
+/// overflows the Rust stack and takes the whole interpreter down with SIGSEGV
+/// -- not a catchable Python exception. The observed crash threshold is around
+/// 20k-30k levels; 512 is far above any real-world nested record and far below
+/// the danger zone.
+const MAX_NESTING_DEPTH: usize = 512;
+
+#[allow(clippy::too_many_arguments)]
 fn flatten_value(
     py: Python<'_>,
     cols: &mut BTreeMap<String, PyColStats>,
@@ -1475,8 +1486,32 @@ fn flatten_value(
     v: &Bound<'_, PyAny>,
     sample_budget: &mut i64,
     max_examples: usize,
+    depth: usize,
+    depth_exceeded: &mut bool,
 ) -> PyResult<()> {
     if *sample_budget <= 0 {
+        return Ok(());
+    }
+    if depth >= MAX_NESTING_DEPTH {
+        // Stop descending rather than overflow the stack. The caller reports
+        // this to Python so the truncation is visible instead of silent.
+        *depth_exceeded = true;
+        *sample_budget -= 1;
+        // Still record the node, so the caller sees where truncation happened
+        // rather than an empty schema. Deliberately does NOT call add_example:
+        // repr() of a deeply nested object recurses inside CPython and would
+        // reintroduce the very stack overflow this guard exists to prevent.
+        let col_key = if path.is_empty() {
+            "value".to_string()
+        } else {
+            path.to_string()
+        };
+        let entry = cols.entry(col_key).or_default();
+        entry.count += 1;
+        if v.is_none() {
+            entry.null_count += 1;
+        }
+        entry.types.insert(type_name(v));
         return Ok(());
     }
     *sample_budget -= 1;
@@ -1489,7 +1524,16 @@ fn flatten_value(
             } else {
                 format!("{path}.{key}")
             };
-            flatten_value(py, cols, &p, &vv, sample_budget, max_examples)?;
+            flatten_value(
+                py,
+                cols,
+                &p,
+                &vv,
+                sample_budget,
+                max_examples,
+                depth + 1,
+                depth_exceeded,
+            )?;
         }
         return Ok(());
     }
@@ -1509,7 +1553,16 @@ fn flatten_value(
             } else {
                 format!("{path}.{key}")
             };
-            flatten_value(py, cols, &p, &vv, sample_budget, max_examples)?;
+            flatten_value(
+                py,
+                cols,
+                &p,
+                &vv,
+                sample_budget,
+                max_examples,
+                depth + 1,
+                depth_exceeded,
+            )?;
         }
         return Ok(());
     }
@@ -1523,7 +1576,16 @@ fn flatten_value(
         if let Ok(list) = v.downcast::<PyList>() {
             for i in 0..list.len().min(50) {
                 let item = list.get_item(i)?;
-                flatten_value(py, cols, &p, &item, sample_budget, max_examples)?;
+                flatten_value(
+                    py,
+                    cols,
+                    &p,
+                    &item,
+                    sample_budget,
+                    max_examples,
+                    depth + 1,
+                    depth_exceeded,
+                )?;
                 if *sample_budget <= 0 {
                     break;
                 }
@@ -1533,7 +1595,16 @@ fn flatten_value(
         if let Ok(tup) = v.downcast::<PyTuple>() {
             for i in 0..tup.len().min(50) {
                 let item = tup.get_item(i)?;
-                flatten_value(py, cols, &p, &item, sample_budget, max_examples)?;
+                flatten_value(
+                    py,
+                    cols,
+                    &p,
+                    &item,
+                    sample_budget,
+                    max_examples,
+                    depth + 1,
+                    depth_exceeded,
+                )?;
                 if *sample_budget <= 0 {
                     break;
                 }
@@ -1546,7 +1617,16 @@ fn flatten_value(
                     break;
                 }
                 let item = item?;
-                flatten_value(py, cols, &p, &item, sample_budget, max_examples)?;
+                flatten_value(
+                    py,
+                    cols,
+                    &p,
+                    &item,
+                    sample_budget,
+                    max_examples,
+                    depth + 1,
+                    depth_exceeded,
+                )?;
                 if *sample_budget <= 0 {
                     break;
                 }
@@ -1601,12 +1681,22 @@ fn detect_schema(
 ) -> PyResult<PyObject> {
     let mut cols: BTreeMap<String, PyColStats> = BTreeMap::new();
     let mut budget = sample_size as i64;
+    let mut depth_exceeded = false;
 
     if is_sequence_like(&data) {
         if let Ok(list) = data.downcast::<PyList>() {
             for i in 0..list.len().min(sample_size) {
                 let item = list.get_item(i)?;
-                flatten_value(py, &mut cols, "", &item, &mut budget, max_examples)?;
+                flatten_value(
+                    py,
+                    &mut cols,
+                    "",
+                    &item,
+                    &mut budget,
+                    max_examples,
+                    0,
+                    &mut depth_exceeded,
+                )?;
                 if budget <= 0 {
                     break;
                 }
@@ -1614,7 +1704,16 @@ fn detect_schema(
         } else if let Ok(tup) = data.downcast::<PyTuple>() {
             for i in 0..tup.len().min(sample_size) {
                 let item = tup.get_item(i)?;
-                flatten_value(py, &mut cols, "", &item, &mut budget, max_examples)?;
+                flatten_value(
+                    py,
+                    &mut cols,
+                    "",
+                    &item,
+                    &mut budget,
+                    max_examples,
+                    0,
+                    &mut depth_exceeded,
+                )?;
                 if budget <= 0 {
                     break;
                 }
@@ -1625,16 +1724,43 @@ fn detect_schema(
                     break;
                 }
                 let item = item?;
-                flatten_value(py, &mut cols, "", &item, &mut budget, max_examples)?;
+                flatten_value(
+                    py,
+                    &mut cols,
+                    "",
+                    &item,
+                    &mut budget,
+                    max_examples,
+                    0,
+                    &mut depth_exceeded,
+                )?;
                 if budget <= 0 {
                     break;
                 }
             }
         } else {
-            flatten_value(py, &mut cols, "", &data, &mut budget, max_examples)?;
+            flatten_value(
+                py,
+                &mut cols,
+                "",
+                &data,
+                &mut budget,
+                max_examples,
+                0,
+                &mut depth_exceeded,
+            )?;
         }
     } else {
-        flatten_value(py, &mut cols, "", &data, &mut budget, max_examples)?;
+        flatten_value(
+            py,
+            &mut cols,
+            "",
+            &data,
+            &mut budget,
+            max_examples,
+            0,
+            &mut depth_exceeded,
+        )?;
     }
 
     let out = PyDict::new(py);
@@ -1651,6 +1777,9 @@ fn detect_schema(
     }
     out.set_item("columns", col_list)?;
     out.set_item("sample_size", sample_size)?;
+    // Report truncation rather than silently returning a partial schema.
+    out.set_item("max_depth_exceeded", depth_exceeded)?;
+    out.set_item("max_depth", MAX_NESTING_DEPTH)?;
     Ok(out.into())
 }
 
