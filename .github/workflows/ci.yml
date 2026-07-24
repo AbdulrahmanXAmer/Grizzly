@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same ref cancels the previous run. Keeps queue time low
+# without letting main go unverified.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Fail the build on any Python warning that escapes a test.
+  PYTHONWARNDEFAULTENCODING: 1
+
+jobs:
+  rust-lint:
+    name: Rust lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  python-lint:
+    name: Python lint (ruff + mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install tooling
+        run: |
+          python -m pip install -U pip
+          python -m pip install ruff==0.14.2 mypy==1.19.0
+          python -m pip install -r benches/requirements.txt
+
+      # The native module must exist before mypy runs, or every `import grizzly`
+      # in the package resolves to a missing stub rather than the real thing.
+      - name: Build native extension
+        run: maturin develop --release
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format
+        run: ruff format --check .
+
+      - name: mypy
+        run: mypy src/grizzly benches
+
+  test:
+    name: Test ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Full interpreter sweep on Linux; the ends of the supported range on
+        # macOS and Windows. Catches platform breakage without paying for a
+        # 15-cell matrix on every push.
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python: "3.10"
+          - os: macos-latest
+            python: "3.14"
+          - os: windows-latest
+            python: "3.10"
+          - os: windows-latest
+            python: "3.14"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.python }}
+
+      - name: Install build tooling
+        run: |
+          python -m pip install -U pip
+          python -m pip install maturin==1.14.1 pytest==9.1.1
+
+      # Build and install a real wheel rather than an editable install, so the
+      # tests exercise the artifact users actually receive.
+      - name: Build wheel
+        run: maturin build --release --out dist --interpreter python
+
+      - name: Install wheel (Unix)
+        if: runner.os != 'Windows'
+        run: python -m pip install --no-index --find-links dist grizzly
+
+      - name: Install wheel (Windows)
+        if: runner.os == 'Windows'
+        run: python -m pip install --no-index --find-links dist grizzly
+
+      - name: Verify the native extension loaded
+        run: python -c "import grizzly, sys; sys.exit(0 if grizzly.is_native() else 'native extension did not load')"
+
+      # Run from a directory without ./src on the path, so the import under
+      # test is the installed wheel and not the source tree.
+      - name: Run tests
+        run: python -m pytest tests -v
+
+      - name: Run tests with optional dependencies present
+        run: |
+          python -m pip install "numpy>=2.0" "pandas>=2.2" "pyarrow>=15.0"
+          python -m pytest tests -v
+
+  # Confirms the benchmark suite still runs and that Grizzly still agrees with
+  # pandas and polars. Deliberately tiny: this gate is about correctness of the
+  # harness, not about timing. Published timings come from bench.yml.
+  bench-smoke:
+    name: Benchmark smoke + equivalence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r benches/requirements.txt
+
+      - name: Build native extension
+        run: maturin develop --release
+
+      # --strict turns any cross-library disagreement into a failed build.
+      - name: Run benchmark suite (small, strict)
+        run: |
+          python -m benches.bench \
+            --rows 20000 \
+            --repetitions 2 \
+            --strict \
+            --out /tmp/smoke-results.json
+
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-smoke-results
+          path: /tmp/smoke-results.json
+
+  # Fails if the README's published numbers no longer match the committed
+  # results.json. Makes it impossible to edit a benchmark table by hand.
+  readme-sync:
+    name: README benchmark tables in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check README against results.json
+        run: python -m benches.render --check
