@@ -909,34 +909,27 @@ fn csv_minmax_params(py: Python<'_>, path: String, sample_size: usize) -> PyResu
     Ok(out.into())
 }
 
-// Parallel transform (min-max scaling).
+// Parallel streaming transforms.
 
-#[pyfunction]
-#[pyo3(signature = (input_path, output_path, params, delimiter=None, has_header=None))]
-fn csv_transform_minmax(
+/// Apply a per-column affine transform `(x - offset) / scale`, streaming.
+///
+/// Min-max scaling and standardization differ only in how `(offset, scale)` is
+/// derived -- `(min, max - min)` versus `(mean, std)` -- so they share this one
+/// parallel writer instead of two near-identical copies of it. Rows are read,
+/// transformed, and written in chunks, so memory stays bounded by the chunk
+/// size rather than the file size.
+///
+/// A non-finite or effectively-zero scale maps the column to 0.0: a constant
+/// column has no spread to scale by, and emitting NaN or infinity would poison
+/// every downstream consumer of the output file.
+fn transform_affine(
     py: Python<'_>,
     input_path: String,
     output_path: String,
-    params: Bound<'_, PyDict>,
+    params_map: AHashMap<String, (f64, f64)>,
     delimiter: Option<String>,
     has_header: Option<bool>,
 ) -> PyResult<PyObject> {
-    // Parse params
-    let mut params_map: AHashMap<String, (f64, f64)> = AHashMap::new();
-    for (k, v) in params.iter() {
-        let col_name: String = k.extract()?;
-        let v_dict = v.downcast::<PyDict>()?;
-        let min_val: f64 = v_dict
-            .get_item("min")?
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing min"))?
-            .extract()?;
-        let max_val: f64 = v_dict
-            .get_item("max")?
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing max"))?
-            .extract()?;
-        params_map.insert(col_name, (min_val, max_val));
-    }
-
     let input_clone = input_path.clone();
     let output_clone = output_path.clone();
 
@@ -1050,12 +1043,11 @@ fn csv_transform_minmax(
 
                             let trimmed = trim_bytes(field);
 
-                            if let Some(Some((min_v, max_v))) = col_params.get(i) {
+                            if let Some(Some((offset, scale))) = col_params.get(i) {
                                 // Only parse columns with params (known numeric).
                                 if let Ok(x) = fast_float::parse::<f64, _>(trimmed) {
-                                    let range = max_v - min_v;
-                                    let scaled = if range > 1e-12 {
-                                        (x - min_v) / range
+                                    let scaled = if scale.is_finite() && scale.abs() > 1e-12 {
+                                        (x - offset) / scale
                                     } else {
                                         0.0
                                     };
@@ -1112,6 +1104,124 @@ fn csv_transform_minmax(
     out.set_item("numeric_cols_scaled", numeric_cols_scaled)?;
     out.set_item("has_header", has_header_detected)?;
     Ok(out.into())
+}
+
+/// Read `params` as a mapping of column name to two named f64 fields.
+fn affine_params_from_dict(
+    params: &Bound<'_, PyDict>,
+    offset_key: &str,
+    scale_key: &str,
+) -> PyResult<AHashMap<String, (f64, f64)>> {
+    let mut out: AHashMap<String, (f64, f64)> = AHashMap::new();
+    for (k, v) in params.iter() {
+        let col_name: String = k.extract()?;
+        let v_dict = v.downcast::<PyDict>()?;
+        let offset: f64 = v_dict
+            .get_item(offset_key)?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "column {col_name:?} is missing {offset_key:?}"
+                ))
+            })?
+            .extract()?;
+        let scale: f64 = v_dict
+            .get_item(scale_key)?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "column {col_name:?} is missing {scale_key:?}"
+                ))
+            })?
+            .extract()?;
+        out.insert(col_name, (offset, scale));
+    }
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (input_path, output_path, params, delimiter=None, has_header=None))]
+fn csv_transform_minmax(
+    py: Python<'_>,
+    input_path: String,
+    output_path: String,
+    params: Bound<'_, PyDict>,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+) -> PyResult<PyObject> {
+    // (x - min) / (max - min)
+    let mut params_map = affine_params_from_dict(&params, "min", "max")?;
+    for value in params_map.values_mut() {
+        value.1 -= value.0;
+    }
+    transform_affine(
+        py,
+        input_path,
+        output_path,
+        params_map,
+        delimiter,
+        has_header,
+    )
+}
+
+/// Mean and population standard deviation per numeric column, from one pass.
+#[pyfunction]
+fn csv_standardize_params(py: Python<'_>, path: String, sample_size: usize) -> PyResult<PyObject> {
+    // lite mode: mean and std come from the streaming accumulator, so no type
+    // inference, examples, or frequency tracking is needed.
+    let prof_obj = csv_profile(py, path.clone(), sample_size, 0, true, true, false, false)?;
+    let prof = prof_obj.bind(py).downcast::<PyDict>()?;
+    let out = PyDict::new(py);
+    out.set_item("path", path)?;
+    let params = PyDict::new(py);
+
+    let cols_any = prof
+        .get_item("columns")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing columns"))?;
+    let cols_list = cols_any.downcast::<PyList>()?;
+
+    for c in cols_list.iter() {
+        let cd = c.downcast::<PyDict>()?;
+        let name: String = cd
+            .get_item("name")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing name"))?
+            .extract()?;
+
+        let (Some(mean_v), Some(std_v)) = (cd.get_item("mean")?, cd.get_item("std")?) else {
+            continue;
+        };
+        if mean_v.is_none() || std_v.is_none() {
+            continue;
+        }
+        let d = PyDict::new(py);
+        d.set_item("mean", &mean_v)?;
+        d.set_item("std", &std_v)?;
+        params.set_item(name, d)?;
+    }
+
+    out.set_item("params", params)?;
+    Ok(out.into())
+}
+
+/// Standardize numeric columns to zero mean and unit variance, streaming.
+#[pyfunction]
+#[pyo3(signature = (input_path, output_path, params, delimiter=None, has_header=None))]
+fn csv_transform_standardize(
+    py: Python<'_>,
+    input_path: String,
+    output_path: String,
+    params: Bound<'_, PyDict>,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+) -> PyResult<PyObject> {
+    // (x - mean) / std
+    let params_map = affine_params_from_dict(&params, "mean", "std")?;
+    transform_affine(
+        py,
+        input_path,
+        output_path,
+        params_map,
+        delimiter,
+        has_header,
+    )
 }
 
 // Python object schema detection (compatibility path).
@@ -1492,6 +1602,404 @@ fn detect_schema(
 mod parse;
 use parse::*;
 
+// Streaming SGD regression.
+
+/// Where the data starts and what the columns are called.
+///
+/// Shared setup for anything that streams a CSV: delimiter, header presence,
+/// column names, and the byte offset of the first data row.
+struct CsvLayout {
+    split_mode: SplitMode,
+    col_names: Vec<String>,
+    data_start: usize,
+}
+
+fn csv_layout(
+    bytes: &[u8],
+    delimiter: Option<u8>,
+    has_header: Option<bool>,
+) -> Result<CsvLayout, String> {
+    if bytes.is_empty() {
+        return Err("Empty file".to_string());
+    }
+    let first_newline = memchr(b'\n', bytes).unwrap_or(bytes.len());
+    let first_line = &bytes[..first_newline];
+
+    let split_mode = match delimiter {
+        Some(d) => SplitMode::Delim(d),
+        None => match sniff_delimiter_simd(first_line) {
+            Some(d) => SplitMode::Delim(d),
+            None => SplitMode::Whitespace,
+        },
+    };
+    let delim_for_detection = match split_mode {
+        SplitMode::Delim(d) => d,
+        SplitMode::Whitespace => b' ',
+    };
+    let has_header_actual =
+        has_header.unwrap_or_else(|| detect_header_smart(bytes, delim_for_detection, 5));
+
+    let first_line_clean = if first_line.ends_with(b"\r") {
+        &first_line[..first_line.len() - 1]
+    } else {
+        first_line
+    };
+    let first_fields = get_fields(first_line_clean, split_mode);
+    if first_fields.is_empty() {
+        return Err("No columns detected in CSV".to_string());
+    }
+
+    let col_names: Vec<String> = if has_header_actual {
+        first_fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let t = trim_bytes(f);
+                if t.is_empty() {
+                    format!("col_{i}")
+                } else {
+                    String::from_utf8_lossy(t).into_owned()
+                }
+            })
+            .collect()
+    } else {
+        (0..first_fields.len())
+            .map(|i| format!("col_{i}"))
+            .collect()
+    };
+
+    let data_start = if has_header_actual {
+        first_newline + 1
+    } else {
+        0
+    };
+
+    Ok(CsvLayout {
+        split_mode,
+        col_names,
+        data_start,
+    })
+}
+
+/// Outcome of a streaming SGD fit, before conversion into a Python dict:
+/// (feature names, coefficients, intercept, train rows, test rows, test r2,
+/// epochs run, final training MSE).
+type SgdFit = (Vec<String>, Vec<f64>, f64, usize, usize, f64, usize, f64);
+
+/// Fit a linear model by stochastic gradient descent, streaming from CSV.
+///
+/// The closed-form solver in `csv_linear_regression` accumulates an X'X matrix,
+/// which costs O(p^2) memory and O(n p^2) time -- fine for tens of features,
+/// hopeless for the wide sparse data typical of ad-tech or recommender
+/// training sets. This path holds only the weight vector, so memory is O(p)
+/// and each epoch is O(n p), and it never materialises a design matrix.
+///
+/// Features are standardized on the fly using the mean and standard deviation
+/// from a prior profiling pass. That is not cosmetic: raw features on wildly
+/// different scales make a single global learning rate either diverge on the
+/// large ones or crawl on the small ones. Coefficients are converted back to
+/// the original feature space before returning, so they are directly
+/// comparable with the closed-form solver's.
+///
+/// Rows are visited in file order within each epoch. Shuffling a stream would
+/// mean buffering it, which would give up the bounded memory that is the point
+/// of this path; data with meaningful row order should be shuffled on disk
+/// first.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (path, target, features=None, epochs=5, learning_rate=0.05, l2=0.0, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true))]
+fn csv_sgd_regression(
+    py: Python<'_>,
+    path: String,
+    target: String,
+    features: Option<Vec<String>>,
+    epochs: usize,
+    learning_rate: f64,
+    l2: f64,
+    train_frac: f64,
+    seed: u64,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+    shuffle: bool,
+) -> PyResult<PyObject> {
+    if !(0.0 < train_frac && train_frac < 1.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "train_frac must be in (0,1)",
+        ));
+    }
+    if epochs == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "epochs must be >= 1",
+        ));
+    }
+    if !(learning_rate.is_finite() && learning_rate > 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "learning_rate must be positive and finite",
+        ));
+    }
+
+    // Standardization statistics, from one profiling pass over the same file.
+    let stats_obj = csv_standardize_params(py, path.clone(), sample_size)?;
+    let stats_dict = stats_obj.bind(py).downcast::<PyDict>()?.clone();
+    let params_any = stats_dict
+        .get_item("params")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing params"))?;
+    let params = params_any.downcast::<PyDict>()?;
+    let mut moments: AHashMap<String, (f64, f64)> = AHashMap::new();
+    for (k, v) in params.iter() {
+        let name: String = k.extract()?;
+        let d = v.downcast::<PyDict>()?;
+        let mean: f64 = d
+            .get_item("mean")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing mean"))?
+            .extract()?;
+        let std: f64 = d
+            .get_item("std")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing std"))?
+            .extract()?;
+        moments.insert(name, (mean, std));
+    }
+
+    let delim_byte = delimiter.and_then(|d| d.bytes().next());
+    let path_for_thread = path.clone();
+    let target_for_thread = target.clone();
+
+    let result = py.allow_threads(move || -> Result<SgdFit, String> {
+        let target = target_for_thread;
+        let file_data = load_file_data(&path_for_thread).map_err(|e| e.to_string())?;
+        let bytes = file_data.as_bytes();
+        let layout = csv_layout(bytes, delim_byte, has_header)?;
+        let col_names = &layout.col_names;
+
+        let target_idx = col_names
+            .iter()
+            .position(|c| c == &target)
+            .ok_or_else(|| format!("target column {target:?} not found"))?;
+
+        let feature_idx: Vec<usize> = match &features {
+            Some(names) => names
+                .iter()
+                .map(|n| {
+                    col_names
+                        .iter()
+                        .position(|c| c == n)
+                        .ok_or_else(|| format!("feature column {n:?} not found"))
+                })
+                .collect::<Result<_, _>>()?,
+            None => (0..col_names.len()).filter(|&i| i != target_idx).collect(),
+        };
+        if feature_idx.is_empty() {
+            return Err("no feature columns selected".to_string());
+        }
+
+        // Per-feature standardization constants. A feature with no usable
+        // spread is centred but not divided, which leaves it contributing
+        // nothing rather than producing NaN.
+        let p = feature_idx.len();
+        let mut mean = vec![0.0f64; p];
+        let mut scale = vec![1.0f64; p];
+        for (j, &idx) in feature_idx.iter().enumerate() {
+            if let Some((m, s)) = moments.get(&col_names[idx]) {
+                mean[j] = *m;
+                if s.is_finite() && *s > 1e-12 {
+                    scale[j] = *s;
+                }
+            }
+        }
+
+        let data_bytes = &bytes[layout.data_start..];
+        let split_mode = layout.split_mode;
+
+        // Row count, for a split defined against the data rather than the cap.
+        let mut counted = 0usize;
+        {
+            let mut it = FastRowIter::new(data_bytes, split_mode);
+            while it.next().is_some() && counted < sample_size {
+                counted += 1;
+            }
+        }
+        let n_rows = counted.max(1);
+        let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
+
+        let is_train_mask: Option<Vec<bool>> = if shuffle {
+            let mut perm: Vec<usize> = (0..n_rows).collect();
+            for i in (1..n_rows).rev() {
+                let r = splitmix64(seed ^ (i as u64));
+                let j = (r % ((i + 1) as u64)) as usize;
+                perm.swap(i, j);
+            }
+            let mut mask = vec![false; n_rows];
+            for &idx in perm.iter().take(train_cut) {
+                mask[idx] = true;
+            }
+            Some(mask)
+        } else {
+            None
+        };
+
+        let is_train = |row_idx: usize| -> bool {
+            match &is_train_mask {
+                Some(mask) => mask[row_idx],
+                None => row_idx < train_cut,
+            }
+        };
+
+        // Weights live in standardized space; O(p) total.
+        let mut w = vec![0.0f64; p];
+        let mut b = 0.0f64;
+        let mut x = vec![0.0f64; p];
+
+        let mut train_n = 0usize;
+        let mut final_mse = 0.0f64;
+
+        for epoch in 0..epochs {
+            // Decay the step size each epoch so later passes refine rather
+            // than bounce around the optimum.
+            let lr = learning_rate / (1.0 + epoch as f64);
+            let mut sq_err = 0.0f64;
+            let mut seen = 0usize;
+
+            for (this_row, fields) in FastRowIter::new(data_bytes, split_mode).enumerate() {
+                if this_row >= n_rows {
+                    break;
+                }
+                if fields.len() <= target_idx || !is_train(this_row) {
+                    continue;
+                }
+
+                let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                    continue;
+                };
+                let mut usable = true;
+                for (j, &idx) in feature_idx.iter().enumerate() {
+                    match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                        Some(v) => x[j] = (v - mean[j]) / scale[j],
+                        None => {
+                            usable = false;
+                            break;
+                        }
+                    }
+                }
+                if !usable {
+                    continue;
+                }
+
+                let mut pred = b;
+                for j in 0..p {
+                    pred += w[j] * x[j];
+                }
+                let err = pred - y;
+                sq_err += err * err;
+                seen += 1;
+
+                for j in 0..p {
+                    w[j] -= lr * (err * x[j] + l2 * w[j]);
+                }
+                b -= lr * err;
+
+                if epoch == 0 {
+                    train_n += 1;
+                }
+            }
+
+            if seen > 0 {
+                final_mse = sq_err / seen as f64;
+            }
+            if !b.is_finite() || w.iter().any(|v| !v.is_finite()) {
+                return Err(format!(
+                    "SGD diverged at epoch {epoch}; lower learning_rate (was {learning_rate})"
+                ));
+            }
+        }
+
+        // Convert weights back to the original feature space so they can be
+        // compared with the closed-form solver:
+        //   y = b + sum_j w_j * (x_j - mean_j) / scale_j
+        //     = (b - sum_j w_j * mean_j / scale_j) + sum_j (w_j / scale_j) x_j
+        let coef: Vec<f64> = (0..p).map(|j| w[j] / scale[j]).collect();
+        let intercept = b - (0..p).map(|j| w[j] * mean[j] / scale[j]).sum::<f64>();
+
+        // Test-set R2, evaluated in the original space.
+        let mut ss_res = 0.0f64;
+        let mut sum_y = 0.0f64;
+        let mut sum_y2 = 0.0f64;
+        let mut test_n = 0usize;
+        for (this_row, fields) in FastRowIter::new(data_bytes, split_mode).enumerate() {
+            if this_row >= n_rows {
+                break;
+            }
+            if fields.len() <= target_idx || is_train(this_row) {
+                continue;
+            }
+            let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                continue;
+            };
+            let mut pred = intercept;
+            let mut usable = true;
+            for (j, &idx) in feature_idx.iter().enumerate() {
+                match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                    Some(v) => pred += coef[j] * v,
+                    None => {
+                        usable = false;
+                        break;
+                    }
+                }
+            }
+            if !usable {
+                continue;
+            }
+            let d = y - pred;
+            ss_res += d * d;
+            sum_y += y;
+            sum_y2 += y * y;
+            test_n += 1;
+        }
+
+        let r2 = if test_n > 1 {
+            let mean_y = sum_y / test_n as f64;
+            let ss_tot = sum_y2 - 2.0 * mean_y * sum_y + (test_n as f64) * mean_y * mean_y;
+            if ss_tot > 1e-12 {
+                1.0 - ss_res / ss_tot
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let feature_names: Vec<String> =
+            feature_idx.iter().map(|&i| col_names[i].clone()).collect();
+
+        Ok((
+            feature_names,
+            coef,
+            intercept,
+            train_n,
+            test_n,
+            r2,
+            epochs,
+            final_mse,
+        ))
+    });
+
+    let (feature_names, coef, intercept, train_n, test_n, r2, epochs_run, final_mse) =
+        result.map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+    let out = PyDict::new(py);
+    out.set_item("path", path)?;
+    out.set_item("target", target)?;
+    out.set_item("features", feature_names)?;
+    out.set_item("coef", coef)?;
+    out.set_item("intercept", intercept)?;
+    out.set_item("train_n", train_n)?;
+    out.set_item("test_n", test_n)?;
+    out.set_item("r2", r2)?;
+    out.set_item("epochs", epochs_run)?;
+    out.set_item("final_train_mse", final_mse)?;
+    Ok(out.into())
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1517,7 +2025,10 @@ fn _grizzly(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(csv_profile, m)?)?;
     m.add_function(wrap_pyfunction!(csv_minmax_params, m)?)?;
     m.add_function(wrap_pyfunction!(csv_transform_minmax, m)?)?;
+    m.add_function(wrap_pyfunction!(csv_standardize_params, m)?)?;
+    m.add_function(wrap_pyfunction!(csv_transform_standardize, m)?)?;
     m.add_function(wrap_pyfunction!(csv_linear_regression, m)?)?;
+    m.add_function(wrap_pyfunction!(csv_sgd_regression, m)?)?;
     Ok(())
 }
 

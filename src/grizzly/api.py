@@ -168,6 +168,116 @@ def csv_transform_minmax(
     return native.csv_transform_minmax(input_path, output_path, params, delimiter, has_header)
 
 
+def csv_standardize_params(path: str, *, sample_size: int = 1000) -> dict[str, Any]:
+    """Return mean/std per numeric column, suitable for standardization.
+
+    Computed from the same single streaming pass as the profile, so the cost is
+    one read of the file rather than a materialised DataFrame.
+
+    Note the standard deviation is a *population* std, matching the rest of
+    Grizzly's statistics; pandas and polars default to the sample std.
+    """
+    native = _load_native()
+    if native is None:
+        raise RuntimeError(
+            "csv_standardize_params requires the native Rust extension; "
+            "build with `maturin develop`."
+        )
+    return native.csv_standardize_params(path, sample_size=sample_size)
+
+
+def csv_transform_standardize(
+    input_path: str,
+    output_path: str,
+    params: dict[str, dict[str, float]],
+    *,
+    delimiter: str | None = None,
+    has_header: bool | None = None,
+) -> dict[str, Any]:
+    """Standardize numeric columns to zero mean and unit variance, streaming.
+
+    Rows are read, transformed, and written in chunks, so peak memory is bounded
+    by the chunk size rather than by the size of the file.
+
+    Args:
+        input_path: Path to input CSV (can be .csv.gz)
+        output_path: Path to output CSV
+        params: Dict of {col_name: {"mean": ..., "std": ...}, ...}
+        delimiter: Optional delimiter (None = auto-detect)
+        has_header: Whether file has header row (None = auto-detect)
+
+    A column whose std is zero or non-finite is written as 0.0 rather than
+    NaN: a constant column carries no signal to scale, and NaN would propagate
+    into everything downstream.
+    """
+    native = _load_native()
+    if native is None:
+        raise RuntimeError(
+            "csv_transform_standardize requires the native Rust extension; "
+            "build with `maturin develop`."
+        )
+    return native.csv_transform_standardize(input_path, output_path, params, delimiter, has_header)
+
+
+def csv_sgd_regression(
+    path: str,
+    *,
+    target: str,
+    features: list[str] | None = None,
+    epochs: int = 5,
+    learning_rate: float = 0.05,
+    l2: float = 0.0,
+    train_frac: float = 0.8,
+    seed: int = 0,
+    sample_size: int = 1_000_000,
+    delimiter: str | None = None,
+    has_header: bool | None = None,
+    shuffle: bool = True,
+) -> dict[str, Any]:
+    """Fit a linear model by SGD, streaming from CSV in bounded memory.
+
+    Use this instead of :func:`csv_linear_regression` when the feature count is
+    large. The closed-form solver accumulates an X'X matrix, costing O(p^2)
+    memory and O(n p^2) time; this holds only the weight vector, so memory is
+    O(p) and each epoch is O(n p). It never builds a design matrix.
+
+    Features are standardized on the fly from a prior profiling pass, because a
+    single global learning rate cannot suit features on very different scales.
+    Coefficients are returned in the original feature space, so they are
+    directly comparable with the closed-form solver's.
+
+    Rows are visited in file order within each epoch: shuffling a stream would
+    require buffering it, which would give up the bounded memory that is the
+    point. Shuffle on disk first if row order carries meaning.
+
+    Returns a dict with `coef`, `intercept`, `r2` (test set), `train_n`,
+    `test_n`, `epochs`, and `final_train_mse`.
+
+    Raises:
+        ValueError: if the fit diverges, which usually means `learning_rate`
+            is too high for the data.
+    """
+    native = _load_native()
+    if native is None:
+        raise RuntimeError(
+            "csv_sgd_regression requires the native Rust extension; build with `maturin develop`."
+        )
+    return native.csv_sgd_regression(
+        path,
+        target=target,
+        features=features,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        l2=l2,
+        train_frac=train_frac,
+        seed=seed,
+        sample_size=sample_size,
+        delimiter=delimiter,
+        has_header=has_header,
+        shuffle=shuffle,
+    )
+
+
 def csv_linear_regression(
     path: str,
     *,
