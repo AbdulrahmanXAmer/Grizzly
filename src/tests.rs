@@ -601,6 +601,122 @@ fn for_each_field_matches_get_fields() {
 }
 
 // ---------------------------------------------------------------------------
+// micro-benchmarks
+// ---------------------------------------------------------------------------
+//
+// Ignored by default; they measure, they do not assert. Run with:
+//
+//     cargo test --release -- --ignored bench_ --nocapture
+//
+// Living as ignored unit tests rather than a `[[bench]]` target is deliberate:
+// the crate is a cdylib, which benches and integration tests cannot link
+// against, while unit tests compile the crate itself and need no rlib.
+
+fn bench_values(n: usize) -> Vec<f64> {
+    // Deterministic pseudo-random values via the same splitmix64 the crate
+    // uses elsewhere; no external RNG dependency.
+    (0..n)
+        .map(|i| {
+            let r = splitmix64(0x9E37 ^ (i as u64));
+            (r as f64 / u64::MAX as f64) * 2000.0 - 1000.0
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "micro-benchmark: run explicitly with --ignored --nocapture"]
+fn bench_numstats_digest_overhead() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let values = bench_values(2_000_000);
+
+    // Full push: moments + t-digest buffering (sort + centroid merge / 1024).
+    let start = Instant::now();
+    let mut with_digest = NumStats::default();
+    for &v in &values {
+        with_digest.push(v);
+    }
+    with_digest.finalize();
+    let digest_time = start.elapsed();
+    black_box(with_digest.quantile(0.5));
+
+    // Moments only: what a scaler-params scan actually needs.
+    let start = Instant::now();
+    let (mut n, mut mean, mut m2, mut min, mut max) = (0u64, 0.0f64, 0.0f64, f64::MAX, f64::MIN);
+    for &v in &values {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+        n += 1;
+        let delta = v - mean;
+        mean += delta / (n as f64);
+        m2 += (v - mean) * delta;
+    }
+    let moments_time = start.elapsed();
+    black_box((n, mean, m2, min, max));
+
+    let per_value_digest = digest_time.as_nanos() as f64 / values.len() as f64;
+    let per_value_moments = moments_time.as_nanos() as f64 / values.len() as f64;
+    println!("push with t-digest : {per_value_digest:8.2} ns/value");
+    println!("moments only       : {per_value_moments:8.2} ns/value");
+    println!(
+        "digest overhead    : {:8.2}x",
+        per_value_digest / per_value_moments
+    );
+}
+
+#[test]
+#[ignore = "micro-benchmark: run explicitly with --ignored --nocapture"]
+fn bench_process_cell_paths() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    // Realistic numeric fields, formatted once outside the timed region.
+    let fields: Vec<Vec<u8>> = bench_values(500_000)
+        .iter()
+        .map(|v| format!("{v:.6}").into_bytes())
+        .collect();
+
+    let start = Instant::now();
+    let mut stats = ColStats {
+        freq: FreqTracker::new(),
+        ..Default::default()
+    };
+    for field in &fields {
+        process_cell_lite(field, &mut stats);
+    }
+    stats.finalize();
+    let lite = start.elapsed();
+    black_box(stats.num.std_pop());
+
+    let start = Instant::now();
+    let mut stats = ColStats {
+        freq: FreqTracker::new(),
+        ..Default::default()
+    };
+    for field in &fields {
+        process_cell(field, &mut stats, 5, true, true);
+    }
+    stats.finalize();
+    let full = start.elapsed();
+    black_box(stats.num.std_pop());
+
+    let n = fields.len() as f64;
+    println!(
+        "process_cell_lite  : {:8.2} ns/cell",
+        lite.as_nanos() as f64 / n
+    );
+    println!(
+        "process_cell full  : {:8.2} ns/cell",
+        full.as_nanos() as f64 / n
+    );
+}
+
+// ---------------------------------------------------------------------------
 // linear algebra
 // ---------------------------------------------------------------------------
 

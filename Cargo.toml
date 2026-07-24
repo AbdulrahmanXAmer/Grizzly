@@ -12,12 +12,18 @@ crate-type = ["cdylib"]
 # catchable Python exception rather than killing the interpreter. Never enabled
 # in a released wheel.
 testing = []
+# extension-module tells pyo3 to leave Python symbols undefined, which is what
+# a loadable module needs but breaks linking `cargo test --release` binaries.
+# maturin enables it (see pyproject [tool.maturin]); plain cargo builds link
+# against the local libpython instead, which is the documented pyo3 recipe for
+# keeping the crate testable and benchmarkable.
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 # abi3-py310 builds against the CPython stable ABI, so one wheel per platform
 # works on Python 3.10 and every later version, instead of needing a separate
 # wheel per interpreter. The floor matches requires-python in pyproject.toml.
-pyo3 = { version = "0.25", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.25", features = ["abi3-py310"] }
 csv = "1.3"
 flate2 = "1.0"
 ahash = "0.8"
