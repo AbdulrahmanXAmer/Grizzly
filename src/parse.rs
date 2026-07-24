@@ -295,8 +295,16 @@ impl<'a> Iterator for FastLineIter<'a> {
 }
 
 /// Visit each field of a line in order, without allocating.
+///
+/// The explicit lifetime ties the field slices to `line` rather than to the
+/// closure invocation, so a caller may collect them into a scratch buffer
+/// (cleared and reused across lines) instead of allocating a Vec per row.
 #[inline]
-pub fn for_each_field<F: FnMut(usize, &[u8])>(line: &[u8], mode: SplitMode, mut visit: F) {
+pub fn for_each_field<'a, F: FnMut(usize, &'a [u8])>(
+    line: &'a [u8],
+    mode: SplitMode,
+    mut visit: F,
+) {
     match mode {
         SplitMode::Delim(d) => {
             for (i, field) in iter_fields_delim(line, d).enumerate() {

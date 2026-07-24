@@ -1939,11 +1939,16 @@ fn csv_linear_regression(
 
             let p = feature_idx.len();
             let dim = p + 1; // + intercept
-            let mut xtx = vec![0.0f64; dim * dim];
+                             // XtX is symmetric, so only the upper triangle (row-major, r <= c)
+                             // is accumulated: dim*(dim+1)/2 slots instead of dim^2, which also
+                             // halves the multiply-adds per row in the hot loop. Mirrored into a
+                             // full matrix just before the solve.
+            let tri = dim * (dim + 1) / 2;
+            let mut xtx_tri = vec![0.0f64; tri];
             let mut xty = vec![0.0f64; dim];
 
-            // Second pass to evaluate test R2 after solving
-            // We'll do two passes over bytes (fast for in-memory).
+            // Two passes over the mmapped bytes: accumulate on train, then
+            // evaluate on test with the solved coefficients.
 
             // Helper to iterate rows (fast path) – reuse existing FastRowIter
             let data_start = if has_header_actual {
@@ -1964,22 +1969,42 @@ fn csv_linear_regression(
             // the data: with the default sample_size of 1,000,000, every file
             // under 800,000 rows put every row on the train side, leaving the
             // test set empty and reporting r2 = 0.0 for a perfectly good model.
-            let mut counted = 0usize;
-            if fast_csv {
-                let mut it = FastRowIter::new(data_bytes, split_mode);
-                while it.next().is_some() && counted < sample_size {
-                    counted += 1;
+            // Chunk the data once; the same chunks serve the row count, the
+            // training pass, and the evaluation pass. Counting is a parallel
+            // newline scan per chunk, and the per-chunk counts prefix-sum into
+            // each chunk's global starting row index — which is what lets the
+            // accumulation passes run chunk-parallel while agreeing with the
+            // split about which global row is which.
+            let num_threads = rayon::current_num_threads();
+            let byte_chunks: Vec<&[u8]> = if fast_csv {
+                chunk_bytes_aligned(data_bytes, num_threads)
+            } else {
+                Vec::new()
+            };
+            let chunk_rows: Vec<usize> = byte_chunks
+                .par_iter()
+                .map(|c| FastLineIter::new(c).count())
+                .collect();
+            let chunk_base: Vec<usize> = {
+                let mut bases = Vec::with_capacity(chunk_rows.len());
+                let mut acc = 0usize;
+                for &r in &chunk_rows {
+                    bases.push(acc);
+                    acc += r;
                 }
+                bases
+            };
+
+            let counted = if fast_csv {
+                chunk_rows.iter().sum::<usize>().min(sample_size)
             } else {
                 let mut reader = ReaderBuilder::new()
                     .has_headers(has_header_actual)
                     .delimiter(delim_byte_for_detection)
                     .flexible(true)
                     .from_reader(bytes);
-                for _ in reader.byte_records().take(sample_size) {
-                    counted += 1;
-                }
-            }
+                reader.byte_records().take(sample_size).count()
+            };
             let n_rows = counted.max(1);
             let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
 
@@ -1999,66 +2024,110 @@ fn csv_linear_regression(
                 is_train_mask = Some(mask);
             }
 
-            let mut rows_seen = 0usize;
             let mut train_n = 0usize;
             let mut test_assigned = 0usize;
 
             // PASS 1: accumulate XtX/Xty on TRAIN
             if fast_csv {
-                let iter = FastRowIter::new(data_bytes, split_mode);
-                for fields in iter {
-                    if rows_seen >= n_rows {
-                        break;
-                    }
-                    let row_idx = rows_seen;
-                    rows_seen += 1;
+                // Chunk-parallel. Each chunk accumulates its own triangle and
+                // counters; partials are folded in chunk order afterwards, so
+                // the summation order — and therefore the result — is
+                // deterministic for a given thread count.
+                struct TrainPartial {
+                    xtx_tri: Vec<f64>,
+                    xty: Vec<f64>,
+                    train_n: usize,
+                    test_assigned: usize,
+                }
 
-                    if fields.len() < ncols {
-                        continue;
-                    }
+                let partials: Vec<TrainPartial> = byte_chunks
+                    .par_iter()
+                    .zip(chunk_base.par_iter())
+                    .map(|(&chunk, &base)| {
+                        let mut part = TrainPartial {
+                            xtx_tri: vec![0.0f64; tri],
+                            xty: vec![0.0f64; dim],
+                            train_n: 0,
+                            test_assigned: 0,
+                        };
+                        if base >= n_rows {
+                            return part;
+                        }
+                        // Scratch reused across rows: no per-row allocation.
+                        let mut fields: Vec<&[u8]> = Vec::with_capacity(ncols);
+                        let mut x = vec![0.0f64; dim];
 
-                    // Split assignment (stable across passes)
-                    let is_train = if let Some(mask) = &is_train_mask {
-                        mask[row_idx]
-                    } else {
-                        row_idx < train_cut
-                    };
-
-                    let yv = match parse_f64_opt(fields[target_idx]) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    let mut x = vec![0.0f64; dim];
-                    for (j, &idx) in feature_idx.iter().enumerate() {
-                        let v = match parse_f64_opt(fields[idx]) {
-                            Some(v) => v,
-                            None => {
-                                x.clear();
+                        for (local, line) in FastLineIter::new(chunk).enumerate() {
+                            let row_idx = base + local;
+                            if row_idx >= n_rows {
                                 break;
                             }
-                        };
-                        x[j] = v;
-                    }
-                    if x.is_empty() {
-                        continue;
-                    }
-                    x[p] = 1.0; // intercept
-
-                    if is_train {
-                        // xtx += x x^T
-                        for r in 0..dim {
-                            let xr = x[r];
-                            for c in 0..dim {
-                                xtx[r * dim + c] += xr * x[c];
+                            // Split assignment first: pass 1 needs nothing
+                            // from a test row, so it is not worth parsing.
+                            let is_train = if let Some(mask) = &is_train_mask {
+                                mask[row_idx]
+                            } else {
+                                row_idx < train_cut
+                            };
+                            if !is_train {
+                                part.test_assigned += 1;
+                                continue;
                             }
-                            xty[r] += xr * yv;
+
+                            fields.clear();
+                            for_each_field(line, split_mode, |_, f| fields.push(f));
+                            if fields.len() < ncols {
+                                continue;
+                            }
+
+                            let yv = match parse_f64_opt(fields[target_idx]) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            let mut ok = true;
+                            for (j, &idx) in feature_idx.iter().enumerate() {
+                                match parse_f64_opt(fields[idx]) {
+                                    Some(v) => x[j] = v,
+                                    None => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !ok {
+                                continue;
+                            }
+                            x[p] = 1.0; // intercept
+
+                            // Upper triangle only: xtx[r][c] for r <= c.
+                            let mut k = 0usize;
+                            for r in 0..dim {
+                                let xr = x[r];
+                                part.xty[r] += xr * yv;
+                                for &xc in &x[r..dim] {
+                                    part.xtx_tri[k] += xr * xc;
+                                    k += 1;
+                                }
+                            }
+                            part.train_n += 1;
                         }
-                        train_n += 1;
-                    } else {
-                        test_assigned += 1;
+                        part
+                    })
+                    .collect();
+
+                for part in partials {
+                    for (a, b) in xtx_tri.iter_mut().zip(&part.xtx_tri) {
+                        *a += b;
                     }
+                    for (a, b) in xty.iter_mut().zip(&part.xty) {
+                        *a += b;
+                    }
+                    train_n += part.train_n;
+                    test_assigned += part.test_assigned;
                 }
             } else {
+                let mut rows_seen = 0usize;
+                let mut x_scratch = vec![0.0f64; dim];
                 // Safe path: fall back to csv crate parsing (quoted newlines, etc.)
                 let mut reader = ReaderBuilder::new()
                     .has_headers(has_header_actual)
@@ -2073,46 +2142,49 @@ fn csv_linear_regression(
                     };
                     let row_idx = rows_seen;
                     rows_seen += 1;
-                    if record.len() < ncols {
-                        continue;
-                    }
+                    // Same shape as the fast path: split first, parse only
+                    // train rows, accumulate the upper triangle.
                     let is_train = if let Some(mask) = &is_train_mask {
                         mask[row_idx]
                     } else {
                         row_idx < train_cut
                     };
+                    if !is_train {
+                        test_assigned += 1;
+                        continue;
+                    }
+                    if record.len() < ncols {
+                        continue;
+                    }
 
                     let yv = match parse_f64_opt(record.get(target_idx).unwrap_or(&[])) {
                         Some(v) => v,
                         None => continue,
                     };
-                    let mut x = vec![0.0f64; dim];
+                    let mut ok = true;
                     for (j, &idx) in feature_idx.iter().enumerate() {
-                        let v = match record.get(idx).and_then(parse_f64_opt) {
-                            Some(v) => v,
+                        match record.get(idx).and_then(parse_f64_opt) {
+                            Some(v) => x_scratch[j] = v,
                             None => {
-                                x.clear();
+                                ok = false;
                                 break;
                             }
-                        };
-                        x[j] = v;
+                        }
                     }
-                    if x.is_empty() {
+                    if !ok {
                         continue;
                     }
-                    x[p] = 1.0;
-                    if is_train {
-                        for r in 0..dim {
-                            let xr = x[r];
-                            for c in 0..dim {
-                                xtx[r * dim + c] += xr * x[c];
-                            }
-                            xty[r] += xr * yv;
+                    x_scratch[p] = 1.0;
+                    let mut k = 0usize;
+                    for r in 0..dim {
+                        let xr = x_scratch[r];
+                        xty[r] += xr * yv;
+                        for &xc in &x_scratch[r..dim] {
+                            xtx_tri[k] += xr * xc;
+                            k += 1;
                         }
-                        train_n += 1;
-                    } else {
-                        test_assigned += 1;
                     }
+                    train_n += 1;
                 }
             }
 
@@ -2120,6 +2192,20 @@ fn csv_linear_regression(
                 return Err(format!(
                     "Not enough training rows to fit model (train_n={train_n}, params={dim})"
                 ));
+            }
+
+            // Mirror the accumulated upper triangle into the full symmetric
+            // matrix the solver expects.
+            let mut xtx = vec![0.0f64; dim * dim];
+            {
+                let mut k = 0usize;
+                for r in 0..dim {
+                    for c in r..dim {
+                        xtx[r * dim + c] = xtx_tri[k];
+                        xtx[c * dim + r] = xtx_tri[k];
+                        k += 1;
+                    }
+                }
             }
 
             // Optional ridge for stability: XtX += λI
@@ -2140,53 +2226,84 @@ fn csv_linear_regression(
             let mut sum_y = 0.0f64;
             let mut sum_y2 = 0.0f64;
             let mut test_used = 0usize;
-            let mut rows_seen2 = 0usize;
 
             if fast_csv {
-                let iter = FastRowIter::new(data_bytes, split_mode);
-                for fields in iter {
-                    if rows_seen2 >= n_rows {
-                        break;
-                    }
-                    let row_idx = rows_seen2;
-                    rows_seen2 += 1;
-                    if fields.len() < ncols {
-                        continue;
-                    }
-                    let is_train = if let Some(mask) = &is_train_mask {
-                        mask[row_idx]
-                    } else {
-                        row_idx < train_cut
-                    };
-                    if is_train {
-                        continue;
-                    }
+                // Same chunk-parallel shape as pass 1, same deterministic
+                // in-order fold of the partial sums.
+                #[derive(Default)]
+                struct EvalPartial {
+                    ss_res: f64,
+                    sum_y: f64,
+                    sum_y2: f64,
+                    test_used: usize,
+                }
 
-                    let yv = match parse_f64_opt(fields[target_idx]) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    let mut pred = intercept;
-                    for (j, &idx) in feature_idx.iter().enumerate() {
-                        let xv = match parse_f64_opt(fields[idx]) {
-                            Some(v) => v,
-                            None => {
-                                pred = f64::NAN;
+                let partials: Vec<EvalPartial> = byte_chunks
+                    .par_iter()
+                    .zip(chunk_base.par_iter())
+                    .map(|(&chunk, &base)| {
+                        let mut part = EvalPartial::default();
+                        if base >= n_rows {
+                            return part;
+                        }
+                        let mut fields: Vec<&[u8]> = Vec::with_capacity(ncols);
+
+                        for (local, line) in FastLineIter::new(chunk).enumerate() {
+                            let row_idx = base + local;
+                            if row_idx >= n_rows {
                                 break;
                             }
-                        };
-                        pred += coef[j] * xv;
-                    }
-                    if !pred.is_finite() {
-                        continue;
-                    }
-                    let r = yv - pred;
-                    ss_res += r * r;
-                    sum_y += yv;
-                    sum_y2 += yv * yv;
-                    test_used += 1;
+                            let is_train = if let Some(mask) = &is_train_mask {
+                                mask[row_idx]
+                            } else {
+                                row_idx < train_cut
+                            };
+                            if is_train {
+                                continue;
+                            }
+
+                            fields.clear();
+                            for_each_field(line, split_mode, |_, f| fields.push(f));
+                            if fields.len() < ncols {
+                                continue;
+                            }
+
+                            let yv = match parse_f64_opt(fields[target_idx]) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            let mut pred = intercept;
+                            for (j, &idx) in feature_idx.iter().enumerate() {
+                                let xv = match parse_f64_opt(fields[idx]) {
+                                    Some(v) => v,
+                                    None => {
+                                        pred = f64::NAN;
+                                        break;
+                                    }
+                                };
+                                pred += coef[j] * xv;
+                            }
+                            if !pred.is_finite() {
+                                continue;
+                            }
+                            let r = yv - pred;
+                            part.ss_res += r * r;
+                            part.sum_y += yv;
+                            part.sum_y2 += yv * yv;
+                            part.test_used += 1;
+                        }
+                        part
+                    })
+                    .collect();
+
+                for part in partials {
+                    ss_res += part.ss_res;
+                    sum_y += part.sum_y;
+                    sum_y2 += part.sum_y2;
+                    test_used += part.test_used;
                 }
             } else {
+                let mut rows_seen2 = 0usize;
                 let mut reader = ReaderBuilder::new()
                     .has_headers(has_header_actual)
                     .delimiter(delim_byte_for_detection)
