@@ -23,7 +23,12 @@ build/
 ### Local data / playground (kept out of git)
 *.csv
 *.csv.gz
+*.parquet
+data/
 playground/
+
+### Container build context leftovers
+.dockerignore.bak
 
 ### OS / IDE
 .DS_Store

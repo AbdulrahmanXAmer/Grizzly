@@ -254,7 +254,12 @@ def test_sgd_l2_shrinks_coefficients(regression_csv):
 
 
 def test_sgd_reports_divergence_instead_of_returning_nan(regression_csv):
-    """An absurd learning rate must fail loudly, not return NaN coefficients."""
+    """An absurd learning rate must fail loudly, not return NaN coefficients.
+
+    Gradient clipping is disabled here so the guard itself is what is under
+    test; with clipping on, this same learning rate no longer diverges, which
+    is the point of the next test.
+    """
     path, _, _ = regression_csv
 
     with pytest.raises(ValueError, match="diverged"):
@@ -263,8 +268,67 @@ def test_sgd_reports_divergence_instead_of_returning_nan(regression_csv):
             target="target",
             epochs=5,
             learning_rate=1e6,
+            grad_clip=math.inf,
             sample_size=FULL_COVERAGE,
         )
+
+
+def outlier_dataset(tmp_path, name, outlier_x):
+    """A clean linear relationship plus one badly mis-recorded row."""
+    rng = random.Random(5)
+    rows = []
+    for _ in range(4_000):
+        x = rng.gauss(0.0, 1.0)
+        rows.append([f"{x:.6f}", f"{3.0 * x + 1.0 + rng.gauss(0, 0.01):.6f}"])
+    rows.append([f"{outlier_x:.1f}", f"{outlier_x:.1f}"])
+    return write_csv(tmp_path / name, ["x", "target"], rows)
+
+
+def test_gradient_clipping_prevents_divergence_on_an_extreme_outlier(tmp_path):
+    """One absurd row must not diverge the fit.
+
+    Found by running the demo against real NYC taxi data: the feed contains
+    mis-metered trips recorded at tens of thousands of miles, which stay far
+    out even after standardization. Unclipped, a single such row produced a
+    step large enough to diverge the whole model.
+
+    What clipping guarantees is a finite, non-diverged result. It does not
+    guarantee a *good* one: an outlier this extreme also inflates the standard
+    deviation used to standardize, which compresses every ordinary value toward
+    zero and leaves little signal to learn from. That is a property of z-score
+    scaling, not of SGD, and it is why real pipelines winsorize first.
+    """
+    path = outlier_dataset(tmp_path, "extreme.csv", 1_000_000.0)
+
+    result = grizzly.csv_sgd_regression(
+        path, target="target", epochs=20, learning_rate=0.1, sample_size=FULL_COVERAGE
+    )
+
+    assert all(math.isfinite(c) for c in result["coef"])
+    assert math.isfinite(result["intercept"])
+    assert math.isfinite(result["final_train_mse"])
+
+
+def test_a_realistic_outlier_still_leaves_the_signal_learnable(tmp_path):
+    """At a magnitude that does not destroy the scaling, the fit still lands."""
+    path = outlier_dataset(tmp_path, "moderate.csv", 100.0)
+
+    result = grizzly.csv_sgd_regression(
+        path, target="target", epochs=30, learning_rate=0.1, sample_size=FULL_COVERAGE
+    )
+
+    assert result["coef"][0] == pytest.approx(3.0, rel=0.25)
+
+
+def test_grad_clip_is_validated(regression_csv):
+    path, _, _ = regression_csv
+    with pytest.raises(ValueError, match="grad_clip"):
+        grizzly.csv_sgd_regression(path, target="target", grad_clip=0.0)
+
+    # Infinity is legal: it means "do not clip".
+    grizzly.csv_sgd_regression(
+        path, target="target", epochs=1, learning_rate=1e-6, grad_clip=math.inf
+    )
 
 
 def test_sgd_rejects_invalid_arguments(regression_csv):

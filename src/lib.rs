@@ -1707,7 +1707,7 @@ type SgdFit = (Vec<String>, Vec<f64>, f64, usize, usize, f64, usize, f64);
 /// first.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (path, target, features=None, epochs=5, learning_rate=0.05, l2=0.0, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true))]
+#[pyo3(signature = (path, target, features=None, epochs=5, learning_rate=0.05, l2=0.0, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, grad_clip=10.0))]
 fn csv_sgd_regression(
     py: Python<'_>,
     path: String,
@@ -1722,6 +1722,7 @@ fn csv_sgd_regression(
     delimiter: Option<String>,
     has_header: Option<bool>,
     shuffle: bool,
+    grad_clip: f64,
 ) -> PyResult<PyObject> {
     if !(0.0 < train_frac && train_frac < 1.0) {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1736,6 +1737,12 @@ fn csv_sgd_regression(
     if !(learning_rate.is_finite() && learning_rate > 0.0) {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "learning_rate must be positive and finite",
+        ));
+    }
+    // Infinity is a legitimate value here: it disables clipping.
+    if grad_clip.is_nan() || grad_clip <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "grad_clip must be positive (use infinity to disable clipping)",
         ));
     }
 
@@ -1893,10 +1900,25 @@ fn csv_sgd_regression(
                 sq_err += err * err;
                 seen += 1;
 
+                // Clip the per-sample gradient. Real data has outliers that
+                // survive standardization -- a mis-metered taxi trip of 100,000
+                // miles sits a thousand standard deviations out -- and a single
+                // such row produces a step large enough to diverge the fit.
+                // Clipping bounds any one row's influence without needing the
+                // caller to hand-tune the learning rate per dataset.
+                // intercept gradient is err * 1, hence the leading 1.0
+                let grad_sq = 1.0 + x.iter().map(|v| v * v).sum::<f64>();
+                let grad_norm = err.abs() * grad_sq.sqrt();
+                let step = if grad_norm > grad_clip && grad_norm > 0.0 {
+                    lr * (grad_clip / grad_norm)
+                } else {
+                    lr
+                };
+
                 for j in 0..p {
-                    w[j] -= lr * (err * x[j] + l2 * w[j]);
+                    w[j] -= step * (err * x[j] + l2 * w[j]);
                 }
-                b -= lr * err;
+                b -= step * err;
 
                 if epoch == 0 {
                     train_n += 1;

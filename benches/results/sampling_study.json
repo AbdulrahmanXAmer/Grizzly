@@ -1,0 +1,794 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "timestamp_utc": "2026-07-24T19:36:15+00:00",
+    "cpu": "Apple M1",
+    "cpu_count": 8,
+    "memory_bytes": 8589934592,
+    "platform": "macOS-15.7.7-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "python": "3.14.6",
+    "python_implementation": "CPython",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo_profile": "release (lto=true, codegen-units=1, opt-level=3)",
+    "git": {
+      "commit": "759a93351c69616f8db65f7ef76302a6d6980be4",
+      "branch": "track-a-reproducible-benchmarks",
+      "dirty": true
+    }
+  },
+  "dataset": {
+    "rows": 2000000,
+    "distribution": "lognormal(0, 1)",
+    "seed": 1234,
+    "variants": {
+      "shuffled": "rows in random order; the baseline",
+      "sorted": "rows ascending; isolates the t-digest's insertion-order sensitivity, since chunked reading means the sample is stratified across the file rather than a biased prefix"
+    }
+  },
+  "methodology": {
+    "repetitions": 3,
+    "headline_statistic": "median",
+    "process_isolation": "one fresh interpreter per repetition",
+    "rank_error": "tie-aware distance from the requested quantile to the band the estimate answers",
+    "value_error": "absolute error as a fraction of the data range"
+  },
+  "results": [
+    {
+      "distribution": "shuffled",
+      "sample_fraction": 0.001,
+      "sample_size": 2000,
+      "rows_actually_read": 2048,
+      "coverage": 0.001024,
+      "seconds": 0.0013534170066122897,
+      "worst_rank_error": 0.01084750000000001,
+      "worst_value_error_fraction": 0.0004254093029834119,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.49196353610307886,
+          "exact": 0.509109365063509,
+          "rank_error": 0.01084750000000001,
+          "value_error_fraction": 0.00012701582799666186
+        },
+        "median": {
+          "estimate": 0.9983313822934838,
+          "exact": 0.9984051627378261,
+          "rank_error": 2.849999999998687e-05,
+          "value_error_fraction": 5.465634965635267e-07
+        },
+        "p75": {
+          "estimate": 1.9733054641631944,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.00222650000000002,
+          "value_error_fraction": 0.00010333254448879969
+        },
+        "p90": {
+          "estimate": 3.5541153128762506,
+          "exact": 3.597415802302301,
+          "rank_error": 0.002139000000000002,
+          "value_error_fraction": 0.0003207688312885453
+        },
+        "p95": {
+          "estimate": 5.237589780836811,
+          "exact": 5.180163905163103,
+          "rank_error": 0.001080000000000081,
+          "value_error_fraction": 0.0004254093029834119
+        }
+      }
+    },
+    {
+      "distribution": "shuffled",
+      "sample_fraction": 0.005,
+      "sample_size": 10000,
+      "rows_actually_read": 10112,
+      "coverage": 0.005056,
+      "seconds": 0.0013802920002490282,
+      "worst_rank_error": 0.006815500000000002,
+      "worst_value_error_fraction": 0.0005780352024607633,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.4982669778655854,
+          "exact": 0.509109365063509,
+          "rank_error": 0.006815500000000002,
+          "value_error_fraction": 8.032010529108453e-05
+        },
+        "median": {
+          "estimate": 0.9887811339913858,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.003893499999999994,
+          "value_error_fraction": 7.129453948910286e-05
+        },
+        "p75": {
+          "estimate": 1.9188017724292674,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.006634000000000029,
+          "value_error_fraction": 0.00030042930047281433
+        },
+        "p90": {
+          "estimate": 3.519387001712501,
+          "exact": 3.597415802302301,
+          "rank_error": 0.003917000000000059,
+          "value_error_fraction": 0.0005780352024607633
+        },
+        "p95": {
+          "estimate": 5.179303963340167,
+          "exact": 5.180163905163103,
+          "rank_error": 1.7500000000003624e-05,
+          "value_error_fraction": 6.37042530409485e-06
+        }
+      }
+    },
+    {
+      "distribution": "shuffled",
+      "sample_fraction": 0.01,
+      "sample_size": 20000,
+      "rows_actually_read": 20096,
+      "coverage": 0.010048,
+      "seconds": 0.001616207999177277,
+      "worst_rank_error": 0.0036209999999999853,
+      "worst_value_error_fraction": 0.0004024265873751023,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5049272093225708,
+          "exact": 0.509109365063509,
+          "rank_error": 0.002623500000000001,
+          "value_error_fraction": 3.098129437032055e-05
+        },
+        "median": {
+          "estimate": 0.9988482651638203,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.00017750000000005262,
+          "value_error_fraction": 3.2824905494433767e-06
+        },
+        "p75": {
+          "estimate": 1.9370610109075685,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.0036209999999999853,
+          "value_error_fraction": 0.00016516536547951077
+        },
+        "p90": {
+          "estimate": 3.5430923565940664,
+          "exact": 3.597415802302301,
+          "rank_error": 0.002694500000000044,
+          "value_error_fraction": 0.0004024265873751023
+        },
+        "p95": {
+          "estimate": 5.151613862727756,
+          "exact": 5.180163905163103,
+          "rank_error": 0.0005469999999999642,
+          "value_error_fraction": 0.00021149792685056843
+        }
+      }
+    },
+    {
+      "distribution": "shuffled",
+      "sample_fraction": 0.05,
+      "sample_size": 100000,
+      "rows_actually_read": 100096,
+      "coverage": 0.050048,
+      "seconds": 0.002612500000395812,
+      "worst_rank_error": 0.001201500000000022,
+      "worst_value_error_fraction": 0.00016498918024163037,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5109947158784215,
+          "exact": 0.509109365063509,
+          "rank_error": 0.001201500000000022,
+          "value_error_fraction": 1.3966626832271972e-05
+        },
+        "median": {
+          "estimate": 0.9978880252404922,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.00021850000000001035,
+          "value_error_fraction": 3.830940315779955e-06
+        },
+        "p75": {
+          "estimate": 1.9562272278405897,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.0005020000000000024,
+          "value_error_fraction": 2.3182559111293978e-05
+        },
+        "p90": {
+          "estimate": 3.5751439617816145,
+          "exact": 3.597415802302301,
+          "rank_error": 0.0010729999999999906,
+          "value_error_fraction": 0.00016498918024163037
+        },
+        "p95": {
+          "estimate": 5.18977145360627,
+          "exact": 5.180163905163103,
+          "rank_error": 0.00018650000000008937,
+          "value_error_fraction": 7.117245385704071e-05
+        }
+      }
+    },
+    {
+      "distribution": "shuffled",
+      "sample_fraction": 0.1,
+      "sample_size": 200000,
+      "rows_actually_read": 200064,
+      "coverage": 0.100032,
+      "seconds": 0.00527104100183351,
+      "worst_rank_error": 0.001079500000000011,
+      "worst_value_error_fraction": 7.921618627577788e-05,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5104095517858928,
+          "exact": 0.509109365063509,
+          "rank_error": 0.0008365000000000178,
+          "value_error_fraction": 9.631747375700762e-06
+        },
+        "median": {
+          "estimate": 1.0010879284778817,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.001079500000000011,
+          "value_error_fraction": 1.9873854602227297e-05
+        },
+        "p75": {
+          "estimate": 1.9619853735104213,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.0004309999999999592,
+          "value_error_fraction": 1.9473625180930264e-05
+        },
+        "p90": {
+          "estimate": 3.5870301553833395,
+          "exact": 3.597415802302301,
+          "rank_error": 0.0005005000000000148,
+          "value_error_fraction": 7.693658590303381e-05
+        },
+        "p95": {
+          "estimate": 5.190857274660468,
+          "exact": 5.180163905163103,
+          "rank_error": 0.0002075000000000271,
+          "value_error_fraction": 7.921618627577788e-05
+        }
+      }
+    },
+    {
+      "distribution": "shuffled",
+      "sample_fraction": 0.25,
+      "sample_size": 500000,
+      "rows_actually_read": 500096,
+      "coverage": 0.250048,
+      "seconds": 0.007971541002916638,
+      "worst_rank_error": 0.0006680000000000019,
+      "worst_value_error_fraction": 3.517692149903695e-05,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5101451807745343,
+          "exact": 0.509109365063509,
+          "rank_error": 0.0006680000000000019,
+          "value_error_fraction": 7.67329421583869e-06
+        },
+        "median": {
+          "estimate": 0.9993020855300152,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.00036049999999998583,
+          "value_error_fraction": 6.644379304255005e-06
+        },
+        "p75": {
+          "estimate": 1.9560689100952782,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.0005309999999999482,
+          "value_error_fraction": 2.435537260160189e-05
+        },
+        "p90": {
+          "estimate": 3.592667280099282,
+          "exact": 3.597415802302301,
+          "rank_error": 0.00023850000000003035,
+          "value_error_fraction": 3.517692149903695e-05
+        },
+        "p95": {
+          "estimate": 5.179228482231436,
+          "exact": 5.180163905163103,
+          "rank_error": 1.8999999999991246e-05,
+          "value_error_fraction": 6.929587275535897e-06
+        }
+      }
+    },
+    {
+      "distribution": "shuffled",
+      "sample_fraction": 0.5,
+      "sample_size": 1000000,
+      "rows_actually_read": 1000064,
+      "coverage": 0.500032,
+      "seconds": 0.01410158300132025,
+      "worst_rank_error": 0.0006659999999999999,
+      "worst_value_error_fraction": 4.615136190414777e-05,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5091753282428845,
+          "exact": 0.509109365063509,
+          "rank_error": 4.1500000000027626e-05,
+          "value_error_fraction": 4.886534133171669e-07
+        },
+        "median": {
+          "estimate": 0.9967801570893449,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.0006659999999999999,
+          "value_error_fraction": 1.2037997020583667e-05
+        },
+        "p75": {
+          "estimate": 1.959783313674343,
+          "exact": 1.9593566346212765,
+          "rank_error": 6.550000000005163e-05,
+          "value_error_fraction": 3.1608266558090678e-06
+        },
+        "p90": {
+          "estimate": 3.5911858436429736,
+          "exact": 3.597415802302301,
+          "rank_error": 0.00030850000000004485,
+          "value_error_fraction": 4.615136190414777e-05
+        },
+        "p95": {
+          "estimate": 5.175802189487867,
+          "exact": 5.180163905163103,
+          "rank_error": 8.599999999991947e-05,
+          "value_error_fraction": 3.231146941070356e-05
+        }
+      }
+    },
+    {
+      "distribution": "shuffled",
+      "sample_fraction": 1.0,
+      "sample_size": 2000000,
+      "rows_actually_read": 1999980,
+      "coverage": 0.99999,
+      "seconds": 0.026773332996526733,
+      "worst_rank_error": 0.0002315000000000511,
+      "worst_value_error_fraction": 8.954096810634682e-05,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5093499844808465,
+          "exact": 0.509109365063509,
+          "rank_error": 0.00014649999999999386,
+          "value_error_fraction": 1.7825020065068062e-06
+        },
+        "median": {
+          "estimate": 0.9986264335627478,
+          "exact": 0.9984051627378261,
+          "rank_error": 8.900000000000574e-05,
+          "value_error_fraction": 1.6391681675934446e-06
+        },
+        "p75": {
+          "estimate": 1.9586912767779472,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.00011499999999997623,
+          "value_error_fraction": 4.928952550476606e-06
+        },
+        "p90": {
+          "estimate": 3.5946167293411015,
+          "exact": 3.597415802302301,
+          "rank_error": 0.00014199999999997548,
+          "value_error_fraction": 2.0735455288297583e-05
+        },
+        "p95": {
+          "estimate": 5.192251013898426,
+          "exact": 5.180163905163103,
+          "rank_error": 0.0002315000000000511,
+          "value_error_fraction": 8.954096810634682e-05
+        }
+      }
+    },
+    {
+      "distribution": "shuffled",
+      "sample_fraction": 4.0,
+      "sample_size": 8000000,
+      "rows_actually_read": 2000000,
+      "coverage": 1.0,
+      "seconds": 0.02809466700273333,
+      "worst_rank_error": 0.0002315000000000511,
+      "worst_value_error_fraction": 8.95415840886604e-05,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5093475281800247,
+          "exact": 0.509109365063509,
+          "rank_error": 0.00014399999999997748,
+          "value_error_fraction": 1.76430579777276e-06
+        },
+        "median": {
+          "estimate": 0.9986228088113039,
+          "exact": 0.9984051627378261,
+          "rank_error": 8.649999999998936e-05,
+          "value_error_fraction": 1.6123161088805104e-06
+        },
+        "p75": {
+          "estimate": 1.958684529944646,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.00011600000000000499,
+          "value_error_fraction": 4.978932905470174e-06
+        },
+        "p90": {
+          "estimate": 3.594606219301426,
+          "exact": 3.597415802302301,
+          "rank_error": 0.00014199999999997548,
+          "value_error_fraction": 2.0813313372309485e-05
+        },
+        "p95": {
+          "estimate": 5.192251097049696,
+          "exact": 5.180163905163103,
+          "rank_error": 0.0002315000000000511,
+          "value_error_fraction": 8.95415840886604e-05
+        }
+      }
+    },
+    {
+      "distribution": "sorted",
+      "sample_fraction": 0.001,
+      "sample_size": 2000,
+      "rows_actually_read": 2048,
+      "coverage": 0.001024,
+      "seconds": 0.001301374999457039,
+      "worst_rank_error": 0.00417500000000004,
+      "worst_value_error_fraction": 0.0012569499121190637,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5060708707450216,
+          "exact": 0.509109365063509,
+          "rank_error": 0.0018964999999999954,
+          "value_error_fraction": 2.2509082099006037e-05
+        },
+        "median": {
+          "estimate": 0.9902715514986282,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.0032614999999999728,
+          "value_error_fraction": 6.025356770640233e-05
+        },
+        "p75": {
+          "estimate": 1.9336448746760655,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.00417500000000004,
+          "value_error_fraction": 0.0001904720084534455
+        },
+        "p90": {
+          "estimate": 3.5187879195388687,
+          "exact": 3.597415802302301,
+          "rank_error": 0.003946000000000005,
+          "value_error_fraction": 0.000582473186678239
+        },
+        "p95": {
+          "estimate": 5.010488609218195,
+          "exact": 5.180163905163103,
+          "rank_error": 0.0034679999999999156,
+          "value_error_fraction": 0.0012569499121190637
+        }
+      }
+    },
+    {
+      "distribution": "sorted",
+      "sample_fraction": 0.005,
+      "sample_size": 10000,
+      "rows_actually_read": 10112,
+      "coverage": 0.005056,
+      "seconds": 0.0013834159981342964,
+      "worst_rank_error": 0.004168999999999978,
+      "worst_value_error_fraction": 0.0012341184434152281,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5060712693522746,
+          "exact": 0.509109365063509,
+          "rank_error": 0.0018964999999999954,
+          "value_error_fraction": 2.250612922747011e-05
+        },
+        "median": {
+          "estimate": 0.9902328376500337,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.003273999999999999,
+          "value_error_fraction": 6.0540358828926804e-05
+        },
+        "p75": {
+          "estimate": 1.933683489902754,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.004168999999999978,
+          "value_error_fraction": 0.00019018594791928096
+        },
+        "p90": {
+          "estimate": 3.5322699465224003,
+          "exact": 3.597415802302301,
+          "rank_error": 0.0032685000000000075,
+          "value_error_fraction": 0.0004825987026659101
+        },
+        "p95": {
+          "estimate": 5.013570622408879,
+          "exact": 5.180163905163103,
+          "rank_error": 0.0034004999999999175,
+          "value_error_fraction": 0.0012341184434152281
+        }
+      }
+    },
+    {
+      "distribution": "sorted",
+      "sample_fraction": 0.01,
+      "sample_size": 20000,
+      "rows_actually_read": 20096,
+      "coverage": 0.010048,
+      "seconds": 0.0014713330019731075,
+      "worst_rank_error": 0.0043320000000000025,
+      "worst_value_error_fraction": 0.001221302127242148,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5057427831550547,
+          "exact": 0.509109365063509,
+          "rank_error": 0.0021094999999999864,
+          "value_error_fraction": 2.4939545915671846e-05
+        },
+        "median": {
+          "estimate": 0.9896366313716609,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.003530499999999992,
+          "value_error_fraction": 6.495703849364826e-05
+        },
+        "p75": {
+          "estimate": 1.9326909211053747,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.0043320000000000025,
+          "value_error_fraction": 0.000197538870191732
+        },
+        "p90": {
+          "estimate": 3.53918510879625,
+          "exact": 3.597415802302301,
+          "rank_error": 0.0029170000000000584,
+          "value_error_fraction": 0.0004313713712857035
+        },
+        "p95": {
+          "estimate": 5.01530069312898,
+          "exact": 5.180163905163103,
+          "rank_error": 0.0033614999999999062,
+          "value_error_fraction": 0.001221302127242148
+        }
+      }
+    },
+    {
+      "distribution": "sorted",
+      "sample_fraction": 0.05,
+      "sample_size": 100000,
+      "rows_actually_read": 100096,
+      "coverage": 0.050048,
+      "seconds": 0.00239779100229498,
+      "worst_rank_error": 0.00436700000000001,
+      "worst_value_error_fraction": 0.0011603090673745907,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5063138278512656,
+          "exact": 0.509109365063509,
+          "rank_error": 0.0017514999999999892,
+          "value_error_fraction": 2.0709262557561095e-05
+        },
+        "median": {
+          "estimate": 0.990577550658064,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.003147000000000011,
+          "value_error_fraction": 5.798673437383429e-05
+        },
+        "p75": {
+          "estimate": 1.9324647057822018,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.00436700000000001,
+          "value_error_fraction": 0.00019921466706598347
+        },
+        "p90": {
+          "estimate": 3.510929028078473,
+          "exact": 3.597415802302301,
+          "rank_error": 0.004350500000000035,
+          "value_error_fraction": 0.0006406916378410128
+        },
+        "p95": {
+          "estimate": 5.023534128195749,
+          "exact": 5.180163905163103,
+          "rank_error": 0.0031814999999999483,
+          "value_error_fraction": 0.0011603090673745907
+        }
+      }
+    },
+    {
+      "distribution": "sorted",
+      "sample_fraction": 0.1,
+      "sample_size": 200000,
+      "rows_actually_read": 200064,
+      "coverage": 0.100032,
+      "seconds": 0.0036972090019844472,
+      "worst_rank_error": 0.003430000000000044,
+      "worst_value_error_fraction": 0.0010964335941582213,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5060082207649068,
+          "exact": 0.509109365063509,
+          "rank_error": 0.0019335000000000047,
+          "value_error_fraction": 2.2973191423589438e-05
+        },
+        "median": {
+          "estimate": 0.99004737660648,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.0033495000000000053,
+          "value_error_fraction": 6.19142491239051e-05
+        },
+        "p75": {
+          "estimate": 1.9554344487128472,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.0006410000000000027,
+          "value_error_fraction": 2.905544502197626e-05
+        },
+        "p90": {
+          "estimate": 3.5287952302766135,
+          "exact": 3.597415802302301,
+          "rank_error": 0.003430000000000044,
+          "value_error_fraction": 0.0005083393047698168
+        },
+        "p95": {
+          "estimate": 5.032156659385824,
+          "exact": 5.180163905163103,
+          "rank_error": 0.0029914999999999248,
+          "value_error_fraction": 0.0010964335941582213
+        }
+      }
+    },
+    {
+      "distribution": "sorted",
+      "sample_fraction": 0.25,
+      "sample_size": 500000,
+      "rows_actually_read": 500096,
+      "coverage": 0.250048,
+      "seconds": 0.006282166003074963,
+      "worst_rank_error": 0.0033729999999999594,
+      "worst_value_error_fraction": 0.0009352518367080328,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5071727230743852,
+          "exact": 0.509109365063509,
+          "rank_error": 0.0012034999999999962,
+          "value_error_fraction": 1.4346590436038641e-05
+        },
+        "median": {
+          "estimate": 0.9927004761435796,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.0022900000000000142,
+          "value_error_fraction": 4.2260160934878344e-05
+        },
+        "p75": {
+          "estimate": 1.9386760530143996,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.0033729999999999594,
+          "value_error_fraction": 0.0001532011781006421
+        },
+        "p90": {
+          "estimate": 3.5488963274701937,
+          "exact": 3.597415802302301,
+          "rank_error": 0.0024119999999999697,
+          "value_error_fraction": 0.0003594309312186605
+        },
+        "p95": {
+          "estimate": 5.053914537032814,
+          "exact": 5.180163905163103,
+          "rank_error": 0.002534499999999995,
+          "value_error_fraction": 0.0009352518367080328
+        }
+      }
+    },
+    {
+      "distribution": "sorted",
+      "sample_fraction": 0.5,
+      "sample_size": 1000000,
+      "rows_actually_read": 1000064,
+      "coverage": 0.500032,
+      "seconds": 0.011771541998314206,
+      "worst_rank_error": 0.002534499999999995,
+      "worst_value_error_fraction": 0.0005152296792122216,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.5082718096368487,
+          "exact": 0.509109365063509,
+          "rank_error": 0.0005239999999999967,
+          "value_error_fraction": 6.204587497978137e-06
+        },
+        "median": {
+          "estimate": 0.9943242391260578,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.001627500000000004,
+          "value_error_fraction": 3.0231369549767712e-05
+        },
+        "p75": {
+          "estimate": 1.943909703378898,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.002534499999999995,
+          "value_error_fraction": 0.0001144304405629042
+        },
+        "p90": {
+          "estimate": 3.576572232760481,
+          "exact": 3.597415802302301,
+          "rank_error": 0.0010040000000000049,
+          "value_error_fraction": 0.00015440858822691797
+        },
+        "p95": {
+          "estimate": 5.1106132035344665,
+          "exact": 5.180163905163103,
+          "rank_error": 0.001382999999999912,
+          "value_error_fraction": 0.0005152296792122216
+        }
+      }
+    },
+    {
+      "distribution": "sorted",
+      "sample_fraction": 1.0,
+      "sample_size": 2000000,
+      "rows_actually_read": 1998488,
+      "coverage": 0.999244,
+      "seconds": 0.02166962499904912,
+      "worst_rank_error": 0.001075500000000007,
+      "worst_value_error_fraction": 0.000145412066938583,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.510790898477584,
+          "exact": 0.509109365063509,
+          "rank_error": 0.001075500000000007,
+          "value_error_fraction": 1.2456753148867618e-05
+        },
+        "median": {
+          "estimate": 0.9988112622142904,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.000164000000000053,
+          "value_error_fraction": 3.008373719997181e-06
+        },
+        "p75": {
+          "estimate": 1.9620007884661552,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.00043349999999997557,
+          "value_error_fraction": 1.9587818747808152e-05
+        },
+        "p90": {
+          "estimate": 3.577786670501679,
+          "exact": 3.597415802302301,
+          "rank_error": 0.0009385000000000643,
+          "value_error_fraction": 0.000145412066938583
+        },
+        "p95": {
+          "estimate": 5.180062660871035,
+          "exact": 5.180163905163103,
+          "rank_error": 9.999999999177334e-07,
+          "value_error_fraction": 7.500149229683634e-07
+        }
+      }
+    },
+    {
+      "distribution": "sorted",
+      "sample_fraction": 4.0,
+      "sample_size": 8000000,
+      "rows_actually_read": 2000000,
+      "coverage": 1.0,
+      "seconds": 0.020481749997998122,
+      "worst_rank_error": 0.0011014999999999775,
+      "worst_value_error_fraction": 0.00016914758223817393,
+      "quantiles": {
+        "p25": {
+          "estimate": 0.510788399127909,
+          "exact": 0.509109365063509,
+          "rank_error": 0.0010749999999999926,
+          "value_error_fraction": 1.243823803541606e-05
+        },
+        "median": {
+          "estimate": 0.998761466322588,
+          "exact": 0.9984051627378261,
+          "rank_error": 0.00014199999999997548,
+          "value_error_fraction": 2.63948712781147e-06
+        },
+        "p75": {
+          "estimate": 1.9618392200765122,
+          "exact": 1.9593566346212765,
+          "rank_error": 0.00040799999999996395,
+          "value_error_fraction": 1.839092457395677e-05
+        },
+        "p90": {
+          "estimate": 3.5745826203290885,
+          "exact": 3.597415802302301,
+          "rank_error": 0.0011014999999999775,
+          "value_error_fraction": 0.00016914758223817393
+        },
+        "p95": {
+          "estimate": 5.17828775034831,
+          "exact": 5.180163905163103,
+          "rank_error": 3.799999999998249e-05,
+          "value_error_fraction": 1.389850311704632e-05
+        }
+      }
+    }
+  ]
+}

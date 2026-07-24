@@ -269,6 +269,40 @@ jobs:
           name: bench-smoke-results
           path: /tmp/smoke-results.json
 
+  # The demo is the project's front door, so a broken one is a broken README.
+  # Run it offline: CI should not depend on an external dataset host staying up,
+  # and the generated fallback exercises every stage the same way.
+  demo:
+    name: End-to-end demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r benches/requirements.txt
+
+      - name: Build native extension
+        run: maturin develop --release
+
+      - name: Run the pipeline end to end
+        run: python -m demo.pipeline --offline --rows 100000 --json-out /tmp/demo.json
+
+      # The offline fixture injects known drift, so a run reporting none means
+      # a stage silently stopped working.
+      - name: Assert the demo detected the injected drift
+        run: python demo/assert_drift.py /tmp/demo.json
+
   # Fails if the README's published numbers no longer match the committed
   # results.json. Makes it impossible to edit a benchmark table by hand.
   readme-sync:

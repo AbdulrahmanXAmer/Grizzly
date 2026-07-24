@@ -189,6 +189,34 @@ def test_quantiles_are_monotonic_and_within_range(tmp_path, name):
     assert estimates[-1] <= column["max"], f"{name}: p95 above the observed maximum"
 
 
+def test_sampling_is_stratified_not_a_prefix(tmp_path):
+    """A small sample spreads across the file rather than reading its head.
+
+    The profiler splits the file into per-thread chunks and each chunk consumes
+    rows from its own region, so `sample_size` does not mean "the first N rows".
+    That is what makes sampling usable on data with meaningful row order --
+    sorted, time-series, partitioned by date -- where `head -n` or
+    `pandas.read_csv(nrows=...)` would give a badly biased answer.
+
+    Strictly ascending values make the distinction unmissable: a prefix would
+    report a maximum near zero.
+    """
+    n = 200_000
+    values = [float(i) for i in range(n)]
+    path = write_column(tmp_path, "ascending", values)
+
+    profile = grizzly.csv_profile(path, sample_size=256, lite=False)
+    column = profile["columns"][0]
+
+    assert profile["rows_sampled"] < n / 100, "expected a small sample"
+    # A prefix of 256 ascending rows would top out around 255.
+    assert column["max"] > 0.9 * (n - 1), (
+        f"max {column['max']} suggests a prefix was read rather than a spread"
+    )
+    # And the median should land near the true middle, not near the start.
+    assert column["median"] == pytest.approx((n - 1) / 2, rel=0.15)
+
+
 @pytest.mark.parametrize(
     ("name", "values"),
     [

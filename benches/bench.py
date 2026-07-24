@@ -105,18 +105,37 @@ def _command_output(cmd: Sequence[str]) -> str:
 
 
 def _git_state() -> dict[str, Any]:
+    """Best-effort commit provenance.
+
+    Every call here is guarded: git is frequently absent inside a container,
+    and losing the commit label is not a reason to throw away a completed
+    benchmark run.
+    """
+
     def git(*args: str) -> str:
         return _command_output(["git", "-C", str(REPO_ROOT), *args])
 
-    dirty = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        dirty_output = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - informational
+        dirty_output = ""
+
+    commit = git("rev-parse", "HEAD")
+    if commit == "unknown":
+        # Inside the container there is no .git, so the commit is injected at
+        # build time instead. Provenance matters most for exactly those runs,
+        # since they are the ones whose numbers get published.
+        commit = os.environ.get("GRIZZLY_COMMIT", "unknown")
+
     return {
-        "commit": git("rev-parse", "HEAD"),
+        "commit": commit,
         "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
-        "dirty": bool(dirty.stdout.strip()),
+        "dirty": bool(dirty_output.strip()),
     }
 
 

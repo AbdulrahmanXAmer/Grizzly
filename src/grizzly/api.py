@@ -233,6 +233,7 @@ def csv_sgd_regression(
     delimiter: str | None = None,
     has_header: bool | None = None,
     shuffle: bool = True,
+    grad_clip: float = 10.0,
 ) -> dict[str, Any]:
     """Fit a linear model by SGD, streaming from CSV in bounded memory.
 
@@ -249,6 +250,17 @@ def csv_sgd_regression(
     Rows are visited in file order within each epoch: shuffling a stream would
     require buffering it, which would give up the bounded memory that is the
     point. Shuffle on disk first if row order carries meaning.
+
+    `grad_clip` bounds the influence of any single row. Real data contains
+    outliers that survive standardization -- a mis-metered taxi trip recorded
+    as 100,000 miles sits far out even after scaling -- and one such row is
+    enough to diverge an unclipped fit. Pass `math.inf` to disable.
+
+    Clipping guarantees a finite result, not a good one. An extreme outlier
+    also inflates the standard deviation used to standardize, compressing every
+    ordinary value toward zero and leaving little signal to learn from. That is
+    a property of z-score scaling rather than of SGD; winsorize such columns
+    before fitting.
 
     Returns a dict with `coef`, `intercept`, `r2` (test set), `train_n`,
     `test_n`, `epochs`, and `final_train_mse`.
@@ -275,6 +287,7 @@ def csv_sgd_regression(
         delimiter=delimiter,
         has_header=has_header,
         shuffle=shuffle,
+        grad_clip=grad_clip,
     )
 
 

@@ -3,7 +3,9 @@
 # Grizzly
 
 <p align="center">
-  <strong>Rust-powered data profiling and schema inference for Python</strong>
+  <strong>Streaming feature statistics for training pipelines</strong>
+  <br>
+  <sub>Profile, scale, fit, and detect drift on datasets larger than memory — one pass, bounded memory, Rust core</sub>
 </p>
 
 <p align="center">
@@ -37,65 +39,129 @@
 
 ## Overview
 
-Grizzly is a Python package with a **Rust (PyO3) core** for high-performance data operations:
+Grizzly summarises, scales, and fits models over CSV data in a **single
+streaming pass**, with a Rust (PyO3) core. Memory stays bounded by the chunk
+size rather than the file size, so the input can be larger than RAM.
+
+The point is not to be another DataFrame. It is the layer *underneath* one —
+the part of a training pipeline that has to answer "what does this data look
+like, is it still the same as last month, and can I fit a baseline on it"
+without materialising anything.
 
 <table>
 <tr>
 <td width="50%">
 
-### What It Does
+### What it does
 
-- Schema/column detection from any Python data
-- CSV/CSV.GZ profiling with stats & percentiles
-- Fast min-max scaling transforms
-- Rust-native linear regression (no NumPy!)
+- **Profile** — types, null rates, moments, and approximate quantiles in one pass
+- **Standardize / scale** — z-score or min-max, CSV in to CSV out, streaming
+- **Fit** — closed-form or streaming SGD, no design matrix
+- **Detect drift** — compare a batch against a reference profile saved at training time
 
 </td>
 <td width="50%">
 
-### Why It's Fast
+### Why it holds up
 
-- Rust core via PyO3 bindings
-- Sampling-first design
-- Parallel chunked CSV processing
-- Zero-copy where possible
+- Sampling is **stratified across the file**, not a prefix — usable on ordered data
+- Quantile error is **measured**, not asserted ([study below](#performance))
+- SGD is **O(p) memory**, so feature count is not bounded by RAM
+- Every benchmark number here is [regenerated from committed code](benches/README.md)
 
 </td>
 </tr>
 </table>
+
+### Where it fits
+
+| You want to… | Use |
+|---|---|
+| Query, join, reshape | polars / DuckDB — Grizzly does not do this |
+| Load a dataset that fits in RAM and explore it | pandas / polars |
+| Summarise a file **larger than RAM** in one pass | **Grizzly** |
+| Know whether today's batch matches training data | **Grizzly** (`grizzly.drift`) |
+| Fit a baseline without materialising a matrix | **Grizzly** (`csv_sgd_regression`) |
+
+Grizzly is not trying to beat polars at being polars — on full-scan profiling
+they are close, and the numbers below say so plainly. The difference is what
+happens next: nothing in a DataFrame library tells you that a feature stopped
+being populated last Tuesday.
+
+---
+
+## Quick example
+
+```python
+import grizzly
+from grizzly import drift
+
+# One streaming pass: types, nulls, moments, quantiles.
+profile = grizzly.csv_profile("january.csv", sample_size=1_000_000)
+
+# Save it next to the model. The training data itself is not needed again.
+drift.save_reference(profile, "reference.json")
+
+# Standardize for training, streaming CSV to CSV.
+params = grizzly.csv_standardize_params("january.csv")["params"]
+grizzly.csv_transform_standardize("january.csv", "scaled.csv", params)
+
+# Fit in bounded memory: only the weight vector is held.
+model = grizzly.csv_sgd_regression("scaled.csv", target="tip_amount", epochs=10)
+print(model["r2"], model["coef"])
+
+# Months later, against the same reference.
+report = drift.detect_drift("june.csv", "reference.json")
+print(drift.format_report(report))
+```
+
+```text
+Drift verdict: SIGNIFICANT  (1 significant, 0 moderate, 5 stable)
+
+  column                   severity          PSI   mean shift    null Δ
+  ---------------------------------------------------------------------
+  tip_amount               significant    0.3483        +0.06    +0.0%
+  passenger_count          stable         0.0438        -0.07    +0.0%
+  fare_amount              stable         0.0081        +0.01    +0.0%
+```
+
+<sub>Real output from `make demo` on NYC yellow taxi trips, January vs June 2024.</sub>
 
 ---
 
 ## Features
 
-<table>
-<tr>
-<td align="center" width="25%">
+| Capability | Function | Memory |
+|---|---|---|
+| **Profile** a CSV — types, nulls, moments, quantiles | `csv_profile` | bounded by chunk |
+| **Infer a schema** from nested Python data | `detect_schema` | bounded by sample |
+| **Standardize** to zero mean / unit variance | `csv_standardize_params` + `csv_transform_standardize` | bounded by chunk |
+| **Min-max scale** to [0, 1] | `csv_minmax_params` + `csv_transform_minmax` | bounded by chunk |
+| **Fit** exactly (normal equations) | `csv_linear_regression` | O(p²) |
+| **Fit** by streaming SGD | `csv_sgd_regression` | **O(p)** |
+| **Detect drift** against a saved profile | `grizzly.drift` | profile-only |
+
+The two fit paths return coefficients in the same space, so they are directly
+comparable — the SGD one exists for when `p` is large enough that an X'X matrix
+stops being an option.
+
+<details>
+<summary><strong>What drift detection reports</strong></summary>
 <br>
-<strong>Schema Inference</strong>
-<br><br>
-<sub>Detect types from nested dicts, lists, iterables</sub>
-</td>
-<td align="center" width="25%">
-<br>
-<strong>CSV Profiling</strong>
-<br><br>
-<sub>Stats, percentiles, outliers, missing data</sub>
-</td>
-<td align="center" width="25%">
-<br>
-<strong>Fast Transforms</strong>
-<br><br>
-<sub>Streaming min-max scaling, CSV in to CSV out</sub>
-</td>
-<td align="center" width="25%">
-<br>
-<strong>Native ML</strong>
-<br><br>
-<sub>Linear regression without NumPy</sub>
-</td>
-</tr>
-</table>
+
+| Metric | Catches |
+|---|---|
+| `psi` | Distribution shape change, binned on the reference quantiles |
+| `mean_shift_in_std` | A distribution sliding bodily, in reference std units |
+| `null_rate_change` | A feature that quietly stopped being populated |
+| `type_changed` | Upstream schema or parsing failure |
+| `mode_changed` | The dominant categorical level changing |
+| `missing_columns` | A feature that disappeared entirely |
+
+PSI is suppressed when a column's type changed, where it would be meaningless.
+Comparison is profile-to-profile, so the training data does not need to be kept.
+
+</details>
 
 <details>
 <summary><strong>Path Notation (Schema Inference)</strong></summary>
@@ -333,7 +399,13 @@ Reproduce with:
 python -m pip install -r benches/requirements.txt
 maturin develop --release
 python -m benches.bench --strict
+
+# Or, for a comparison that is not at the mercy of whatever else your laptop
+# is doing, run it in a container pinned to a fixed CPU and memory allocation:
+make docker-bench
 ```
+
+### Full-scan comparison
 
 <!-- BENCH:START -->
 
@@ -341,36 +413,35 @@ python -m benches.bench --strict
 
 | Workload | Dataset | Grizzly | vs pandas | vs polars |
 |----------|---------|--------:|-----------|-----------|
-| **Profile** 📉 | numeric, 100,000 rows (19.0 MB) | 27.8 ms | 13.65x faster | 3.09x faster |
-| **Profile** 📉 | numeric, 500,000 rows (95.2 MB) | 227.9 ms | 9.58x faster | 1.57x faster |
-| **Profile** 📉 | mixed, 100,000 rows (14.2 MB) | 88.4 ms | 4.56x faster | 1.12x slower |
-| **Profile** 📉 | mixed, 500,000 rows (70.9 MB) | 360.8 ms | 4.53x faster | 1.39x slower |
-| **Transform** 📉 | numeric, 100,000 rows (19.0 MB) | 94.5 ms | 22.47x faster | 1.02x slower |
-| **Transform** 📉 | numeric, 500,000 rows (95.2 MB) | 1470.4 ms | 15.95x faster | 1.10x faster |
+| **Profile** 📉 | numeric, 100,000 rows (19.0 MB) | 65.3 ms | 4.83x faster | 1.43x faster |
+| **Profile** 📉 | numeric, 500,000 rows (95.2 MB) | 297.3 ms | 6.68x faster | 1.22x faster |
+| **Profile** | mixed, 100,000 rows (14.2 MB) | 52.0 ms | 4.49x faster | 1.27x faster |
+| **Profile** 📉 | mixed, 500,000 rows (70.9 MB) | 222.3 ms | 6.24x faster | 1.84x faster |
+| **Transform** 📉 | numeric, 100,000 rows (19.0 MB) | 174.0 ms | 14.48x faster | 1.35x slower |
+| **Transform** 📉 | numeric, 500,000 rows (95.2 MB) | 928.2 ms | 14.10x faster | 1.08x slower |
 
-> 📉 **These measurements are too noisy to publish.** In the cells below, at least one library's standard deviation exceeded 20% of its median, which means the measuring machine was busy and the ratios above are not reliable. Re-run `python -m benches.bench --strict && python -m benches.render --write` on an idle machine before quoting these numbers.
+> 📉 **Noisy measurement.** In the cells below, at least one library's standard deviation exceeded 20% of its median, so the ratios are indicative rather than precise. Running `make docker-bench` pins the software environment and the CPU/memory allocation, which removes most of this; the rest is whatever else the host is doing, and only an idle machine fixes that.
 >
-> - Profile / numeric_100000 (grizzly, pandas, polars)
-> - Profile / numeric_500000 (grizzly, polars)
-> - Profile / mixed_100000 (polars)
-> - Profile / mixed_500000 (grizzly, pandas, polars)
-> - Transform / numeric_100000 (grizzly, polars)
-> - Transform / numeric_500000 (grizzly, polars)
+> - Profile / numeric_100000 (polars)
+> - Profile / numeric_500000 (grizzly)
+> - Profile / mixed_500000 (pandas, polars)
+> - Transform / numeric_100000 (polars)
+> - Transform / numeric_500000 (grizzly)
 
 <details>
 <summary><strong>Measurement environment and methodology</strong></summary>
 
 | | |
 |---|---|
-| CPU | Apple M1 (8 cores) |
-| Memory | 8.0 GB |
-| Platform | macOS-15.7.7-arm64-arm-64bit-Mach-O |
-| Python | 3.14.6 (CPython) |
-| Rust | rustc 1.97.1 (8bab26f4f 2026-07-14) |
+| CPU | unknown (8 cores) |
+| Memory | 3.8 GB |
+| Platform | Linux-6.12.76-linuxkit-aarch64-with-glibc2.36 |
+| Python | 3.12.13 (CPython) |
+| Rust | rustc 1.90.0 (1159e78c4 2025-09-14) |
 | Cargo profile | release (lto=true, codegen-units=1, opt-level=3) |
 | Libraries | grizzly 0.1.0, pandas 3.0.5, polars 1.43.0 |
-| Grizzly commit | `606711d52c42 (dirty working tree)` |
-| Measured | 2026-07-24T18:29:15+00:00 |
+| Grizzly commit | `unknown` |
+| Measured | 2026-07-24T20:11:03+00:00 |
 
 - **Repetitions:** 7 timed runs per cell, 1 warmup run discarded; headline figure is the median.
 - **Isolation:** one fresh interpreter per repetition.
@@ -389,53 +460,103 @@ Reproduce with `python -m benches.bench --strict`. See [`benches/README.md`](ben
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| **grizzly** | 27.8 ms | 15.1 ms | 27.2 ms | 51.8 MB |
-| polars | 85.8 ms | 47.4 ms | 60.5 ms | 95.6 MB |
-| pandas | 379.0 ms | 187.2 ms | 242.0 ms | 146.7 MB |
+| **grizzly** | 65.3 ms | 11.7 ms | 49.5 ms | 39.1 MB |
+| polars | 93.4 ms | 123.2 ms | 81.8 ms | 87.3 MB |
+| pandas | 315.0 ms | 50.7 ms | 261.4 ms | 130.6 MB |
 
 **Profile — numeric, 500,000 rows (95.2 MB)**
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| **grizzly** | 227.9 ms | 95.3 ms | 164.2 ms | 129.5 MB |
-| polars | 357.5 ms | 85.3 ms | 291.9 ms | 236.2 MB |
-| pandas | 2183.0 ms | 390.7 ms | 1571.6 ms | 236.0 MB |
+| **grizzly** | 297.3 ms | 132.7 ms | 256.6 ms | 115.2 MB |
+| polars | 362.3 ms | 21.5 ms | 354.2 ms | 227.6 MB |
+| pandas | 1984.8 ms | 228.5 ms | 1501.3 ms | 234.7 MB |
 
 **Profile — mixed, 100,000 rows (14.2 MB)**
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| polars | 78.6 ms | 38.8 ms | 59.1 ms | 104.3 MB |
-| **grizzly** | 88.4 ms | 9.3 ms | 79.2 ms | 73.3 MB |
-| pandas | 403.5 ms | 74.2 ms | 374.4 ms | 141.7 MB |
+| **grizzly** | 52.0 ms | 6.3 ms | 49.8 ms | 50.0 MB |
+| polars | 65.8 ms | 11.1 ms | 61.1 ms | 101.0 MB |
+| pandas | 233.0 ms | 33.0 ms | 220.3 ms | 137.2 MB |
 
 **Profile — mixed, 500,000 rows (70.9 MB)**
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| polars | 260.2 ms | 87.9 ms | 162.5 ms | 261.8 MB |
-| **grizzly** | 360.8 ms | 112.5 ms | 331.3 ms | 162.9 MB |
-| pandas | 1633.1 ms | 801.9 ms | 1368.4 ms | 254.4 MB |
+| **grizzly** | 222.3 ms | 10.5 ms | 213.3 ms | 133.5 MB |
+| polars | 409.5 ms | 123.0 ms | 391.7 ms | 271.1 MB |
+| pandas | 1386.2 ms | 295.9 ms | 1098.3 ms | 276.7 MB |
 
 **Transform — numeric, 100,000 rows (19.0 MB)**
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| polars | 92.3 ms | 18.6 ms | 68.7 ms | 114.2 MB |
-| **grizzly** | 94.5 ms | 36.9 ms | 80.4 ms | 101.5 MB |
-| pandas | 2123.4 ms | 124.9 ms | 1950.3 ms | 192.8 MB |
+| polars | 128.8 ms | 27.5 ms | 109.9 ms | 145.7 MB |
+| **grizzly** | 174.0 ms | 20.6 ms | 142.8 ms | 79.8 MB |
+| pandas | 2520.3 ms | 326.7 ms | 2412.5 ms | 169.1 MB |
 
 **Transform — numeric, 500,000 rows (95.2 MB)**
 
 | Library | Median | Std dev | Min | Peak RSS |
 |---------|-------:|--------:|----:|---------:|
-| **grizzly** | 1470.4 ms | 501.2 ms | 712.9 ms | 325.1 MB |
-| polars | 1613.4 ms | 821.9 ms | 1287.4 ms | 258.5 MB |
-| pandas | 23458.4 ms | 3141.8 ms | 20315.6 ms | 405.7 MB |
+| polars | 855.9 ms | 135.2 ms | 780.7 ms | 275.8 MB |
+| **grizzly** | 928.2 ms | 242.3 ms | 850.2 ms | 312.0 MB |
+| pandas | 13082.9 ms | 297.4 ms | 12563.5 ms | 432.1 MB |
 
 </details>
 
 <!-- BENCH:END -->
+
+### What sampling actually costs
+
+A speed comparison answers the wrong question if the tool gets to read less
+data than the thing it is compared against. Grizzly's `sample_size` is exactly
+that lever, so here is the tradeoff curve it buys — accuracy against time, on
+the same file.
+
+<!-- STUDY:START -->
+
+<!-- Generated by `python -m benches.render --write`. Do not edit by hand. -->
+
+Dataset: 2,000,000 rows drawn from lognormal(0, 1), seed 1234.
+
+| Rows read | Coverage | Time | vs full scan | Worst rank error | Worst value error |
+|----------:|---------:|-----:|-------------:|-----------------:|------------------:|
+| 2,048 | 0.1% | 1.4 ms | 5% | 0.01085 | 0.0425% |
+| 10,112 | 0.5% | 1.4 ms | 5% | 0.00682 | 0.0578% |
+| 20,096 | 1.0% | 1.6 ms | 6% | 0.00362 | 0.0402% |
+| 100,096 | 5.0% | 2.6 ms | 9% | 0.00120 | 0.0165% |
+| 200,064 | 10.0% | 5.3 ms | 19% | 0.00108 | 0.0079% |
+| 500,096 | 25.0% | 8.0 ms | 28% | 0.00067 | 0.0035% |
+| 1,000,064 | 50.0% | 14.1 ms | 50% | 0.00067 | 0.0046% |
+| 1,999,980 | 100.0% | 26.8 ms | 95% | 0.00023 | 0.0090% |
+| 2,000,000 | 100.0% | 28.1 ms | 100% | 0.00023 | 0.0090% |
+
+<details>
+<summary><strong>The same sweep on pre-sorted input</strong></summary>
+
+Rows are read in per-thread chunks, each consuming from its own region of the file, so a small sample is spread across the whole file rather than taken from the front. Sampling therefore stays usable on data with meaningful row order, where `head -n` or `pandas.read_csv(nrows=...)` would give a badly biased answer.
+
+What sorted input does cost is t-digest accuracy, which is sensitive to insertion order: at full coverage it lands at 0.00110 rank error against 0.00023 for shuffled input.
+
+| Rows read | Coverage | Time | Worst rank error | Worst value error |
+|----------:|---------:|-----:|-----------------:|------------------:|
+| 2,048 | 0.1% | 1.3 ms | 0.00418 | 0.1257% |
+| 10,112 | 0.5% | 1.4 ms | 0.00417 | 0.1234% |
+| 20,096 | 1.0% | 1.5 ms | 0.00433 | 0.1221% |
+| 100,096 | 5.0% | 2.4 ms | 0.00437 | 0.1160% |
+| 200,064 | 10.0% | 3.7 ms | 0.00343 | 0.1096% |
+| 500,096 | 25.0% | 6.3 ms | 0.00337 | 0.0935% |
+| 1,000,064 | 50.0% | 11.8 ms | 0.00253 | 0.0515% |
+| 1,998,488 | 99.9% | 21.7 ms | 0.00108 | 0.0145% |
+| 2,000,000 | 100.0% | 20.5 ms | 0.00110 | 0.0169% |
+
+</details>
+
+Reproduce with `python -m benches.study_sampling`.
+
+<!-- STUDY:END -->
 
 ---
 

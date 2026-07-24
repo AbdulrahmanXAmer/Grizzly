@@ -5,6 +5,25 @@ claim is not reproducible from this directory, it should not be in the README.
 
 ## Reproducing
 
+The published numbers come from a container, not a laptop. Pinning the image
+and the CPU/memory allocation fixes the software half of the environment --
+same Python, same compiler, same library versions, same core count -- which a
+developer machine cannot promise:
+
+```bash
+make docker-bench       # pinned CPU/memory, writes data/container-results.json
+make docker-study       # the sampling accuracy-vs-speed sweep
+```
+
+To publish a run, copy its results over the committed ones and regenerate:
+
+```bash
+cp data/container-results.json benches/results/results.json
+make render
+```
+
+On the host directly, which is faster to iterate on but noisier:
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install -U pip maturin
@@ -99,8 +118,26 @@ Stated explicitly, because a benchmark that hides its caveats is not evidence.
   rather than bytes.
 - **Approximate quantiles.** Grizzly's percentiles come from a t-digest, which
   is approximate by construction; pandas and polars compute them exactly. The
-  fingerprint therefore compares min/max/mean rather than quantiles. Quantifying
-  that approximation error is worth doing and is not yet covered here.
+  fingerprint therefore compares min/max/mean rather than quantiles. The size of
+  that approximation is measured separately by `study_sampling.py` and by
+  `tests/test_quantile_accuracy.py`.
+- **The container fixes software, not hardware.** Pinning the image and the
+  CPU/memory allocation removes version and core-count variation. It does not
+  make the host machine idle, so cells whose standard deviation exceeds 20% of
+  their median are still flagged in the rendered output.
+
+## The sampling study
+
+`study_sampling.py` answers the question a speed comparison cannot: what does
+reading less data cost in accuracy? It sweeps `sample_size` over a fixed file
+and reports rank error, value error, and wall-clock at each setting.
+
+Its most useful finding is structural rather than numeric. Sampling does **not**
+read a prefix -- the profiler splits the file into per-thread chunks and each
+consumes from its own region, so a small sample is spread across the whole file.
+Profiling 200,000 strictly ascending rows with `sample_size=256` reports a
+maximum of 198,566, not 255. That is what makes sampling usable on data with
+meaningful row order, where `head -n` would be badly biased.
 
 ## Files
 
@@ -109,6 +146,9 @@ Stated explicitly, because a benchmark that hides its caveats is not evidence.
 | `gen_data.py` | Deterministic dataset generation. |
 | `_runner.py` | One measurement in an isolated process. |
 | `bench.py` | Driver: repetitions, equivalence checks, environment capture. |
-| `render.py` | Renders `results.json` into the README tables. |
+| `_study_runner.py` | One profiling measurement for the sampling study. |
+| `study_sampling.py` | Accuracy-vs-speed sweep over `sample_size`. |
+| `render.py` | Renders results into the README's generated sections. |
 | `requirements.txt` | Pinned comparison libraries. |
-| `results/results.json` | Committed results from the last recorded run. |
+| `results/results.json` | Committed benchmark results. |
+| `results/sampling_study.json` | Committed sampling-study results. |
