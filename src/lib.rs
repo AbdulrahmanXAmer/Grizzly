@@ -1785,8 +1785,22 @@ fn detect_schema(
 
 // Module registration.
 
+/// Panic on purpose, to verify how panics cross the FFI boundary.
+///
+/// PyO3 wraps every #[pyfunction] body in catch_unwind and converts a caught
+/// panic into a Python PanicException. That only works if panics unwind: under
+/// `panic = "abort"` the process dies instead, and no Python-level handler ever
+/// runs. Gated behind the `testing` feature so it never ships.
+#[cfg(feature = "testing")]
+#[pyfunction]
+fn _force_panic() {
+    panic!("deliberate panic: verifying panic propagation across the FFI boundary");
+}
+
 #[pymodule]
 fn _grizzly(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(feature = "testing")]
+    m.add_function(wrap_pyfunction!(_force_panic, m)?)?;
     m.add_function(wrap_pyfunction!(detect_schema, m)?)?;
     m.add_function(wrap_pyfunction!(csv_profile, m)?)?;
     m.add_function(wrap_pyfunction!(csv_minmax_params, m)?)?;
