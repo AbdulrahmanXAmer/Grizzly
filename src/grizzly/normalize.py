@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Iterable, List, Mapping, Sequence
+from typing import Any
 
 
 def _is_seq(x: Any) -> bool:
@@ -51,7 +52,7 @@ def normalize(data: Any, *, sample_size: int = 1000) -> Any:
             import gzip
 
             open_fn = gzip.open if p.lower().endswith(".gz") else open
-            records: List[dict] = []
+            records: list[dict] = []
             with open_fn(p, mode="rt", newline="") as f:  # type: ignore[arg-type]
                 # Peek first non-empty line to decide delimiter/header handling.
                 first = ""
@@ -97,9 +98,11 @@ def normalize(data: Any, *, sample_size: int = 1000) -> Any:
                         cols = [t.strip() or f"col_{i}" for i, t in enumerate(tokens)]
                     else:
                         cols = [f"col_{i}" for i in range(len(tokens))]
-                        records.append({cols[i]: coerce_scalar(tokens[i]) for i in range(len(tokens))})
+                        records.append(
+                            {cols[i]: coerce_scalar(tokens[i]) for i in range(len(tokens))}
+                        )
 
-                    for i, line in enumerate(f):
+                    for line in f:
                         if len(records) >= sample_size:
                             break
                         if not line.strip():
@@ -119,7 +122,9 @@ def normalize(data: Any, *, sample_size: int = 1000) -> Any:
                 except StopIteration:
                     return []
                 header = [h.strip() for h in header]
-                if all(h == "" for h in header) or all(not any(ch.isalpha() for ch in h) for h in header):
+                if all(h == "" for h in header) or all(
+                    not any(ch.isalpha() for ch in h) for h in header
+                ):
                     cols = [f"col_{i}" for i in range(len(header))]
                     # Treat first row as data
                     records.append({cols[i]: coerce_scalar(header[i]) for i in range(len(cols))})
@@ -172,7 +177,7 @@ def normalize(data: Any, *, sample_size: int = 1000) -> Any:
                 n = min(int(data.shape[0]), sample_size)
                 arr = data[:n]
                 cols = [f"col_{i}" for i in range(int(arr.shape[1]))]
-                return [dict(zip(cols, row.tolist())) for row in arr]
+                return [dict(zip(cols, row.tolist(), strict=True)) for row in arr]
             # higher dims: keep nested lists (Rust will produce [][][] paths)
             n = min(int(data.shape[0]), sample_size)
             return data[:n].tolist()
@@ -208,12 +213,10 @@ def normalize(data: Any, *, sample_size: int = 1000) -> Any:
     return data
 
 
-def _pyarrow_table_to_records(table: Any, *, sample_size: int) -> List[dict]:
+def _pyarrow_table_to_records(table: Any, *, sample_size: int) -> list[dict]:
     # pyarrow.Table supports .slice and .to_pylist()
     try:
         return table.slice(0, sample_size).to_pylist()
     except Exception:
         # fallback: best-effort conversion
         return list(table.to_pydict().items())  # type: ignore
-
-

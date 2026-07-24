@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any
 
 
 def _load_native():
@@ -28,7 +28,7 @@ def detect_schema(
     sample_size: int = 1000,
     max_examples: int = 5,
     normalize_input: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Infer a flattened schema from arbitrary Python data.
 
@@ -51,7 +51,7 @@ def detect_schema(
     return py_detect_schema(data, sample_size=sample_size, max_examples=max_examples)
 
 
-def detect_columns(data: Any, *, sample_size: int = 1000) -> List[str]:
+def detect_columns(data: Any, *, sample_size: int = 1000) -> list[str]:
     """Convenience wrapper returning just the sorted column paths."""
     schema = detect_schema(data, sample_size=sample_size)
     return [c["path"] for c in schema.get("columns", [])]
@@ -87,10 +87,10 @@ def csv_profile(
     lite: bool = False,
     track_freq: bool = True,
     collect_examples: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Rust-accelerated CSV profiling: delimiter/header sniff + dtype + basic stats per column.
-    
+
     Args:
         path: Path to CSV file (supports .csv.gz)
         sample_size: Maximum number of rows to sample
@@ -103,16 +103,18 @@ def csv_profile(
               Use this for Polars-equivalent benchmarking speed.
         track_freq: If True, track value frequency for mode calculation.
         collect_examples: If True, collect example values per column.
-    
+
     Returns: Profile dict with columns, stats, delimiter info, etc.
     """
     native = _load_native()
     if native is None:
-        raise RuntimeError("csv_profile requires the native Rust extension; build with `maturin develop`.")
+        raise RuntimeError(
+            "csv_profile requires the native Rust extension; build with `maturin develop`."
+        )
     return native.csv_profile(
-        path, 
-        sample_size=sample_size, 
-        max_examples=max_examples, 
+        path,
+        sample_size=sample_size,
+        max_examples=max_examples,
         fast_csv=fast_csv,
         lite=lite,
         track_freq=track_freq,
@@ -120,34 +122,36 @@ def csv_profile(
     )
 
 
-def csv_minmax_params(path: str, *, sample_size: int = 1000) -> Dict[str, Any]:
+def csv_minmax_params(path: str, *, sample_size: int = 1000) -> dict[str, Any]:
     """
     Return min/max per numeric column (sampled), suitable for min-max scaling.
     """
     native = _load_native()
     if native is None:
-        raise RuntimeError("csv_minmax_params requires the native Rust extension; build with `maturin develop`.")
+        raise RuntimeError(
+            "csv_minmax_params requires the native Rust extension; build with `maturin develop`."
+        )
     return native.csv_minmax_params(path, sample_size=sample_size)
 
 
 def csv_transform_minmax(
     input_path: str,
     output_path: str,
-    params: Dict[str, Dict[str, float]],
+    params: dict[str, dict[str, float]],
     *,
     delimiter: str | None = None,
     has_header: bool | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Transform a CSV by applying min-max scaling to numeric columns.
-    
+
     Args:
         input_path: Path to input CSV (can be .csv.gz)
         output_path: Path to output CSV
         params: Dict of {col_name: {"min": ..., "max": ...}, ...}
         delimiter: Optional delimiter (None = auto-detect)
         has_header: Whether file has header row (None = auto-detect)
-    
+
     Returns: {
         "input_path": ...,
         "output_path": ...,
@@ -158,7 +162,9 @@ def csv_transform_minmax(
     """
     native = _load_native()
     if native is None:
-        raise RuntimeError("csv_transform_minmax requires the native Rust extension; build with `maturin develop`.")
+        raise RuntimeError(
+            "csv_transform_minmax requires the native Rust extension; build with `maturin develop`."
+        )
     return native.csv_transform_minmax(input_path, output_path, params, delimiter, has_header)
 
 
@@ -166,7 +172,7 @@ def csv_linear_regression(
     path: str,
     *,
     target: str,
-    features: List[str] | None = None,
+    features: list[str] | None = None,
     train_frac: float = 0.8,
     seed: int = 0,
     sample_size: int = 1_000_000,
@@ -176,7 +182,7 @@ def csv_linear_regression(
     shuffle: bool = True,
     ridge_lambda: float = 0.0,
     return_debug: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Rust-native linear regression on CSV/CSV.GZ (no numpy required).
 
@@ -185,7 +191,9 @@ def csv_linear_regression(
     """
     native = _load_native()
     if native is None:
-        raise RuntimeError("csv_linear_regression requires the native Rust extension; build with `maturin develop`.")
+        raise RuntimeError(
+            "csv_linear_regression requires the native Rust extension; build with `maturin develop`."
+        )
     return native.csv_linear_regression(
         path,
         target=target,
@@ -200,5 +208,3 @@ def csv_linear_regression(
         ridge_lambda=ridge_lambda,
         return_debug=return_debug,
     )
-
-

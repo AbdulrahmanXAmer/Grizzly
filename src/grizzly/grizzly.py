@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, TextIO, Tuple, Union
+from typing import Any, TextIO
 
 from .api import (
+    csv_linear_regression,
     csv_minmax_params,
     csv_profile,
     csv_transform_minmax,
-    csv_linear_regression,
     detect_columns,
     detect_schema,
     is_native,
@@ -38,11 +39,11 @@ class MinMaxScaler:
     """
 
     input_path: str
-    params: Dict[str, Dict[str, float]]
+    params: dict[str, dict[str, float]]
     delimiter: str | None
     has_header: bool | None
 
-    def transform(self, output_path: str) -> Dict[str, Any]:
+    def transform(self, output_path: str) -> dict[str, Any]:
         return csv_transform_minmax(
             self.input_path,
             output_path,
@@ -70,10 +71,10 @@ class Grizzly:
     fast_csv: bool = True
     # Cache keyed by a richer signature to prevent accidental reuse across config changes.
     # (path is per-object, but sample_size/max_examples/fast_csv can vary per instance)
-    _csv_profile_cache: Dict[Tuple[int, int, bool, bool, bool, bool, Optional[Tuple[str, ...]]], Dict[str, Any]] = field(
-        default_factory=dict, init=False, repr=False
-    )
-    _selected_cols: Optional[Tuple[str, ...]] = field(default=None, init=False, repr=False)
+    _csv_profile_cache: dict[
+        tuple[int, int, bool, bool, bool, bool, tuple[str, ...] | None], dict[str, Any]
+    ] = field(default_factory=dict, init=False, repr=False)
+    _selected_cols: tuple[str, ...] | None = field(default=None, init=False, repr=False)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -85,7 +86,7 @@ class Grizzly:
         lite: bool,
         track_freq: bool,
         collect_examples: bool,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Internal cached profile snapshot.
 
@@ -96,7 +97,15 @@ class Grizzly:
             raise TypeError("Grizzly profile is only available for filesystem paths (str).")
 
         selected_sig = self._selected_cols
-        key = (self.sample_size, self.max_examples, self.fast_csv, lite, track_freq, collect_examples, selected_sig)
+        key = (
+            self.sample_size,
+            self.max_examples,
+            self.fast_csv,
+            lite,
+            track_freq,
+            collect_examples,
+            selected_sig,
+        )
         if key not in self._csv_profile_cache:
             prof = csv_profile(
                 self.data,
@@ -115,13 +124,13 @@ class Grizzly:
             self._csv_profile_cache[key] = prof
         return self._csv_profile_cache[key]
 
-    def _filter_cols(self, cols: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _filter_cols(self, cols: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not self._selected_cols:
             return cols
         wanted = set(self._selected_cols)
         return [c for c in cols if str(c.get("name")) in wanted]
 
-    def select(self, cols: Iterable[str]) -> "Grizzly":
+    def select(self, cols: Iterable[str]) -> Grizzly:
         """
         DataFrame-like projection. Returns a new Grizzly view scoped to selected columns.
 
@@ -140,7 +149,7 @@ class Grizzly:
         g2._selected_cols = tuple(str(c) for c in cols)
         return g2
 
-    def schema(self) -> Dict[str, Any]:
+    def schema(self) -> dict[str, Any]:
         return detect_schema(
             self.data,
             sample_size=self.sample_size,
@@ -148,9 +157,11 @@ class Grizzly:
             normalize_input=self.normalize_input,
         )
 
-    def columns(self) -> List[str]:
+    def columns(self) -> list[str]:
         # If this is a CSV path, return CSV column names (respects selection)
-        if isinstance(self.data, str) and (self.data.endswith(".csv") or self.data.endswith(".csv.gz")):
+        if isinstance(self.data, str) and (
+            self.data.endswith(".csv") or self.data.endswith(".csv.gz")
+        ):
             prof = self.csv_profile(lite=True, track_freq=False, collect_examples=False)
             cols = [str(c.get("name")) for c in prof.get("columns", [])]
             return cols
@@ -175,24 +186,24 @@ class Grizzly:
         p = Path(self.data)
         return p.stat().st_size if p.exists() else None
 
-    def dtypes(self, *, lite: bool = False) -> Dict[str, str]:
+    def dtypes(self, *, lite: bool = False) -> dict[str, str]:
         """
         Return inferred dtype per column (from profile).
         """
         prof = self.csv_profile(lite=lite, track_freq=not lite, collect_examples=not lite)
-        out: Dict[str, str] = {}
+        out: dict[str, str] = {}
         for c in self._filter_cols(list(prof.get("columns", []))):
             out[str(c.get("name"))] = _pretty_dtype(str(c.get("inferred", "unknown")))
         return out
 
-    def null_counts(self, *, lite: bool = True) -> Dict[str, int]:
+    def null_counts(self, *, lite: bool = True) -> dict[str, int]:
         prof = self.csv_profile(lite=lite, track_freq=not lite, collect_examples=not lite)
         cols = self._filter_cols(list(prof.get("columns", [])))
         return {str(c.get("name")): int(c.get("null_count", 0) or 0) for c in cols}
 
-    def null_pct(self, *, lite: bool = True) -> Dict[str, float]:
+    def null_pct(self, *, lite: bool = True) -> dict[str, float]:
         prof = self.csv_profile(lite=lite, track_freq=not lite, collect_examples=not lite)
-        out: Dict[str, float] = {}
+        out: dict[str, float] = {}
         for c in self._filter_cols(list(prof.get("columns", []))):
             name = str(c.get("name"))
             count = float(c.get("count", 0) or 0)
@@ -200,7 +211,7 @@ class Grizzly:
             out[name] = (nulls / count) if count else 0.0
         return out
 
-    def missingness(self, *, lite: bool = True) -> List[Dict[str, Any]]:
+    def missingness(self, *, lite: bool = True) -> list[dict[str, Any]]:
         """
         Per-column missingness table (list of dicts), sorted by null_pct desc.
         """
@@ -210,7 +221,7 @@ class Grizzly:
         miss.sort(key=lambda x: float(x.get("null_pct", 0.0)), reverse=True)
         return miss
 
-    def describe(self, *, lite: bool = False) -> Dict[str, Any]:
+    def describe(self, *, lite: bool = False) -> dict[str, Any]:
         """
         Describe++ style summary. Returns:
           { "numeric": [...], "categorical": [...], "dataset": {...} }
@@ -226,9 +237,9 @@ class Grizzly:
     def info(
         self,
         *,
-        file: Optional[TextIO] = None,
+        file: TextIO | None = None,
         show_examples: bool = False,
-        max_cols: Optional[int] = None,
+        max_cols: int | None = None,
     ) -> None:
         """
         Print a compact summary (similar in spirit to pandas.DataFrame.info()).
@@ -237,18 +248,26 @@ class Grizzly:
 
         out = file if file is not None else sys.stdout
         # If this looks like a CSV path, prefer the native CSV profile for correctness
-        if isinstance(self.data, str) and (self.data.endswith(".csv") or self.data.endswith(".csv.gz")):
+        if isinstance(self.data, str) and (
+            self.data.endswith(".csv") or self.data.endswith(".csv.gz")
+        ):
             prof = self.csv_profile(lite=False, track_freq=False, collect_examples=True)
             cols = prof.get("columns", [])
             sample_size = int(prof.get("rows_sampled", self.sample_size))
             backend = "rust" if is_native() else "python-fallback"
-            print(f"Grizzly info: {len(cols)} columns (sample_size={sample_size}, backend={backend})", file=out)
+            print(
+                f"Grizzly info: {len(cols)} columns (sample_size={sample_size}, backend={backend})",
+                file=out,
+            )
         else:
             schema = self.schema()
             cols = schema.get("columns", [])
             sample_size = schema.get("sample_size", self.sample_size)
             backend = "rust" if is_native() else "python-fallback"
-            print(f"Grizzly info: {len(cols)} columns (sample_size={sample_size}, backend={backend})", file=out)
+            print(
+                f"Grizzly info: {len(cols)} columns (sample_size={sample_size}, backend={backend})",
+                file=out,
+            )
 
         if max_cols is not None:
             cols = cols[:max_cols]
@@ -258,10 +277,10 @@ class Grizzly:
         # Header
         if show_examples:
             print(f"{'#':>3}  {'column':<30}  {'non-null':>8}  {'dtype':<10}  examples", file=out)
-            print(f"{'-'*3}  {'-'*30}  {'-'*8}  {'-'*10}  {'-'*30}", file=out)
+            print(f"{'-' * 3}  {'-' * 30}  {'-' * 8}  {'-' * 10}  {'-' * 30}", file=out)
         else:
             print(f"{'#':>3}  {'column':<30}  {'non-null':>8}  {'dtype':<10}", file=out)
-            print(f"{'-'*3}  {'-'*30}  {'-'*8}  {'-'*10}", file=out)
+            print(f"{'-' * 3}  {'-' * 30}  {'-' * 8}  {'-' * 10}", file=out)
 
         for i, c in enumerate(cols):
             # schema uses "path"; csv_profile uses "name"
@@ -284,7 +303,7 @@ class Grizzly:
         lite: bool = False,
         track_freq: bool = True,
         collect_examples: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Profile a CSV/CSV.GZ path using the Rust-native csv profiler.
         """
@@ -297,8 +316,8 @@ class Grizzly:
         sampled: bool = True,
         dtype: str = "float32",
         target: str | None = None,
-        features: List[str] | None = None,
-    ) -> Union["Any", Tuple["Any", "Any"]]:
+        features: list[str] | None = None,
+    ) -> Any | tuple[Any, Any]:
         """
         Convert (sampled) CSV data to a NumPy array.
 
@@ -312,7 +331,9 @@ class Grizzly:
         try:
             import numpy as np  # type: ignore
         except Exception as e:  # pragma: no cover
-            raise RuntimeError("to_numpy requires numpy. Install with `pip install grizzly[numpy]` or `pip install numpy`.") from e
+            raise RuntimeError(
+                "to_numpy requires numpy. Install with `pip install grizzly[numpy]` or `pip install numpy`."
+            ) from e
 
         prof = self.csv_profile(lite=True, track_freq=False, collect_examples=False)
         cols = list(prof.get("columns", []))
@@ -342,14 +363,14 @@ class Grizzly:
 
         # Determine split mode from profile delimiter
         delim = prof.get("delimiter")
-        whitespace = (delim == "whitespace" or delim is None)
+        whitespace = delim == "whitespace" or delim is None
         delim_char = None if whitespace else str(delim)
 
         # How many rows to read
         max_rows = int(prof.get("rows_sampled", 0)) if sampled else 10**18
 
-        rows_x: List[List[float]] = []
-        rows_y: List[float] = []
+        rows_x: list[list[float]] = []
+        rows_y: list[float] = []
 
         import gzip
 
@@ -369,7 +390,7 @@ class Grizzly:
                     continue
 
                 # parse features
-                fx: List[float] = []
+                fx: list[float] = []
                 for i in feature_idx:
                     try:
                         fx.append(float(parts[i]))
@@ -390,12 +411,14 @@ class Grizzly:
         y = np.asarray(rows_y, dtype=dtype)
         return X, y
 
-    def csv_minmax_params(self) -> Dict[str, Any]:
+    def csv_minmax_params(self) -> dict[str, Any]:
         """
         Compute min/max parameters for numeric CSV columns (sampled) for min-max scaling.
         """
         if not isinstance(self.data, (str,)):
-            raise TypeError("Grizzly.csv_minmax_params() currently expects a filesystem path (str).")
+            raise TypeError(
+                "Grizzly.csv_minmax_params() currently expects a filesystem path (str)."
+            )
         return csv_minmax_params(self.data, sample_size=self.sample_size)
 
     def transform_minmax(
@@ -404,7 +427,7 @@ class Grizzly:
         *,
         delimiter: str | None = None,
         has_header: bool | None = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Apply min-max scaling to numeric columns and write a new file.
 
@@ -417,7 +440,7 @@ class Grizzly:
         prof = self.csv_profile()
         cols = self._filter_cols(list(prof.get("columns", [])))
 
-        params: Dict[str, Dict[str, float]] = {}
+        params: dict[str, dict[str, float]] = {}
         for c in cols:
             name = c.get("name")
             mn = c.get("min")
@@ -448,7 +471,7 @@ class Grizzly:
             raise TypeError("Grizzly.fit_minmax() currently expects a filesystem path (str).")
 
         prof = self.csv_profile()
-        params: Dict[str, Dict[str, float]] = {}
+        params: dict[str, dict[str, float]] = {}
         for c in self._filter_cols(list(prof.get("columns", []))):
             name = c.get("name")
             mn = c.get("min")
@@ -469,7 +492,7 @@ class Grizzly:
         self,
         *,
         target: str,
-        features: List[str] | None = None,
+        features: list[str] | None = None,
         train_frac: float = 0.8,
         seed: int = 0,
         sample_size: int | None = None,
@@ -478,13 +501,15 @@ class Grizzly:
         shuffle: bool = True,
         ridge_lambda: float = 0.0,
         return_debug: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Rust-native linear regression directly from the CSV (no numpy required).
         Returns a stable schema dict with r2/coef/intercept/train_n/test_n.
         """
         if not isinstance(self.data, (str,)):
-            raise TypeError("Grizzly.fit_linear_regression() currently expects a filesystem path (str).")
+            raise TypeError(
+                "Grizzly.fit_linear_regression() currently expects a filesystem path (str)."
+            )
 
         # Default feature set: respect select() if present, else all non-target columns.
         if features is None:
@@ -516,8 +541,8 @@ class Grizzly:
         lite: bool = False,
         max_cols: int | None = None,
         return_json: bool = True,
-        file: Optional[TextIO] = None,
-    ) -> Dict[str, Any] | None:
+        file: TextIO | None = None,
+    ) -> dict[str, Any] | None:
         """
         Phase-1 EDA (fast + practical):
         - Dataset-level summary
@@ -618,14 +643,18 @@ class Grizzly:
                         "non_null_count": non_null,
                         "types": types,
                         **(
-                            {"mode": c.get("mode"), "mode_count": c.get("mode_count"), "examples": c.get("examples", [])}
+                            {
+                                "mode": c.get("mode"),
+                                "mode_count": c.get("mode_count"),
+                                "examples": c.get("examples", []),
+                            }
                             if not lite
                             else {}
                         ),
                     }
                 )
 
-        report: Dict[str, Any] = {
+        report: dict[str, Any] = {
             "schema_version": "eda.v1",
             "dataset": dataset,
             "missing": missing,
@@ -640,24 +669,39 @@ class Grizzly:
         import sys
 
         out = file if file is not None else sys.stdout
-        print(f"Grizzly EDA ({dataset['mode']}): {dataset['num_columns']} cols, rows_sampled={dataset['rows_sampled']}", file=out)
+        print(
+            f"Grizzly EDA ({dataset['mode']}): {dataset['num_columns']} cols, rows_sampled={dataset['rows_sampled']}",
+            file=out,
+        )
         print(f"  path={dataset['path']}", file=out)
-        print(f"  delimiter={dataset['delimiter']}, has_header={dataset['has_header']}, backend={dataset['backend']}", file=out)
+        print(
+            f"  delimiter={dataset['delimiter']}, has_header={dataset['has_header']}, backend={dataset['backend']}",
+            file=out,
+        )
         if dataset["file_size_bytes"] is not None:
-            mb = dataset["file_size_bytes"] / (1024 * 1024)
+            # `dataset` is a heterogeneous report dict, so the static type of any
+            # single key is the union of all of them; the guard above is the
+            # actual contract.
+            mb = float(dataset["file_size_bytes"]) / (1024 * 1024)  # type: ignore[arg-type]
             print(f"  file_size={mb:.2f} MB", file=out)
         print("", file=out)
 
         # Missingness top offenders
-        miss_sorted = sorted(missing, key=lambda x: x["null_pct"], reverse=True)
+        miss_sorted = sorted(missing, key=lambda x: float(x["null_pct"] or 0.0), reverse=True)
         print("Missingness (top 10 by null_pct):", file=out)
         for m in miss_sorted[:10]:
-            print(f"  {m['name']}: null_pct={m['null_pct']:.2%} ({m['null_count']}/{m['count']})", file=out)
+            print(
+                f"  {m['name']}: null_pct={m['null_pct']:.2%} ({m['null_count']}/{m['count']})",
+                file=out,
+            )
         print("", file=out)
 
         print("Numeric columns:", file=out)
         for n in numeric[: min(10, len(numeric))]:
-            print(f"  {n['name']}: min={n['min']}, p50={n['median']}, max={n['max']}, std={n['std']}", file=out)
+            print(
+                f"  {n['name']}: min={n['min']}, p50={n['median']}, max={n['max']}, std={n['std']}",
+                file=out,
+            )
         if len(numeric) > 10:
             print(f"  ... +{len(numeric) - 10} more", file=out)
         print("", file=out)
@@ -665,7 +709,9 @@ class Grizzly:
         print("Categorical/non-numeric columns:", file=out)
         for s in categorical[: min(10, len(categorical))]:
             if not lite:
-                print(f"  {s['name']}: mode={s.get('mode')} (count={s.get('mode_count')})", file=out)
+                print(
+                    f"  {s['name']}: mode={s.get('mode')} (count={s.get('mode_count')})", file=out
+                )
             else:
                 print(f"  {s['name']}: dtype={s.get('dtype')}", file=out)
         if len(categorical) > 10:
@@ -673,5 +719,3 @@ class Grizzly:
         print("", file=out)
 
         return None
-
-

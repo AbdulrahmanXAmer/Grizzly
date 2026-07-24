@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Set, Tuple
+from typing import Any
 
 
 def _is_seq(x: Any) -> bool:
@@ -28,8 +29,8 @@ def _type_name(x: Any) -> str:
 class _Col:
     count: int = 0
     null_count: int = 0
-    types: Set[str] = field(default_factory=set)
-    examples: List[str] = field(default_factory=list)
+    types: set[str] = field(default_factory=set)
+    examples: list[str] = field(default_factory=list)
 
 
 def _add_example(col: _Col, v: Any, max_examples: int) -> None:
@@ -48,7 +49,7 @@ def _flatten(
     v: Any,
     *,
     max_examples: int,
-    budget: List[int],
+    budget: list[int],
 ) -> None:
     # budget[0] is remaining nodes to traverse
     if budget[0] <= 0:
@@ -77,8 +78,8 @@ def _flatten(
     _add_example(col, v, max_examples)
 
 
-def detect_schema(data: Any, *, sample_size: int = 1000, max_examples: int = 5) -> Dict[str, Any]:
-    cols: Dict[str, _Col] = {}
+def detect_schema(data: Any, *, sample_size: int = 1000, max_examples: int = 5) -> dict[str, Any]:
+    cols: dict[str, _Col] = {}
     budget = [max(1, sample_size)]
 
     # treat top-level list/tuple as "rows" if it looks like a batch
@@ -102,7 +103,5 @@ def detect_schema(data: Any, *, sample_size: int = 1000, max_examples: int = 5) 
             }
         )
 
-    columns.sort(key=lambda x: x["path"])
+    columns.sort(key=lambda x: str(x["path"]))
     return {"columns": columns, "sample_size": sample_size}
-
-
