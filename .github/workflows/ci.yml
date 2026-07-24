@@ -262,6 +262,16 @@ jobs:
             --strict \
             --out /tmp/smoke-results.json
 
+      # Same gate for the fit benchmark: five methods must land on the same
+      # model, or the run fails rather than publishing a fast wrong answer.
+      - name: Run fit benchmark (small, strict)
+        run: |
+          python -m benches.bench_fit \
+            --rows 20000 \
+            --repetitions 2 \
+            --strict \
+            --out /tmp/smoke-fit.json
+
       - name: Upload smoke results
         if: always()
         uses: actions/upload-artifact@v4

@@ -146,9 +146,14 @@ meaningful row order, where `head -n` would be badly biased.
 | `gen_data.py` | Deterministic dataset generation. |
 | `_runner.py` | One measurement in an isolated process. |
 | `bench.py` | Driver: repetitions, equivalence checks, environment capture. |
+| `_fit_runner.py` | One model-fit measurement in an isolated process. |
+| `bench_fit.py` | Fit benchmark: CSV → split → model → R², with a coefficient-agreement gate. |
 | `_study_runner.py` | One profiling measurement for the sampling study. |
 | `study_sampling.py` | Accuracy-vs-speed sweep over `sample_size`. |
-| `render.py` | Renders results into the README's generated sections. |
+| `study_memory.py` | Memory-ceiling study under container limits. |
+| `render.py` | Renders results into the README's generated sections, hero tiles included. |
 | `requirements.txt` | Pinned comparison libraries. |
 | `results/results.json` | Committed benchmark results. |
+| `results/fit_results.json` | Committed fit-benchmark results. |
 | `results/sampling_study.json` | Committed sampling-study results. |
+| `results/memory_study.json` | Committed memory-ceiling results. |

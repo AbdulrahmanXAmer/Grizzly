@@ -78,6 +78,10 @@ demo-offline:  ## Run the demo without downloading anything
 bench:  ## Run the benchmark suite (host — noisy, see docker-bench)
 	$(PYTHON) -m benches.bench --strict
 
+.PHONY: bench-fit
+bench-fit:  ## Run the model-fitting benchmark (host)
+	$(PYTHON) -m benches.bench_fit --strict
+
 .PHONY: study
 study:  ## Run the sampling accuracy-vs-speed study
 	$(PYTHON) -m benches.study_sampling
@@ -126,6 +130,14 @@ docker-bench: docker-build  ## Run benchmarks in the container (stable compariso
 	@echo
 	@echo "Results written to $(DATA_DIR)/container-results.json"
 	@echo "To publish them: cp $(DATA_DIR)/container-results.json benches/results/results.json && make render"
+
+.PHONY: docker-bench-fit
+docker-bench-fit: docker-build  ## Run the fit benchmark in the container
+	@mkdir -p $(DATA_DIR)
+	$(DOCKER_RUN_PINNED) $(IMAGE) \
+	  python -m benches.bench_fit --strict --out $(DATA_DIR)/container-fit.json
+	@echo
+	@echo "To publish: cp $(DATA_DIR)/container-fit.json benches/results/fit_results.json && make render"
 
 .PHONY: docker-study
 docker-study: docker-build  ## Run the sampling study in the container
