@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import math
 import random
 from collections.abc import Iterator, Sequence
 from pathlib import Path
@@ -72,6 +73,41 @@ def numeric_rows(
         yield ",".join(f"{v:.6f}" for v in (*x, y)) + "\n"
 
 
+def binary_rows(
+    n_rows: int,
+    n_features: int,
+    seed: int,
+    noise: float = 1.0,
+) -> Iterator[str]:
+    """Yield CSV lines for the binary-classification shape, header included.
+
+    The label is drawn from a logistic model of the features -- ``target ~
+    Bernoulli(sigmoid(w . x + b))`` -- rather than thresholded deterministically.
+    That matters: a hard threshold produces perfectly separable classes, on
+    which logistic regression's likelihood has no finite maximum, coefficients
+    run away to infinity, and every implementation "agrees" only in the sense
+    that they all diverge. Sampling the label gives overlapping classes, a
+    well-posed optimum, and an accuracy ceiling below 1.0 -- which is what real
+    data looks like and what makes a cross-library comparison mean anything.
+
+    ``noise`` scales the logit; larger values sharpen the classes.
+    """
+    rng = random.Random(seed)
+    weights = [rng.uniform(-1.5, 1.5) for _ in range(n_features)]
+    bias = rng.uniform(-0.5, 0.5)
+
+    header = [f"f_{i}" for i in range(n_features)] + ["target"]
+    yield ",".join(header) + "\n"
+
+    for _ in range(n_rows):
+        x = [rng.gauss(0.0, 1.0) for _ in range(n_features)]
+        z = noise * (sum(w * xi for w, xi in zip(weights, x, strict=True)) + bias)
+        # Numerically stable sigmoid; z can be large for wide feature counts.
+        p = 1.0 / (1.0 + math.exp(-z)) if z >= 0 else math.exp(z) / (1.0 + math.exp(z))
+        label = 1 if rng.random() < p else 0
+        yield ",".join((*(f"{v:.6f}" for v in x), str(label))) + "\n"
+
+
 def mixed_rows(n_rows: int, n_features: int, seed: int) -> Iterator[str]:
     """Yield CSV lines for the heterogeneous shape, including the header.
 
@@ -114,6 +150,8 @@ def write_dataset(
     """Write one dataset to ``out_path``, creating parent directories."""
     if shape == "numeric":
         rows = numeric_rows(n_rows, n_features, seed)
+    elif shape == "binary":
+        rows = binary_rows(n_rows, n_features, seed)
     elif shape == "mixed":
         rows = mixed_rows(n_rows, n_features, seed)
     else:
@@ -185,7 +223,7 @@ def main() -> None:
         "--shapes",
         nargs="+",
         default=["numeric", "mixed"],
-        choices=["numeric", "mixed"],
+        choices=["numeric", "binary", "mixed"],
     )
     parser.add_argument("--features", type=int, default=20, help="feature columns per row")
     parser.add_argument("--seed", type=int, default=0)

@@ -1317,6 +1317,7 @@ fn _grizzly(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(csv_transform_standardize, m)?)?;
     m.add_function(wrap_pyfunction!(csv_linear_regression, m)?)?;
     m.add_function(wrap_pyfunction!(csv_sgd_regression, m)?)?;
+    m.add_function(wrap_pyfunction!(csv_logistic_regression, m)?)?;
     Ok(())
 }
 

@@ -127,16 +127,227 @@ pub fn csv_layout(
     })
 }
 
-/// Outcome of a streaming SGD fit, before conversion into a Python dict:
-/// (feature names, coefficients, intercept, train rows, test rows, test r2,
-/// epochs run, final training MSE).
-pub type SgdFit = (Vec<String>, Vec<f64>, f64, usize, usize, f64, usize, f64);
+/// Outcome of a streaming SGD fit, before conversion into a Python dict.
+///
+/// A struct rather than the ten-element tuple this used to be: classification
+/// adds five more fields, and positional access was already the wrong shape.
+pub struct SgdOutcome {
+    pub feature_names: Vec<String>,
+    pub coef: Vec<f64>,
+    pub intercept: f64,
+    pub train_n: usize,
+    pub test_n: usize,
+    pub epochs: usize,
+    /// Mean per-sample value of the objective on the final training epoch.
+    pub final_train_loss: f64,
+    /// Held-out R^2. Meaningful for regression losses only.
+    pub r2: f64,
+    /// Present when the loss is a classification objective.
+    pub classification: Option<ClassificationMetrics>,
+}
+
+/// Held-out classification metrics.
+pub struct ClassificationMetrics {
+    pub accuracy: f64,
+    pub log_loss: f64,
+    pub roc_auc: f64,
+    pub true_positives: u64,
+    pub false_positives: u64,
+    pub true_negatives: u64,
+    pub false_negatives: u64,
+    pub positive_rate: f64,
+}
+
+/// Number of score bins used for the streaming ROC-AUC estimate.
+///
+/// AUC is a rank statistic, so the direct computation sorts every score --
+/// which means holding the whole test set in memory and would give up the
+/// bounded-memory property that is the point of this path. Binning the scores
+/// instead makes it O(bins): with 4096 bins over [0,1] the estimate is within
+/// ~1e-3 of exact, which the tests assert against scikit-learn.
+const AUC_BINS: usize = 4096;
+
+/// Streaming accumulator for binary classification metrics.
+///
+/// Fixed size regardless of how many rows it sees.
+pub struct BinaryEval {
+    pos_bins: Vec<u64>,
+    neg_bins: Vec<u64>,
+    correct: u64,
+    total: u64,
+    log_loss_sum: f64,
+    tp: u64,
+    fp: u64,
+    tn: u64,
+    r#fn: u64,
+}
+
+impl Default for BinaryEval {
+    fn default() -> Self {
+        Self {
+            pos_bins: vec![0; AUC_BINS],
+            neg_bins: vec![0; AUC_BINS],
+            correct: 0,
+            total: 0,
+            log_loss_sum: 0.0,
+            tp: 0,
+            fp: 0,
+            tn: 0,
+            r#fn: 0,
+        }
+    }
+}
+
+impl BinaryEval {
+    /// Record one held-out row. `score` is a probability in [0, 1].
+    pub fn push(&mut self, score: f64, label: f64) {
+        let positive = label > 0.5;
+        let predicted = score >= 0.5;
+
+        self.total += 1;
+        if predicted == positive {
+            self.correct += 1;
+        }
+        match (positive, predicted) {
+            (true, true) => self.tp += 1,
+            (false, true) => self.fp += 1,
+            (false, false) => self.tn += 1,
+            (true, false) => self.r#fn += 1,
+        }
+
+        // Clamped so a saturated probability cannot contribute -inf and
+        // destroy the whole metric; 1e-15 matches scikit-learn's eps.
+        let p = score.clamp(1e-15, 1.0 - 1e-15);
+        self.log_loss_sum -= if positive { p.ln() } else { (1.0 - p).ln() };
+
+        let bin = ((score.clamp(0.0, 1.0)) * (AUC_BINS - 1) as f64).round() as usize;
+        if positive {
+            self.pos_bins[bin] += 1;
+        } else {
+            self.neg_bins[bin] += 1;
+        }
+    }
+
+    /// Mann-Whitney U over the binned scores.
+    ///
+    /// Walking bins in ascending score order, each positive outranks every
+    /// negative in a lower bin and ties with those in its own; the 0.5 credit
+    /// for ties is what makes this agree with scikit-learn rather than
+    /// systematically over- or under-counting.
+    fn roc_auc(&self) -> f64 {
+        let n_pos: u64 = self.pos_bins.iter().sum();
+        let n_neg: u64 = self.neg_bins.iter().sum();
+        if n_pos == 0 || n_neg == 0 {
+            // Undefined with only one class present. 0.5 is the honest
+            // "no discrimination measurable" answer.
+            return 0.5;
+        }
+
+        let mut negatives_below = 0u64;
+        let mut rank_sum = 0.0f64;
+        for bin in 0..AUC_BINS {
+            let pos = self.pos_bins[bin] as f64;
+            let neg = self.neg_bins[bin] as f64;
+            if pos > 0.0 {
+                rank_sum += pos * (negatives_below as f64 + 0.5 * neg);
+            }
+            negatives_below += self.neg_bins[bin];
+        }
+        rank_sum / (n_pos as f64 * n_neg as f64)
+    }
+
+    pub fn finish(&self) -> ClassificationMetrics {
+        let total = self.total.max(1) as f64;
+        ClassificationMetrics {
+            accuracy: self.correct as f64 / total,
+            log_loss: self.log_loss_sum / total,
+            roc_auc: self.roc_auc(),
+            true_positives: self.tp,
+            false_positives: self.fp,
+            true_negatives: self.tn,
+            false_negatives: self.r#fn,
+            positive_rate: (self.tp + self.r#fn) as f64 / total,
+        }
+    }
+}
+
+/// The objective an SGD fit minimises.
+///
+/// Every one of these has the same gradient *shape* with respect to the
+/// weights -- `dL/dw_j = g * x_j` for a scalar `g` that depends only on the
+/// prediction and the label. So a single update kernel serves all of them, and
+/// adding a linear model means adding a variant here rather than another
+/// training loop -- hinge (linear SVM) and Huber both fit this shape and drop
+/// in without touching [`sgd_step`]. `residual()` returns that `g`; `loss()`
+/// returns the value being minimised, for the reported training metric.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Loss {
+    /// Ordinary least squares. Labels are real-valued.
+    Squared,
+    /// Binary logistic (log-loss). Labels must be 0 or 1; `pred` is a logit
+    /// and the reported probability is its sigmoid.
+    Logistic,
+}
+
+/// Numerically stable logistic function.
+///
+/// The naive `1/(1+exp(-z))` overflows to inf for `z` around -750 and then
+/// produces NaN. Branching on the sign keeps the exponent negative, which is
+/// the standard trick and matters here because an early SGD iterate can
+/// easily produce a logit that large before the weights settle.
+#[inline(always)]
+pub fn sigmoid(z: f64) -> f64 {
+    if z >= 0.0 {
+        1.0 / (1.0 + (-z).exp())
+    } else {
+        let e = z.exp();
+        e / (1.0 + e)
+    }
+}
+
+impl Loss {
+    /// The scalar `g` in `dL/dw_j = g * x_j`.
+    #[inline(always)]
+    pub fn residual(&self, pred: f64, y: f64) -> f64 {
+        match *self {
+            Loss::Squared => pred - y,
+            // d/dz of -[y log s(z) + (1-y) log(1-s(z))] is exactly s(z) - y,
+            // which is why logistic costs no more per row than squared.
+            Loss::Logistic => sigmoid(pred) - y,
+        }
+    }
+
+    /// The value being minimised, accumulated as the reported training metric.
+    #[inline(always)]
+    pub fn loss(&self, pred: f64, y: f64) -> f64 {
+        match *self {
+            Loss::Squared => {
+                let r = pred - y;
+                r * r
+            }
+            Loss::Logistic => {
+                // log(1 + exp(-|z|)) + max(z,0) - y*z, the stable form of
+                // -[y log s + (1-y) log(1-s)]: never takes log of an
+                // underflowed sigmoid, which would be -inf.
+                let z = pred;
+                (1.0 + (-z.abs()).exp()).ln() + z.max(0.0) - y * z
+            }
+        }
+    }
+
+    /// Whether labels are expected to be 0/1.
+    pub fn is_classification(&self) -> bool {
+        matches!(self, Loss::Logistic)
+    }
+}
 
 /// One SGD update, shared verbatim by the streaming and replay paths.
 ///
 /// Kept as a single function so the cached-epoch replay cannot drift from the
 /// streaming arithmetic: identical inputs through identical operations is what
-/// makes the two paths bit-identical, and the tests assert exactly that.
+/// makes the two paths bit-identical, and the tests assert exactly that. The
+/// `loss` parameter is what lets regression and classification share it:
+/// only the scalar residual differs.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub fn sgd_step(
@@ -147,6 +358,7 @@ pub fn sgd_step(
     lr: f64,
     l2: f64,
     grad_clip: f64,
+    loss: Loss,
     sq_err: &mut f64,
     seen: &mut usize,
 ) {
@@ -155,8 +367,8 @@ pub fn sgd_step(
     for j in 0..p {
         pred += w[j] * x[j];
     }
-    let err = pred - y;
-    *sq_err += err * err;
+    let err = loss.residual(pred, y);
+    *sq_err += loss.loss(pred, y);
     *seen += 1;
 
     // Clip the per-sample gradient. Real data has outliers that survive
@@ -218,6 +430,104 @@ pub fn csv_sgd_regression(
     grad_clip: f64,
     cache_budget_mb: usize,
 ) -> PyResult<PyObject> {
+    fit_sgd(
+        py,
+        path,
+        target,
+        features,
+        epochs,
+        learning_rate,
+        l2,
+        train_frac,
+        seed,
+        sample_size,
+        delimiter,
+        has_header,
+        shuffle,
+        grad_clip,
+        cache_budget_mb,
+        Loss::Squared,
+    )
+}
+
+/// Fit a binary logistic classifier by SGD, streaming from CSV.
+///
+/// Identical machinery to [`csv_sgd_regression`] -- same standardization, same
+/// deterministic split, same cached-replay optimisation -- with the squared
+/// loss swapped for log-loss. The target column must contain only 0 and 1.
+///
+/// The reported metrics are the ones a classifier is actually judged on:
+/// held-out accuracy, log-loss, ROC-AUC, and the confusion matrix. R^2 is
+/// returned as well but means little here, so it is not the headline.
+///
+/// `coef` and `intercept` are in the original feature space and parameterise a
+/// logit: `p = sigmoid(intercept + coef . x)`. They are directly comparable
+/// with scikit-learn's `LogisticRegression(penalty=None)` fitted on the same
+/// data, which the differential tests assert.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (path, target, features=None, epochs=5, learning_rate=0.05, l2=0.0, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, grad_clip=10.0, cache_budget_mb=512))]
+pub fn csv_logistic_regression(
+    py: Python<'_>,
+    path: String,
+    target: String,
+    features: Option<Vec<String>>,
+    epochs: usize,
+    learning_rate: f64,
+    l2: f64,
+    train_frac: f64,
+    seed: u64,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+    shuffle: bool,
+    grad_clip: f64,
+    cache_budget_mb: usize,
+) -> PyResult<PyObject> {
+    fit_sgd(
+        py,
+        path,
+        target,
+        features,
+        epochs,
+        learning_rate,
+        l2,
+        train_frac,
+        seed,
+        sample_size,
+        delimiter,
+        has_header,
+        shuffle,
+        grad_clip,
+        cache_budget_mb,
+        Loss::Logistic,
+    )
+}
+
+/// The shared body behind every SGD entry point.
+///
+/// Only `loss` differs between regression and classification: the streaming,
+/// splitting, standardization, caching, and divergence checks are the same
+/// code for all of them, which is the whole reason [`Loss`] exists.
+#[allow(clippy::too_many_arguments)]
+fn fit_sgd(
+    py: Python<'_>,
+    path: String,
+    target: String,
+    features: Option<Vec<String>>,
+    epochs: usize,
+    learning_rate: f64,
+    l2: f64,
+    train_frac: f64,
+    seed: u64,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+    shuffle: bool,
+    grad_clip: f64,
+    cache_budget_mb: usize,
+    loss: Loss,
+) -> PyResult<PyObject> {
     if !(0.0 < train_frac && train_frac < 1.0) {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "train_frac must be in (0,1)",
@@ -266,7 +576,7 @@ pub fn csv_sgd_regression(
     let path_for_thread = path.clone();
     let target_for_thread = target.clone();
 
-    let result = py.allow_threads(move || -> Result<SgdFit, String> {
+    let result = py.allow_threads(move || -> Result<SgdOutcome, String> {
         let target = target_for_thread;
         let file_data = load_file_data(&path_for_thread).map_err(|e| e.to_string())?;
         let bytes = file_data.as_bytes();
@@ -390,6 +700,7 @@ pub fn csv_sgd_regression(
                         lr,
                         l2,
                         grad_clip,
+                        loss,
                         &mut sq_err,
                         &mut seen,
                     );
@@ -414,6 +725,17 @@ pub fn csv_sgd_regression(
                     let Some(y) = parse_f64_opt(fields[target_idx]) else {
                         continue;
                     };
+                    // A classifier silently trained on labels of 2 and 7 would
+                    // return a plausible-looking model that means nothing, so
+                    // this is an error rather than a coercion. Rows with an
+                    // unparseable label are skipped above like any other bad
+                    // row; a *parseable* label outside {0,1} is a mistake.
+                    if loss.is_classification() && y != 0.0 && y != 1.0 {
+                        return Err(format!(
+                            "target column {target:?} must contain only 0 and 1 for \
+                             classification; found {y}"
+                        ));
+                    }
                     let mut usable = true;
                     for (j, &idx) in feature_idx.iter().enumerate() {
                         match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
@@ -436,6 +758,7 @@ pub fn csv_sgd_regression(
                         lr,
                         l2,
                         grad_clip,
+                        loss,
                         &mut sq_err,
                         &mut seen,
                     );
@@ -467,11 +790,14 @@ pub fn csv_sgd_regression(
         let coef: Vec<f64> = (0..p).map(|j| w[j] / scale[j]).collect();
         let intercept = b - (0..p).map(|j| w[j] * mean[j] / scale[j]).sum::<f64>();
 
-        // Test-set R2, evaluated in the original space.
+        // Held-out evaluation, in the original feature space. Regression
+        // metrics accumulate for every loss (they cost four adds a row);
+        // classification metrics only when the objective is one.
         let mut ss_res = 0.0f64;
         let mut sum_y = 0.0f64;
         let mut sum_y2 = 0.0f64;
         let mut test_n = 0usize;
+        let mut eval = loss.is_classification().then(BinaryEval::default);
         for (this_row, line) in FastLineIter::new(data_bytes).enumerate() {
             if this_row >= n_rows {
                 break;
@@ -501,6 +827,10 @@ pub fn csv_sgd_regression(
             if !usable {
                 continue;
             }
+            if let Some(ev) = eval.as_mut() {
+                // `pred` is a logit here; the metrics want a probability.
+                ev.push(sigmoid(pred), y);
+            }
             let d = y - pred;
             ss_res += d * d;
             sum_y += y;
@@ -523,32 +853,49 @@ pub fn csv_sgd_regression(
         let feature_names: Vec<String> =
             feature_idx.iter().map(|&i| col_names[i].clone()).collect();
 
-        Ok((
+        Ok(SgdOutcome {
             feature_names,
             coef,
             intercept,
             train_n,
             test_n,
-            r2,
             epochs,
-            final_mse,
-        ))
+            final_train_loss: final_mse,
+            r2,
+            classification: eval.map(|ev| ev.finish()),
+        })
     });
 
-    let (feature_names, coef, intercept, train_n, test_n, r2, epochs_run, final_mse) =
-        result.map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let fit = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     let out = PyDict::new(py);
     out.set_item("path", path)?;
     out.set_item("target", target)?;
-    out.set_item("features", feature_names)?;
-    out.set_item("coef", coef)?;
-    out.set_item("intercept", intercept)?;
-    out.set_item("train_n", train_n)?;
-    out.set_item("test_n", test_n)?;
-    out.set_item("r2", r2)?;
-    out.set_item("epochs", epochs_run)?;
-    out.set_item("final_train_mse", final_mse)?;
+    out.set_item("features", fit.feature_names)?;
+    out.set_item("coef", fit.coef)?;
+    out.set_item("intercept", fit.intercept)?;
+    out.set_item("train_n", fit.train_n)?;
+    out.set_item("test_n", fit.test_n)?;
+    out.set_item("r2", fit.r2)?;
+    out.set_item("epochs", fit.epochs)?;
+    // Kept under its original name for the regression path, whose callers and
+    // README already reference it; for classification it is the mean log-loss,
+    // which is what `final_train_loss` says without lying about the metric.
+    out.set_item("final_train_mse", fit.final_train_loss)?;
+    out.set_item("final_train_loss", fit.final_train_loss)?;
+
+    if let Some(m) = fit.classification {
+        out.set_item("accuracy", m.accuracy)?;
+        out.set_item("log_loss", m.log_loss)?;
+        out.set_item("roc_auc", m.roc_auc)?;
+        out.set_item("positive_rate", m.positive_rate)?;
+        let cm = PyDict::new(py);
+        cm.set_item("tp", m.true_positives)?;
+        cm.set_item("fp", m.false_positives)?;
+        cm.set_item("tn", m.true_negatives)?;
+        cm.set_item("fn", m.false_negatives)?;
+        out.set_item("confusion_matrix", cm)?;
+    }
     Ok(out.into())
 }
 

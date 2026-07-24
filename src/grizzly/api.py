@@ -301,6 +301,80 @@ def csv_sgd_regression(
     )
 
 
+def csv_logistic_regression(
+    path: str,
+    *,
+    target: str,
+    features: list[str] | None = None,
+    epochs: int = 5,
+    learning_rate: float = 0.05,
+    l2: float = 0.0,
+    train_frac: float = 0.8,
+    seed: int = 0,
+    sample_size: int = 1_000_000,
+    delimiter: str | None = None,
+    has_header: bool | None = None,
+    shuffle: bool = True,
+    grad_clip: float = 10.0,
+    cache_budget_mb: int = 512,
+) -> dict[str, Any]:
+    """Fit a binary logistic classifier by SGD, streaming from CSV.
+
+    The classification counterpart to :func:`csv_sgd_regression`, sharing all of
+    its machinery -- on-the-fly standardization, the deterministic split, the
+    cached-replay optimisation, gradient clipping -- with log-loss in place of
+    squared error. Memory is O(p) in the feature count, independent of rows.
+
+    The target column must contain only 0 and 1. A parseable label outside that
+    set raises rather than being coerced, because a classifier quietly trained
+    on labels of 2 and 7 returns a plausible-looking model that means nothing.
+
+    `coef` and `intercept` are returned in the original feature space and
+    parameterise a logit: ``p = sigmoid(intercept + coef . x)``. They are
+    directly comparable with scikit-learn's
+    ``LogisticRegression(penalty=None)``.
+
+    See :func:`csv_sgd_regression` for `grad_clip`, `cache_budget_mb`, and the
+    row-order caveat, which behave identically here.
+
+    Returns a dict with `coef`, `intercept`, `train_n`, `test_n`, `epochs`,
+    `final_train_loss` (mean training log-loss), and held-out `accuracy`,
+    `log_loss`, `roc_auc`, `positive_rate`, and `confusion_matrix` (a dict of
+    `tp`/`fp`/`tn`/`fn`). `r2` is present for symmetry with the regression
+    path but means little for a classifier.
+
+    ROC-AUC is computed from a 4096-bin histogram of the held-out scores rather
+    than by sorting them, which keeps evaluation within the same bounded memory
+    as the fit; it agrees with scikit-learn to about 1e-3.
+
+    Raises:
+        ValueError: if the target contains a label outside {0, 1}, or if the
+            fit diverges, which usually means `learning_rate` is too high.
+    """
+    native = _load_native()
+    if native is None:
+        raise RuntimeError(
+            "csv_logistic_regression requires the native Rust extension; "
+            "build with `maturin develop`."
+        )
+    return native.csv_logistic_regression(
+        path,
+        target=target,
+        features=features,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        l2=l2,
+        train_frac=train_frac,
+        seed=seed,
+        sample_size=sample_size,
+        delimiter=delimiter,
+        has_header=has_header,
+        shuffle=shuffle,
+        grad_clip=grad_clip,
+        cache_budget_mb=cache_budget_mb,
+    )
+
+
 def csv_linear_regression(
     path: str,
     *,
