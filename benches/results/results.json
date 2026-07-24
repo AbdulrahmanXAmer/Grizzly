@@ -1,0 +1,2688 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "timestamp_utc": "2026-07-24T18:29:15+00:00",
+    "cpu": "Apple M1",
+    "cpu_count": 8,
+    "memory_bytes": 8589934592,
+    "platform": "macOS-15.7.7-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "python": "3.14.6",
+    "python_implementation": "CPython",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo_profile": "release (lto=true, codegen-units=1, opt-level=3)",
+    "git": {
+      "commit": "606711d52c42eb3695c293cbf94994c7fa55e2d5",
+      "branch": "main",
+      "dirty": true
+    }
+  },
+  "methodology": {
+    "process_isolation": "one fresh interpreter per repetition",
+    "warmup_runs_discarded": 1,
+    "repetitions": 7,
+    "headline_statistic": "median",
+    "grizzly_sample_size_margin": 4,
+    "timed_region": "profile: read CSV + compute per-column stats; transform: read CSV + min-max scale numeric columns + write CSV"
+  },
+  "datasets": {
+    "numeric_100000": {
+      "shape": "numeric",
+      "rows": 100000,
+      "feature_columns": 20,
+      "bytes": 19957028,
+      "sha256": "6da90fa3f29386d51bc14eaa3e4db214d86d2cfa08f4d90573a8458ee8d67236"
+    },
+    "numeric_500000": {
+      "shape": "numeric",
+      "rows": 500000,
+      "feature_columns": 20,
+      "bytes": 99785833,
+      "sha256": "76c7d14211aef93e822e86015eb7c36cad78322d49ea90ca9d3cd1e1595c09c5"
+    },
+    "mixed_100000": {
+      "shape": "mixed",
+      "rows": 100000,
+      "feature_columns": 20,
+      "bytes": 14875364,
+      "sha256": "8a45a4861f9e31cb679faf714e66f383ebb6c73b204fdece924c3689a57accc1"
+    },
+    "mixed_500000": {
+      "shape": "mixed",
+      "rows": 500000,
+      "feature_columns": 20,
+      "bytes": 74382659,
+      "sha256": "4ba0ddb523f14ae1a85e7e0195f4d00d81f17cd5abdb2e9abe5eef940b6c739e"
+    }
+  },
+  "measurements": [
+    {
+      "workload": "profile",
+      "dataset": "numeric_100000",
+      "grizzly_sample_size": 400000,
+      "equivalence": {
+        "status": "ok",
+        "problems": []
+      },
+      "results": {
+        "grizzly": {
+          "library": "grizzly",
+          "library_version": "0.1.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 27.76445899507962,
+            "min_ms": 27.229375002207235,
+            "max_ms": 67.78816699807066,
+            "mean_ms": 33.55558942920262,
+            "stdev_ms": 15.11323456548028
+          },
+          "peak_rss_bytes": 54312960,
+          "fingerprint": {
+            "rows": 100000,
+            "columns": {
+              "f_0": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4509,
+                "max": 4.4277,
+                "mean": 0.0027
+              },
+              "f_1": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4658,
+                "max": 4.6805,
+                "mean": -0.0003
+              },
+              "f_2": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4054,
+                "max": 4.4735,
+                "mean": -0.0029
+              },
+              "f_3": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.3088,
+                "max": 4.2874,
+                "mean": 0.0007
+              },
+              "f_4": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2264,
+                "max": 3.8166,
+                "mean": 0.0015
+              },
+              "f_5": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4196,
+                "max": 4.1827,
+                "mean": 0.0005
+              },
+              "f_6": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.1119,
+                "max": 4.4091,
+                "mean": -0.0059
+              },
+              "f_7": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.11,
+                "max": 4.2392,
+                "mean": 0.0037
+              },
+              "f_8": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4481,
+                "max": 4.2975,
+                "mean": -0.0035
+              },
+              "f_9": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2903,
+                "max": 4.1464,
+                "mean": 0.0015
+              },
+              "f_10": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.1543,
+                "max": 4.6021,
+                "mean": 0.0008
+              },
+              "f_11": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2641,
+                "max": 4.7073,
+                "mean": 0.0006
+              },
+              "f_12": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.3388,
+                "max": 4.0316,
+                "mean": 0.001
+              },
+              "f_13": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.5931,
+                "max": 4.5073,
+                "mean": 0.0053
+              },
+              "f_14": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.416,
+                "max": 4.0871,
+                "mean": 0.0022
+              },
+              "f_15": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4051,
+                "max": 4.4256,
+                "mean": -0.0015
+              },
+              "f_16": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4197,
+                "max": 3.9725,
+                "mean": -0.001
+              },
+              "f_17": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.5868,
+                "max": 4.0748,
+                "mean": 0.0002
+              },
+              "f_18": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.1139,
+                "max": 4.2177,
+                "mean": 0.0021
+              },
+              "f_19": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.6057,
+                "max": 4.1142,
+                "mean": -0.0015
+              },
+              "target": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -20.3774,
+                "max": 19.9357,
+                "mean": -0.3781
+              }
+            }
+          }
+        },
+        "pandas": {
+          "library": "pandas",
+          "library_version": "3.0.5",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 379.029083000205,
+            "min_ms": 242.03125000349246,
+            "max_ms": 712.76945900172,
+            "mean_ms": 426.9437860005252,
+            "stdev_ms": 187.22549976838096
+          },
+          "peak_rss_bytes": 153812992,
+          "fingerprint": {
+            "rows": 100000,
+            "columns": {
+              "f_0": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4509,
+                "max": 4.4277,
+                "mean": 0.0027
+              },
+              "f_1": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4658,
+                "max": 4.6805,
+                "mean": -0.0003
+              },
+              "f_2": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4054,
+                "max": 4.4735,
+                "mean": -0.0029
+              },
+              "f_3": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.3088,
+                "max": 4.2874,
+                "mean": 0.0007
+              },
+              "f_4": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2264,
+                "max": 3.8166,
+                "mean": 0.0015
+              },
+              "f_5": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4196,
+                "max": 4.1827,
+                "mean": 0.0005
+              },
+              "f_6": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.1119,
+                "max": 4.4091,
+                "mean": -0.0059
+              },
+              "f_7": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.11,
+                "max": 4.2392,
+                "mean": 0.0037
+              },
+              "f_8": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4481,
+                "max": 4.2975,
+                "mean": -0.0035
+              },
+              "f_9": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2903,
+                "max": 4.1464,
+                "mean": 0.0015
+              },
+              "f_10": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.1543,
+                "max": 4.6021,
+                "mean": 0.0008
+              },
+              "f_11": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2641,
+                "max": 4.7073,
+                "mean": 0.0006
+              },
+              "f_12": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.3388,
+                "max": 4.0316,
+                "mean": 0.001
+              },
+              "f_13": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.5931,
+                "max": 4.5073,
+                "mean": 0.0053
+              },
+              "f_14": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.416,
+                "max": 4.0871,
+                "mean": 0.0022
+              },
+              "f_15": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4051,
+                "max": 4.4256,
+                "mean": -0.0015
+              },
+              "f_16": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4197,
+                "max": 3.9725,
+                "mean": -0.001
+              },
+              "f_17": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.5868,
+                "max": 4.0748,
+                "mean": 0.0002
+              },
+              "f_18": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.1139,
+                "max": 4.2177,
+                "mean": 0.0021
+              },
+              "f_19": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.6057,
+                "max": 4.1142,
+                "mean": -0.0015
+              },
+              "target": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -20.3774,
+                "max": 19.9357,
+                "mean": -0.3781
+              }
+            }
+          }
+        },
+        "polars": {
+          "library": "polars",
+          "library_version": "1.43.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 85.81366699945647,
+            "min_ms": 60.529624999617226,
+            "max_ms": 201.2544999961392,
+            "mean_ms": 96.93032142864207,
+            "stdev_ms": 47.448909733066905
+          },
+          "peak_rss_bytes": 100204544,
+          "fingerprint": {
+            "rows": 100000,
+            "columns": {
+              "f_0": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4509,
+                "max": 4.4277,
+                "mean": 0.0027
+              },
+              "f_1": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4658,
+                "max": 4.6805,
+                "mean": -0.0003
+              },
+              "f_2": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4054,
+                "max": 4.4735,
+                "mean": -0.0029
+              },
+              "f_3": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.3088,
+                "max": 4.2874,
+                "mean": 0.0007
+              },
+              "f_4": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2264,
+                "max": 3.8166,
+                "mean": 0.0015
+              },
+              "f_5": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4196,
+                "max": 4.1827,
+                "mean": 0.0005
+              },
+              "f_6": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.1119,
+                "max": 4.4091,
+                "mean": -0.0059
+              },
+              "f_7": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.11,
+                "max": 4.2392,
+                "mean": 0.0037
+              },
+              "f_8": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4481,
+                "max": 4.2975,
+                "mean": -0.0035
+              },
+              "f_9": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2903,
+                "max": 4.1464,
+                "mean": 0.0015
+              },
+              "f_10": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.1543,
+                "max": 4.6021,
+                "mean": 0.0008
+              },
+              "f_11": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2641,
+                "max": 4.7073,
+                "mean": 0.0006
+              },
+              "f_12": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.3388,
+                "max": 4.0316,
+                "mean": 0.001
+              },
+              "f_13": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.5931,
+                "max": 4.5073,
+                "mean": 0.0053
+              },
+              "f_14": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.416,
+                "max": 4.0871,
+                "mean": 0.0022
+              },
+              "f_15": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4051,
+                "max": 4.4256,
+                "mean": -0.0015
+              },
+              "f_16": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.4197,
+                "max": 3.9725,
+                "mean": -0.001
+              },
+              "f_17": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.5868,
+                "max": 4.0748,
+                "mean": 0.0002
+              },
+              "f_18": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.1139,
+                "max": 4.2177,
+                "mean": 0.0021
+              },
+              "f_19": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.6057,
+                "max": 4.1142,
+                "mean": -0.0015
+              },
+              "target": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -20.3774,
+                "max": 19.9357,
+                "mean": -0.3781
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "workload": "profile",
+      "dataset": "numeric_500000",
+      "grizzly_sample_size": 2000000,
+      "equivalence": {
+        "status": "ok",
+        "problems": []
+      },
+      "results": {
+        "grizzly": {
+          "library": "grizzly",
+          "library_version": "0.1.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 227.94312499900116,
+            "min_ms": 164.15320899977814,
+            "max_ms": 440.9052090049954,
+            "mean_ms": 255.40131571428253,
+            "stdev_ms": 95.33956928884781
+          },
+          "peak_rss_bytes": 135741440,
+          "fingerprint": {
+            "rows": 500000,
+            "columns": {
+              "f_0": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.9379,
+                "max": 4.9406,
+                "mean": 0.0013
+              },
+              "f_1": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -5.3652,
+                "max": 4.7096,
+                "mean": -0.0008
+              },
+              "f_2": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -5.018,
+                "max": 4.4735,
+                "mean": -0.0007
+              },
+              "f_3": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5736,
+                "max": 4.3666,
+                "mean": 0.0011
+              },
+              "f_4": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.966,
+                "max": 4.384,
+                "mean": 0.0007
+              },
+              "f_5": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6085,
+                "max": 4.6352,
+                "mean": 0.0014
+              },
+              "f_6": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.653,
+                "max": 4.7159,
+                "mean": -0.0017
+              },
+              "f_7": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5829,
+                "max": 4.506,
+                "mean": -0.0005
+              },
+              "f_8": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6807,
+                "max": 5.5031,
+                "mean": -0.003
+              },
+              "f_9": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.7604,
+                "max": 4.4658,
+                "mean": 0.0013
+              },
+              "f_10": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -5.025,
+                "max": 4.8404,
+                "mean": 0.0009
+              },
+              "f_11": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8139,
+                "max": 4.7073,
+                "mean": -0.0011
+              },
+              "f_12": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.4834,
+                "max": 4.5661,
+                "mean": -0.0005
+              },
+              "f_13": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8893,
+                "max": 4.5454,
+                "mean": 0.0004
+              },
+              "f_14": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8256,
+                "max": 4.8364,
+                "mean": -0.0019
+              },
+              "f_15": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.591,
+                "max": 5.2722,
+                "mean": 0.0003
+              },
+              "f_16": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.9224,
+                "max": 4.4459,
+                "mean": -0.001
+              },
+              "f_17": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5868,
+                "max": 4.335,
+                "mean": -0.0004
+              },
+              "f_18": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5791,
+                "max": 4.7388,
+                "mean": 0.0004
+              },
+              "f_19": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6057,
+                "max": 4.2743,
+                "mean": 0.0003
+              },
+              "target": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -24.5861,
+                "max": 20.9342,
+                "mean": -0.3814
+              }
+            }
+          }
+        },
+        "pandas": {
+          "library": "pandas",
+          "library_version": "3.0.5",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 2183.000125005492,
+            "min_ms": 1571.6275829981896,
+            "max_ms": 2684.6764579968294,
+            "mean_ms": 2068.3404222862528,
+            "stdev_ms": 390.71600397205407
+          },
+          "peak_rss_bytes": 247480320,
+          "fingerprint": {
+            "rows": 500000,
+            "columns": {
+              "f_0": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.9379,
+                "max": 4.9406,
+                "mean": 0.0013
+              },
+              "f_1": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -5.3652,
+                "max": 4.7096,
+                "mean": -0.0008
+              },
+              "f_2": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -5.018,
+                "max": 4.4735,
+                "mean": -0.0007
+              },
+              "f_3": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5736,
+                "max": 4.3666,
+                "mean": 0.0011
+              },
+              "f_4": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.966,
+                "max": 4.384,
+                "mean": 0.0007
+              },
+              "f_5": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6085,
+                "max": 4.6352,
+                "mean": 0.0014
+              },
+              "f_6": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.653,
+                "max": 4.7159,
+                "mean": -0.0017
+              },
+              "f_7": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5829,
+                "max": 4.506,
+                "mean": -0.0005
+              },
+              "f_8": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6807,
+                "max": 5.5031,
+                "mean": -0.003
+              },
+              "f_9": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.7604,
+                "max": 4.4658,
+                "mean": 0.0013
+              },
+              "f_10": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -5.025,
+                "max": 4.8404,
+                "mean": 0.0009
+              },
+              "f_11": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8139,
+                "max": 4.7073,
+                "mean": -0.0011
+              },
+              "f_12": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.4834,
+                "max": 4.5661,
+                "mean": -0.0005
+              },
+              "f_13": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8893,
+                "max": 4.5454,
+                "mean": 0.0004
+              },
+              "f_14": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8256,
+                "max": 4.8364,
+                "mean": -0.0019
+              },
+              "f_15": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.591,
+                "max": 5.2722,
+                "mean": 0.0003
+              },
+              "f_16": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.9224,
+                "max": 4.4459,
+                "mean": -0.001
+              },
+              "f_17": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5868,
+                "max": 4.335,
+                "mean": -0.0004
+              },
+              "f_18": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5791,
+                "max": 4.7388,
+                "mean": 0.0004
+              },
+              "f_19": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6057,
+                "max": 4.2743,
+                "mean": 0.0003
+              },
+              "target": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -24.5861,
+                "max": 20.9342,
+                "mean": -0.3814
+              }
+            }
+          }
+        },
+        "polars": {
+          "library": "polars",
+          "library_version": "1.43.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 357.47704199457075,
+            "min_ms": 291.9099999999162,
+            "max_ms": 541.1249579992727,
+            "mean_ms": 375.55750571274467,
+            "stdev_ms": 85.33158212480765
+          },
+          "peak_rss_bytes": 247726080,
+          "fingerprint": {
+            "rows": 500000,
+            "columns": {
+              "f_0": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.9379,
+                "max": 4.9406,
+                "mean": 0.0013
+              },
+              "f_1": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -5.3652,
+                "max": 4.7096,
+                "mean": -0.0008
+              },
+              "f_2": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -5.018,
+                "max": 4.4735,
+                "mean": -0.0007
+              },
+              "f_3": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5736,
+                "max": 4.3666,
+                "mean": 0.0011
+              },
+              "f_4": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.966,
+                "max": 4.384,
+                "mean": 0.0007
+              },
+              "f_5": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6085,
+                "max": 4.6352,
+                "mean": 0.0014
+              },
+              "f_6": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.653,
+                "max": 4.7159,
+                "mean": -0.0017
+              },
+              "f_7": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5829,
+                "max": 4.506,
+                "mean": -0.0005
+              },
+              "f_8": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6807,
+                "max": 5.5031,
+                "mean": -0.003
+              },
+              "f_9": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.7604,
+                "max": 4.4658,
+                "mean": 0.0013
+              },
+              "f_10": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -5.025,
+                "max": 4.8404,
+                "mean": 0.0009
+              },
+              "f_11": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8139,
+                "max": 4.7073,
+                "mean": -0.0011
+              },
+              "f_12": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.4834,
+                "max": 4.5661,
+                "mean": -0.0005
+              },
+              "f_13": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8893,
+                "max": 4.5454,
+                "mean": 0.0004
+              },
+              "f_14": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8256,
+                "max": 4.8364,
+                "mean": -0.0019
+              },
+              "f_15": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.591,
+                "max": 5.2722,
+                "mean": 0.0003
+              },
+              "f_16": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.9224,
+                "max": 4.4459,
+                "mean": -0.001
+              },
+              "f_17": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5868,
+                "max": 4.335,
+                "mean": -0.0004
+              },
+              "f_18": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5791,
+                "max": 4.7388,
+                "mean": 0.0004
+              },
+              "f_19": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6057,
+                "max": 4.2743,
+                "mean": 0.0003
+              },
+              "target": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -24.5861,
+                "max": 20.9342,
+                "mean": -0.3814
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "workload": "profile",
+      "dataset": "mixed_100000",
+      "grizzly_sample_size": 400000,
+      "equivalence": {
+        "status": "ok",
+        "problems": []
+      },
+      "results": {
+        "grizzly": {
+          "library": "grizzly",
+          "library_version": "0.1.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 88.40187500027241,
+            "min_ms": 79.2326660011895,
+            "max_ms": 105.3570839940221,
+            "mean_ms": 91.25733314223388,
+            "stdev_ms": 9.274817966463633
+          },
+          "peak_rss_bytes": 76840960,
+          "fingerprint": {
+            "rows": 100000,
+            "columns": {
+              "num_0": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.3245,
+                "max": 4.2457,
+                "mean": -0.0016
+              },
+              "int_1": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -27.7938
+              },
+              "cat_2": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_3": {
+                "observed": 100000,
+                "null_count": 5031,
+                "min": -3.2501,
+                "max": 13.9393,
+                "mean": 5.0061
+              },
+              "num_4": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.5339,
+                "max": 4.421,
+                "mean": -0.0034
+              },
+              "int_5": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 9.0777
+              },
+              "cat_6": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_7": {
+                "observed": 100000,
+                "null_count": 5088,
+                "min": -3.8962,
+                "max": 13.8554,
+                "mean": 5.0042
+              },
+              "num_8": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.6794,
+                "max": 4.2606,
+                "mean": 0.0021
+              },
+              "int_9": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -30.2526
+              },
+              "cat_10": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_11": {
+                "observed": 100000,
+                "null_count": 4926,
+                "min": -3.7186,
+                "max": 13.7614,
+                "mean": 5.0089
+              },
+              "num_12": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2754,
+                "max": 4.5092,
+                "mean": 0.0016
+              },
+              "int_13": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -17.461
+              },
+              "cat_14": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_15": {
+                "observed": 100000,
+                "null_count": 5085,
+                "min": -3.347,
+                "max": 14.1853,
+                "mean": 4.9995
+              },
+              "num_16": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2124,
+                "max": 4.2388,
+                "mean": 0.0013
+              },
+              "int_17": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -9.1161
+              },
+              "cat_18": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_19": {
+                "observed": 100000,
+                "null_count": 5041,
+                "min": -3.6865,
+                "max": 14.6472,
+                "mean": 5.0044
+              }
+            }
+          }
+        },
+        "pandas": {
+          "library": "pandas",
+          "library_version": "3.0.5",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 403.5077500011539,
+            "min_ms": 374.3680420011515,
+            "max_ms": 576.3441670060274,
+            "mean_ms": 434.72011314484655,
+            "stdev_ms": 74.16182744498221
+          },
+          "peak_rss_bytes": 148602880,
+          "fingerprint": {
+            "rows": 100000,
+            "columns": {
+              "num_0": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.3245,
+                "max": 4.2457,
+                "mean": -0.0016
+              },
+              "int_1": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -27.7938
+              },
+              "cat_2": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_3": {
+                "observed": 100000,
+                "null_count": 5031,
+                "min": -3.2501,
+                "max": 13.9393,
+                "mean": 5.0061
+              },
+              "num_4": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.5339,
+                "max": 4.421,
+                "mean": -0.0034
+              },
+              "int_5": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 9.0777
+              },
+              "cat_6": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_7": {
+                "observed": 100000,
+                "null_count": 5088,
+                "min": -3.8962,
+                "max": 13.8554,
+                "mean": 5.0042
+              },
+              "num_8": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.6794,
+                "max": 4.2606,
+                "mean": 0.0021
+              },
+              "int_9": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -30.2526
+              },
+              "cat_10": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_11": {
+                "observed": 100000,
+                "null_count": 4926,
+                "min": -3.7186,
+                "max": 13.7614,
+                "mean": 5.0089
+              },
+              "num_12": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2754,
+                "max": 4.5092,
+                "mean": 0.0016
+              },
+              "int_13": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -17.461
+              },
+              "cat_14": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_15": {
+                "observed": 100000,
+                "null_count": 5085,
+                "min": -3.347,
+                "max": 14.1853,
+                "mean": 4.9995
+              },
+              "num_16": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2124,
+                "max": 4.2388,
+                "mean": 0.0013
+              },
+              "int_17": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -9.1161
+              },
+              "cat_18": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_19": {
+                "observed": 100000,
+                "null_count": 5041,
+                "min": -3.6865,
+                "max": 14.6472,
+                "mean": 5.0044
+              }
+            }
+          }
+        },
+        "polars": {
+          "library": "polars",
+          "library_version": "1.43.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 78.64500000141561,
+            "min_ms": 59.14150000171503,
+            "max_ms": 150.33854200009955,
+            "mean_ms": 94.78803000092739,
+            "stdev_ms": 38.78495591620885
+          },
+          "peak_rss_bytes": 109346816,
+          "fingerprint": {
+            "rows": 100000,
+            "columns": {
+              "num_0": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.3245,
+                "max": 4.2457,
+                "mean": -0.0016
+              },
+              "int_1": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -27.7938
+              },
+              "cat_2": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_3": {
+                "observed": 100000,
+                "null_count": 5031,
+                "min": -3.2501,
+                "max": 13.9393,
+                "mean": 5.0061
+              },
+              "num_4": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.5339,
+                "max": 4.421,
+                "mean": -0.0034
+              },
+              "int_5": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 9.0777
+              },
+              "cat_6": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_7": {
+                "observed": 100000,
+                "null_count": 5088,
+                "min": -3.8962,
+                "max": 13.8554,
+                "mean": 5.0042
+              },
+              "num_8": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.6794,
+                "max": 4.2606,
+                "mean": 0.0021
+              },
+              "int_9": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -30.2526
+              },
+              "cat_10": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_11": {
+                "observed": 100000,
+                "null_count": 4926,
+                "min": -3.7186,
+                "max": 13.7614,
+                "mean": 5.0089
+              },
+              "num_12": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2754,
+                "max": 4.5092,
+                "mean": 0.0016
+              },
+              "int_13": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -17.461
+              },
+              "cat_14": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_15": {
+                "observed": 100000,
+                "null_count": 5085,
+                "min": -3.347,
+                "max": 14.1853,
+                "mean": 4.9995
+              },
+              "num_16": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -4.2124,
+                "max": 4.2388,
+                "mean": 0.0013
+              },
+              "int_17": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -9.1161
+              },
+              "cat_18": {
+                "observed": 100000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_19": {
+                "observed": 100000,
+                "null_count": 5041,
+                "min": -3.6865,
+                "max": 14.6472,
+                "mean": 5.0044
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "workload": "profile",
+      "dataset": "mixed_500000",
+      "grizzly_sample_size": 2000000,
+      "equivalence": {
+        "status": "ok",
+        "problems": []
+      },
+      "results": {
+        "grizzly": {
+          "library": "grizzly",
+          "library_version": "0.1.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 360.7988750009099,
+            "min_ms": 331.3262079973356,
+            "max_ms": 651.9177919981303,
+            "mean_ms": 406.84914271384645,
+            "stdev_ms": 112.46189344410364
+          },
+          "peak_rss_bytes": 170835968,
+          "fingerprint": {
+            "rows": 500000,
+            "columns": {
+              "num_0": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6085,
+                "max": 5.2722,
+                "mean": 0.0003
+              },
+              "int_1": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -15.2741
+              },
+              "cat_2": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_3": {
+                "observed": 500000,
+                "null_count": 24800,
+                "min": -4.0436,
+                "max": 13.9393,
+                "mean": 5.0016
+              },
+              "num_4": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5339,
+                "max": 4.566,
+                "mean": -0.0022
+              },
+              "int_5": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 9.507
+              },
+              "cat_6": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_7": {
+                "observed": 500000,
+                "null_count": 24840,
+                "min": -3.8962,
+                "max": 13.8554,
+                "mean": 5.0037
+              },
+              "num_8": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.7202,
+                "max": 4.7388,
+                "mean": 0.0015
+              },
+              "int_9": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 5.3367
+              },
+              "cat_10": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_11": {
+                "observed": 500000,
+                "null_count": 24679,
+                "min": -3.7306,
+                "max": 14.9177,
+                "mean": 5.0083
+              },
+              "num_12": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8893,
+                "max": 4.5092,
+                "mean": 0.0
+              },
+              "int_13": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -5.4062
+              },
+              "cat_14": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_15": {
+                "observed": 500000,
+                "null_count": 25150,
+                "min": -3.8949,
+                "max": 14.1853,
+                "mean": 5.0034
+              },
+              "num_16": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6387,
+                "max": 4.7204,
+                "mean": 0.0007
+              },
+              "int_17": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 4.7844
+              },
+              "cat_18": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_19": {
+                "observed": 500000,
+                "null_count": 24904,
+                "min": -4.5137,
+                "max": 14.6472,
+                "mean": 5.0001
+              }
+            }
+          }
+        },
+        "pandas": {
+          "library": "pandas",
+          "library_version": "3.0.5",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 1633.1300829988322,
+            "min_ms": 1368.3951249986421,
+            "max_ms": 3524.601666998933,
+            "mean_ms": 2051.753434571895,
+            "stdev_ms": 801.9122573199791
+          },
+          "peak_rss_bytes": 266731520,
+          "fingerprint": {
+            "rows": 500000,
+            "columns": {
+              "num_0": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6085,
+                "max": 5.2722,
+                "mean": 0.0003
+              },
+              "int_1": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -15.2741
+              },
+              "cat_2": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_3": {
+                "observed": 500000,
+                "null_count": 24800,
+                "min": -4.0436,
+                "max": 13.9393,
+                "mean": 5.0016
+              },
+              "num_4": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5339,
+                "max": 4.566,
+                "mean": -0.0022
+              },
+              "int_5": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 9.507
+              },
+              "cat_6": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_7": {
+                "observed": 500000,
+                "null_count": 24840,
+                "min": -3.8962,
+                "max": 13.8554,
+                "mean": 5.0037
+              },
+              "num_8": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.7202,
+                "max": 4.7388,
+                "mean": 0.0015
+              },
+              "int_9": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 5.3367
+              },
+              "cat_10": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_11": {
+                "observed": 500000,
+                "null_count": 24679,
+                "min": -3.7306,
+                "max": 14.9177,
+                "mean": 5.0083
+              },
+              "num_12": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8893,
+                "max": 4.5092,
+                "mean": 0.0
+              },
+              "int_13": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -5.4062
+              },
+              "cat_14": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_15": {
+                "observed": 500000,
+                "null_count": 25150,
+                "min": -3.8949,
+                "max": 14.1853,
+                "mean": 5.0034
+              },
+              "num_16": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6387,
+                "max": 4.7204,
+                "mean": 0.0007
+              },
+              "int_17": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 4.7844
+              },
+              "cat_18": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_19": {
+                "observed": 500000,
+                "null_count": 24904,
+                "min": -4.5137,
+                "max": 14.6472,
+                "mean": 5.0001
+              }
+            }
+          }
+        },
+        "polars": {
+          "library": "polars",
+          "library_version": "1.43.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 260.22795800236054,
+            "min_ms": 162.52254199935123,
+            "max_ms": 415.8841669996036,
+            "mean_ms": 261.78550614505576,
+            "stdev_ms": 87.89181706977062
+          },
+          "peak_rss_bytes": 274481152,
+          "fingerprint": {
+            "rows": 500000,
+            "columns": {
+              "num_0": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6085,
+                "max": 5.2722,
+                "mean": 0.0003
+              },
+              "int_1": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -15.2741
+              },
+              "cat_2": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_3": {
+                "observed": 500000,
+                "null_count": 24800,
+                "min": -4.0436,
+                "max": 13.9393,
+                "mean": 5.0016
+              },
+              "num_4": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.5339,
+                "max": 4.566,
+                "mean": -0.0022
+              },
+              "int_5": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 9.507
+              },
+              "cat_6": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_7": {
+                "observed": 500000,
+                "null_count": 24840,
+                "min": -3.8962,
+                "max": 13.8554,
+                "mean": 5.0037
+              },
+              "num_8": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.7202,
+                "max": 4.7388,
+                "mean": 0.0015
+              },
+              "int_9": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 5.3367
+              },
+              "cat_10": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_11": {
+                "observed": 500000,
+                "null_count": 24679,
+                "min": -3.7306,
+                "max": 14.9177,
+                "mean": 5.0083
+              },
+              "num_12": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.8893,
+                "max": 4.5092,
+                "mean": 0.0
+              },
+              "int_13": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": -5.4062
+              },
+              "cat_14": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_15": {
+                "observed": 500000,
+                "null_count": 25150,
+                "min": -3.8949,
+                "max": 14.1853,
+                "mean": 5.0034
+              },
+              "num_16": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -4.6387,
+                "max": 4.7204,
+                "mean": 0.0007
+              },
+              "int_17": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": -10000.0,
+                "max": 10000.0,
+                "mean": 4.7844
+              },
+              "cat_18": {
+                "observed": 500000,
+                "null_count": 0,
+                "min": null,
+                "max": null,
+                "mean": null
+              },
+              "opt_19": {
+                "observed": 500000,
+                "null_count": 24904,
+                "min": -4.5137,
+                "max": 14.6472,
+                "mean": 5.0001
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "workload": "transform",
+      "dataset": "numeric_100000",
+      "grizzly_sample_size": 400000,
+      "equivalence": {
+        "status": "ok",
+        "problems": []
+      },
+      "results": {
+        "grizzly": {
+          "library": "grizzly",
+          "library_version": "0.1.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 94.50775000004796,
+            "min_ms": 80.35129099880578,
+            "max_ms": 184.45937500655418,
+            "mean_ms": 102.26571414386854,
+            "stdev_ms": 36.85754019215556
+          },
+          "peak_rss_bytes": 106479616,
+          "fingerprint": {
+            "rows_written": 100000,
+            "cols_scaled": 21,
+            "rows": 100000,
+            "ranges": {
+              "f_0": [
+                0.0,
+                1.0
+              ],
+              "f_1": [
+                0.0,
+                1.0
+              ],
+              "f_2": [
+                0.0,
+                1.0
+              ],
+              "f_3": [
+                0.0,
+                1.0
+              ],
+              "f_4": [
+                0.0,
+                1.0
+              ],
+              "f_5": [
+                0.0,
+                1.0
+              ],
+              "f_6": [
+                0.0,
+                1.0
+              ],
+              "f_7": [
+                0.0,
+                1.0
+              ],
+              "f_8": [
+                0.0,
+                1.0
+              ],
+              "f_9": [
+                0.0,
+                1.0
+              ],
+              "f_10": [
+                0.0,
+                1.0
+              ],
+              "f_11": [
+                0.0,
+                1.0
+              ],
+              "f_12": [
+                0.0,
+                1.0
+              ],
+              "f_13": [
+                0.0,
+                1.0
+              ],
+              "f_14": [
+                0.0,
+                1.0
+              ],
+              "f_15": [
+                0.0,
+                1.0
+              ],
+              "f_16": [
+                0.0,
+                1.0
+              ],
+              "f_17": [
+                0.0,
+                1.0
+              ],
+              "f_18": [
+                0.0,
+                1.0
+              ],
+              "f_19": [
+                0.0,
+                1.0
+              ],
+              "target": [
+                0.0,
+                1.0
+              ]
+            }
+          }
+        },
+        "pandas": {
+          "library": "pandas",
+          "library_version": "3.0.5",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 2123.351542002638,
+            "min_ms": 1950.2545409995946,
+            "max_ms": 2251.5200409980025,
+            "mean_ms": 2113.3763927136897,
+            "stdev_ms": 124.8879041263798
+          },
+          "peak_rss_bytes": 202211328,
+          "fingerprint": {
+            "rows_written": 100000,
+            "cols_scaled": 21,
+            "rows": 100000,
+            "ranges": {
+              "f_0": [
+                0.0,
+                1.0
+              ],
+              "f_1": [
+                0.0,
+                1.0
+              ],
+              "f_2": [
+                0.0,
+                1.0
+              ],
+              "f_3": [
+                0.0,
+                1.0
+              ],
+              "f_4": [
+                0.0,
+                1.0
+              ],
+              "f_5": [
+                0.0,
+                1.0
+              ],
+              "f_6": [
+                0.0,
+                1.0
+              ],
+              "f_7": [
+                0.0,
+                1.0
+              ],
+              "f_8": [
+                0.0,
+                1.0
+              ],
+              "f_9": [
+                0.0,
+                1.0
+              ],
+              "f_10": [
+                0.0,
+                1.0
+              ],
+              "f_11": [
+                0.0,
+                1.0
+              ],
+              "f_12": [
+                0.0,
+                1.0
+              ],
+              "f_13": [
+                0.0,
+                1.0
+              ],
+              "f_14": [
+                0.0,
+                1.0
+              ],
+              "f_15": [
+                0.0,
+                1.0
+              ],
+              "f_16": [
+                0.0,
+                1.0
+              ],
+              "f_17": [
+                0.0,
+                1.0
+              ],
+              "f_18": [
+                0.0,
+                1.0
+              ],
+              "f_19": [
+                0.0,
+                1.0
+              ],
+              "target": [
+                0.0,
+                1.0
+              ]
+            }
+          }
+        },
+        "polars": {
+          "library": "polars",
+          "library_version": "1.43.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 92.26725000189617,
+            "min_ms": 68.71045899606543,
+            "max_ms": 119.9936249977327,
+            "mean_ms": 93.9905894275788,
+            "stdev_ms": 18.576560245771493
+          },
+          "peak_rss_bytes": 119750656,
+          "fingerprint": {
+            "rows_written": 100000,
+            "cols_scaled": 21,
+            "rows": 100000,
+            "ranges": {
+              "f_0": [
+                0.0,
+                1.0
+              ],
+              "f_1": [
+                0.0,
+                1.0
+              ],
+              "f_2": [
+                0.0,
+                1.0
+              ],
+              "f_3": [
+                0.0,
+                1.0
+              ],
+              "f_4": [
+                0.0,
+                1.0
+              ],
+              "f_5": [
+                0.0,
+                1.0
+              ],
+              "f_6": [
+                0.0,
+                1.0
+              ],
+              "f_7": [
+                0.0,
+                1.0
+              ],
+              "f_8": [
+                0.0,
+                1.0
+              ],
+              "f_9": [
+                0.0,
+                1.0
+              ],
+              "f_10": [
+                0.0,
+                1.0
+              ],
+              "f_11": [
+                0.0,
+                1.0
+              ],
+              "f_12": [
+                0.0,
+                1.0
+              ],
+              "f_13": [
+                0.0,
+                1.0
+              ],
+              "f_14": [
+                0.0,
+                1.0
+              ],
+              "f_15": [
+                0.0,
+                1.0
+              ],
+              "f_16": [
+                0.0,
+                1.0
+              ],
+              "f_17": [
+                0.0,
+                1.0
+              ],
+              "f_18": [
+                0.0,
+                1.0
+              ],
+              "f_19": [
+                0.0,
+                1.0
+              ],
+              "target": [
+                0.0,
+                1.0
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "workload": "transform",
+      "dataset": "numeric_500000",
+      "grizzly_sample_size": 2000000,
+      "equivalence": {
+        "status": "ok",
+        "problems": []
+      },
+      "results": {
+        "grizzly": {
+          "library": "grizzly",
+          "library_version": "0.1.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 1470.414791998337,
+            "min_ms": 712.8704999995534,
+            "max_ms": 2178.9040840012603,
+            "mean_ms": 1450.1034407148836,
+            "stdev_ms": 501.2222112585026
+          },
+          "peak_rss_bytes": 340852736,
+          "fingerprint": {
+            "rows_written": 500000,
+            "cols_scaled": 21,
+            "rows": 500000,
+            "ranges": {
+              "f_0": [
+                0.0,
+                1.0
+              ],
+              "f_1": [
+                0.0,
+                1.0
+              ],
+              "f_2": [
+                0.0,
+                1.0
+              ],
+              "f_3": [
+                0.0,
+                1.0
+              ],
+              "f_4": [
+                0.0,
+                1.0
+              ],
+              "f_5": [
+                0.0,
+                1.0
+              ],
+              "f_6": [
+                0.0,
+                1.0
+              ],
+              "f_7": [
+                0.0,
+                1.0
+              ],
+              "f_8": [
+                0.0,
+                1.0
+              ],
+              "f_9": [
+                0.0,
+                1.0
+              ],
+              "f_10": [
+                0.0,
+                1.0
+              ],
+              "f_11": [
+                0.0,
+                1.0
+              ],
+              "f_12": [
+                0.0,
+                1.0
+              ],
+              "f_13": [
+                0.0,
+                1.0
+              ],
+              "f_14": [
+                0.0,
+                1.0
+              ],
+              "f_15": [
+                0.0,
+                1.0
+              ],
+              "f_16": [
+                0.0,
+                1.0
+              ],
+              "f_17": [
+                0.0,
+                1.0
+              ],
+              "f_18": [
+                0.0,
+                1.0
+              ],
+              "f_19": [
+                0.0,
+                1.0
+              ],
+              "target": [
+                0.0,
+                1.0
+              ]
+            }
+          }
+        },
+        "pandas": {
+          "library": "pandas",
+          "library_version": "3.0.5",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 23458.438624998962,
+            "min_ms": 20315.570708997257,
+            "max_ms": 28821.261083001446,
+            "mean_ms": 24240.635095285794,
+            "stdev_ms": 3141.8082538976473
+          },
+          "peak_rss_bytes": 425410560,
+          "fingerprint": {
+            "rows_written": 500000,
+            "cols_scaled": 21,
+            "rows": 500000,
+            "ranges": {
+              "f_0": [
+                0.0,
+                1.0
+              ],
+              "f_1": [
+                0.0,
+                1.0
+              ],
+              "f_2": [
+                0.0,
+                1.0
+              ],
+              "f_3": [
+                0.0,
+                1.0
+              ],
+              "f_4": [
+                0.0,
+                1.0
+              ],
+              "f_5": [
+                0.0,
+                1.0
+              ],
+              "f_6": [
+                0.0,
+                1.0
+              ],
+              "f_7": [
+                0.0,
+                1.0
+              ],
+              "f_8": [
+                0.0,
+                1.0
+              ],
+              "f_9": [
+                0.0,
+                1.0
+              ],
+              "f_10": [
+                0.0,
+                1.0
+              ],
+              "f_11": [
+                0.0,
+                1.0
+              ],
+              "f_12": [
+                0.0,
+                1.0
+              ],
+              "f_13": [
+                0.0,
+                1.0
+              ],
+              "f_14": [
+                0.0,
+                1.0
+              ],
+              "f_15": [
+                0.0,
+                1.0
+              ],
+              "f_16": [
+                0.0,
+                1.0
+              ],
+              "f_17": [
+                0.0,
+                1.0
+              ],
+              "f_18": [
+                0.0,
+                1.0
+              ],
+              "f_19": [
+                0.0,
+                1.0
+              ],
+              "target": [
+                0.0,
+                1.0
+              ]
+            }
+          }
+        },
+        "polars": {
+          "library": "polars",
+          "library_version": "1.43.0",
+          "repetitions": 7,
+          "timing": {
+            "median_ms": 1613.4056660011993,
+            "min_ms": 1287.3997909991886,
+            "max_ms": 3411.9161250055186,
+            "mean_ms": 1999.1427200002363,
+            "stdev_ms": 821.8556439300039
+          },
+          "peak_rss_bytes": 271089664,
+          "fingerprint": {
+            "rows_written": 500000,
+            "cols_scaled": 21,
+            "rows": 500000,
+            "ranges": {
+              "f_0": [
+                0.0,
+                1.0
+              ],
+              "f_1": [
+                0.0,
+                1.0
+              ],
+              "f_2": [
+                0.0,
+                1.0
+              ],
+              "f_3": [
+                0.0,
+                1.0
+              ],
+              "f_4": [
+                0.0,
+                1.0
+              ],
+              "f_5": [
+                0.0,
+                1.0
+              ],
+              "f_6": [
+                0.0,
+                1.0
+              ],
+              "f_7": [
+                0.0,
+                1.0
+              ],
+              "f_8": [
+                0.0,
+                1.0
+              ],
+              "f_9": [
+                0.0,
+                1.0
+              ],
+              "f_10": [
+                0.0,
+                1.0
+              ],
+              "f_11": [
+                0.0,
+                1.0
+              ],
+              "f_12": [
+                0.0,
+                1.0
+              ],
+              "f_13": [
+                0.0,
+                1.0
+              ],
+              "f_14": [
+                0.0,
+                1.0
+              ],
+              "f_15": [
+                0.0,
+                1.0
+              ],
+              "f_16": [
+                0.0,
+                1.0
+              ],
+              "f_17": [
+                0.0,
+                1.0
+              ],
+              "f_18": [
+                0.0,
+                1.0
+              ],
+              "f_19": [
+                0.0,
+                1.0
+              ],
+              "target": [
+                0.0,
+                1.0
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

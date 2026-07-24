@@ -1,0 +1,22 @@
+# Pinned comparison libraries for the Grizzly benchmark suite.
+#
+# These are pinned, not floated, because a benchmark result is only meaningful
+# against a specific version of what it is being compared to. "2x faster than
+# pandas" is a claim about one release of pandas on one day. Bumping these
+# pins is a deliberate act that should be accompanied by re-running the suite
+# and regenerating the README tables:
+#
+#     python -m benches.bench --strict
+#     python -m benches.render --write
+#
+# The versions recorded in benches/results/results.json are authoritative for
+# the numbers currently published; this file is what reproduces them.
+
+pandas==3.0.5
+polars==1.43.0
+numpy==2.5.1
+pyarrow==25.0.0
+
+# Build + test tooling, pinned for the same reason.
+maturin==1.14.1
+pytest==9.1.1
