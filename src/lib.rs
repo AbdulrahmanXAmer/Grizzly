@@ -2013,28 +2013,31 @@ fn csv_linear_regression(
             // Build a stable split that is consistent across both passes.
             // If shuffle=true, use a Fisher–Yates permutation (parity with Python rng.permutation).
             // If shuffle=false, use a simple sequential split (first train_cut rows).
-            let n_rows = if shuffle {
-                // Pre-count rows up to sample_size so we can permute indices deterministically.
-                let mut n = 0usize;
-                if fast_csv {
-                    let mut it = FastRowIter::new(data_bytes, split_mode);
-                    while it.next().is_some() && n < sample_size {
-                        n += 1;
-                    }
-                } else {
-                    let mut reader = ReaderBuilder::new()
-                        .has_headers(has_header_actual)
-                        .delimiter(delim_byte_for_detection)
-                        .flexible(true)
-                        .from_reader(bytes);
-                    for _ in reader.byte_records().take(sample_size) {
-                        n += 1;
-                    }
+            // Pre-count the rows actually present, capped at sample_size.
+            //
+            // This must happen for both split strategies. Deriving n_rows from
+            // sample_size instead (as the sequential branch previously did)
+            // makes train_cut a fraction of the *requested* cap rather than of
+            // the data: with the default sample_size of 1,000,000, every file
+            // under 800,000 rows put every row on the train side, leaving the
+            // test set empty and reporting r2 = 0.0 for a perfectly good model.
+            let mut counted = 0usize;
+            if fast_csv {
+                let mut it = FastRowIter::new(data_bytes, split_mode);
+                while it.next().is_some() && counted < sample_size {
+                    counted += 1;
                 }
-                n.max(1)
             } else {
-                sample_size.max(1)
-            };
+                let mut reader = ReaderBuilder::new()
+                    .has_headers(has_header_actual)
+                    .delimiter(delim_byte_for_detection)
+                    .flexible(true)
+                    .from_reader(bytes);
+                for _ in reader.byte_records().take(sample_size) {
+                    counted += 1;
+                }
+            }
+            let n_rows = counted.max(1);
             let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
 
             let mut is_train_mask: Option<Vec<bool>> = None;
