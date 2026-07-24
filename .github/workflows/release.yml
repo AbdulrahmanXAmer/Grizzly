@@ -1,0 +1,145 @@
+name: Release
+
+# Tag-triggered wheel build and PyPI publish.
+#
+# Grizzly builds against the CPython stable ABI (abi3), so one wheel per
+# platform serves every supported interpreter rather than one wheel per
+# (platform, Python version) pair. The build matrix is therefore platforms
+# only, and each wheel is smoke-tested on the oldest and newest supported
+# interpreter before anything is published.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to PyPI (otherwise build and upload artifacts only)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The oldest interpreter the abi3 wheel is declared to support.
+  ABI3_FLOOR: "3.10"
+
+jobs:
+  build-wheels:
+    name: Wheels — ${{ matrix.platform.os }} / ${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: linux, runner: ubuntu-latest, target: x86_64 }
+          - { os: linux, runner: ubuntu-24.04-arm, target: aarch64 }
+          - { os: macos, runner: macos-13, target: x86_64 }
+          - { os: macos, runner: macos-latest, target: aarch64 }
+          - { os: windows, runner: windows-latest, target: x64 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.ABI3_FLOOR }}
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          sccache: "true"
+          # manylinux images give the widest glibc compatibility for Linux wheels.
+          manylinux: ${{ matrix.platform.os == 'linux' && 'auto' || '' }}
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          path: dist
+
+  # Install the built wheel on both ends of the supported range. If abi3 is
+  # working, the single wheel imports on all of them; if it is not, this is
+  # where that shows up rather than in a user's traceback.
+  verify-wheels:
+    name: Verify wheel — ${{ matrix.os }} / Python ${{ matrix.python }}
+    needs: build-wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install from wheel
+        run: |
+          python -m pip install -U pip pytest
+          python -m pip install --no-index --find-links dist grizzly
+
+      - name: Verify native extension loaded
+        run: python -c "import grizzly, sys; sys.exit(0 if grizzly.is_native() else 'native extension did not load')"
+
+      - name: Run test suite against the wheel
+        run: python -m pytest tests -v
+
+  build-sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish:
+    name: Publish to PyPI
+    needs: [verify-wheels, build-sdist]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/grizzly
+    permissions:
+      # Trusted publishing: PyPI verifies this workflow's OIDC identity, so no
+      # long-lived API token is stored in repository secrets.
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

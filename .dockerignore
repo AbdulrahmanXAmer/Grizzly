@@ -1,0 +1,35 @@
+# Keep the build context small and the image layers cacheable.
+
+# Build output — rebuilt inside the image, and copying a host target/ directory
+# for a different platform would poison the cache.
+target/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+
+# Host virtualenvs and native artefacts built against a different interpreter.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.dll
+
+# Generated datasets: often gigabytes, always regenerable.
+data/
+*.csv
+*.csv.gz
+*.parquet
+
+# Version control and CI metadata are not needed to build or run.
+.git/
+.github/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging output.
+dist/
+build/
+*.whl

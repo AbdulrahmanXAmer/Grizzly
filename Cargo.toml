@@ -7,8 +7,23 @@ edition = "2021"
 name = "grizzly"
 crate-type = ["cdylib"]
 
+[features]
+# Exposes _force_panic(), used only to verify that a Rust panic surfaces as a
+# catchable Python exception rather than killing the interpreter. Never enabled
+# in a released wheel.
+testing = []
+# extension-module tells pyo3 to leave Python symbols undefined, which is what
+# a loadable module needs but breaks linking `cargo test --release` binaries.
+# maturin enables it (see pyproject [tool.maturin]); plain cargo builds link
+# against the local libpython instead, which is the documented pyo3 recipe for
+# keeping the crate testable and benchmarkable.
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
-pyo3 = { version = "0.25", features = ["extension-module"] }
+# abi3-py310 builds against the CPython stable ABI, so one wheel per platform
+# works on Python 3.10 and every later version, instead of needing a separate
+# wheel per interpreter. The floor matches requires-python in pyproject.toml.
+pyo3 = { version = "0.25", features = ["abi3-py310"] }
 csv = "1.3"
 flate2 = "1.0"
 ahash = "0.8"
@@ -27,6 +42,11 @@ atoi_simd = "0.16"  # Same as Polars - SIMD-accelerated integer parsing
 lto = true
 codegen-units = 1
 opt-level = 3
-panic = "abort"
-
-
+# Panics must unwind, not abort. PyO3 wraps every #[pyfunction] body in
+# catch_unwind and converts a caught panic into a Python PanicException; with
+# panic = "abort" that conversion never happens and a panic anywhere in the
+# extension takes the interpreter down with SIGABRT, uncatchable from Python.
+# Verified with the `testing` feature: abort gives exit 134 (SIGABRT), unwind
+# raises a catchable PanicException. Unwinding costs some binary size for
+# landing pads; the runtime cost falls on paths that actually unwind, and the
+# parsing hot paths do not panic.

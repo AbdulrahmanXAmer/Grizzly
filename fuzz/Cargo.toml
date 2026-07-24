@@ -1,0 +1,40 @@
+[package]
+name = "grizzly-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The fuzz targets deliberately do NOT depend on the grizzly crate. grizzly is a
+# cdylib built against libpython via PyO3 and cannot be linked into a standalone
+# binary. Instead each target compiles src/parse.rs directly with `#[path]`,
+# which works because that module has no PyO3 dependency -- that separation is
+# the whole reason it was split out.
+[dependencies]
+libfuzzer-sys = "0.4"
+memchr = "2.7"
+atoi_simd = "0.16"
+fast-float = "0.2"
+
+[[bin]]
+name = "parse_csv"
+path = "fuzz_targets/parse_csv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_alignment"
+path = "fuzz_targets/chunk_alignment.rs"
+test = false
+doc = false
+bench = false
+
+# Fuzzing wants a fast build with debug assertions left on, so that arithmetic
+# overflow and slice misuse are caught rather than silently wrapping.
+[profile.release]
+debug = true
+debug-assertions = true
+overflow-checks = true

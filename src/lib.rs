@@ -17,613 +17,24 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyIterator, PyList, PyMapping, PySequence, PyString, PyTuple};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufWriter, Read};
+use std::io::Read;
 
 use ahash::AHashMap;
 use csv::ReaderBuilder;
 use flate2::read::GzDecoder;
-use memchr::{memchr, memchr2, memchr3};
+use memchr::memchr;
 use memmap2::Mmap;
 use rayon::prelude::*;
-use tdigest::TDigest;
 
 // Type tracking with a bitmask (keeps hot-path allocations low).
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[repr(u8)]
-enum DType {
-    Null = 1,
-    Bool = 2,
-    Int = 4,
-    Float = 8,
-    String = 16,
-}
-
-fn mask_to_types(mask: u8) -> Vec<&'static str> {
-    let mut out = Vec::with_capacity(5);
-    if mask & DType::Null as u8 != 0 {
-        out.push("null");
-    }
-    if mask & DType::Bool as u8 != 0 {
-        out.push("bool");
-    }
-    if mask & DType::Int as u8 != 0 {
-        out.push("int");
-    }
-    if mask & DType::Float as u8 != 0 {
-        out.push("float");
-    }
-    if mask & DType::String as u8 != 0 {
-        out.push("string");
-    }
-    out
-}
-
-fn infer_from_mask(mask: u8) -> &'static str {
-    let non_null = mask & !(DType::Null as u8);
-    if non_null == 0 {
-        return "null";
-    }
-    if non_null == DType::Int as u8 {
-        return "int";
-    }
-    if non_null == DType::Float as u8 {
-        return "float";
-    }
-    if non_null == DType::Bool as u8 {
-        return "bool";
-    }
-    if non_null == DType::String as u8 {
-        return "string";
-    }
-    if non_null == (DType::Int as u8 | DType::Float as u8) {
-        return "float";
-    }
-    "mixed"
-}
-
 // Streaming numeric stats with T-Digest quantiles.
-
-#[derive(Clone)]
-struct NumStats {
-    n: u64,
-    mean: f64,
-    m2: f64,
-    min: f64,
-    max: f64,
-    digest: TDigest,
-    pending: Vec<f64>,
-}
-
-impl Default for NumStats {
-    fn default() -> Self {
-        Self {
-            n: 0,
-            mean: 0.0,
-            m2: 0.0,
-            min: f64::MAX,
-            max: f64::MIN,
-            digest: TDigest::new_with_size(100),
-            pending: Vec::with_capacity(1024),
-        }
-    }
-}
-
-impl NumStats {
-    #[inline(always)]
-    fn push(&mut self, x: f64) {
-        if self.n == 0 {
-            self.min = x;
-            self.max = x;
-        } else {
-            if x < self.min {
-                self.min = x;
-            }
-            if x > self.max {
-                self.max = x;
-            }
-        }
-        self.n += 1;
-        let delta = x - self.mean;
-        self.mean += delta / (self.n as f64);
-        let delta2 = x - self.mean;
-        self.m2 += delta * delta2;
-
-        self.pending.push(x);
-        if self.pending.len() >= 1024 {
-            let batch = std::mem::take(&mut self.pending);
-            self.digest = self.digest.merge_unsorted(batch);
-            self.pending = Vec::with_capacity(1024);
-        }
-    }
-
-    #[inline(always)]
-    fn finalize(&mut self) {
-        if !self.pending.is_empty() {
-            let batch = std::mem::take(&mut self.pending);
-            self.digest = self.digest.merge_unsorted(batch);
-        }
-    }
-
-    fn merge(&mut self, other: &mut NumStats) {
-        // Finalize both before merging
-        self.finalize();
-        other.finalize();
-
-        if other.n == 0 {
-            return;
-        }
-        if self.n == 0 {
-            *self = other.clone();
-            return;
-        }
-
-        if other.min < self.min {
-            self.min = other.min;
-        }
-        if other.max > self.max {
-            self.max = other.max;
-        }
-
-        let n_combined = self.n + other.n;
-        let delta = other.mean - self.mean;
-        let new_mean = self.mean + delta * (other.n as f64 / n_combined as f64);
-        let new_m2 = self.m2
-            + other.m2
-            + delta * delta * (self.n as f64) * (other.n as f64) / (n_combined as f64);
-
-        self.mean = new_mean;
-        self.m2 = new_m2;
-        self.n = n_combined;
-
-        // Use std::mem::take to avoid cloning digests.
-        let self_digest = std::mem::take(&mut self.digest);
-        let other_digest = std::mem::take(&mut other.digest);
-        self.digest = TDigest::merge_digests(vec![self_digest, other_digest]);
-    }
-
-    fn std_pop(&self) -> Option<f64> {
-        if self.n == 0 {
-            None
-        } else {
-            Some((self.m2 / self.n as f64).sqrt())
-        }
-    }
-
-    fn quantile(&self, q: f64) -> Option<f64> {
-        if self.n == 0 {
-            None
-        } else {
-            Some(self.digest.estimate_quantile(q))
-        }
-    }
-}
 
 // Hash-based frequency tracking (no global interning in the hot path).
 
-#[derive(Clone)]
-struct FreqTracker {
-    ints: AHashMap<i64, u64>,
-    // Key: (hash, len) → collision candidates [(bytes, count)].
-    strings: AHashMap<(u64, usize), Vec<(Vec<u8>, u64)>>,
-    max_strings: usize,
-    total_unique: usize,
-    hash_state: ahash::RandomState,
-}
-
-impl Default for FreqTracker {
-    fn default() -> Self {
-        Self {
-            ints: AHashMap::new(),
-            strings: AHashMap::new(),
-            max_strings: 5000,
-            total_unique: 0,
-            hash_state: ahash::RandomState::with_seeds(0, 0, 0, 0),
-        }
-    }
-}
-
-impl FreqTracker {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    #[inline(always)]
-    fn push_int(&mut self, v: i64) {
-        *self.ints.entry(v).or_insert(0) += 1;
-    }
-
-    #[inline(always)]
-    fn push_string_bytes(&mut self, bytes: &[u8]) {
-        // FIX: Skip very long strings (reduces memory traffic for high-cardinality columns)
-        const MAX_TRACKED_STRING_LEN: usize = 64;
-
-        if self.total_unique >= self.max_strings {
-            return;
-        }
-        if bytes.len() > MAX_TRACKED_STRING_LEN {
-            return;
-        }
-
-        let hash = self.hash_state.hash_one(bytes);
-        let key = (hash, bytes.len());
-
-        // Check collision candidates for exact match
-        let candidates = self.strings.entry(key).or_insert_with(Vec::new);
-
-        for (existing_bytes, count) in candidates.iter_mut() {
-            if existing_bytes == bytes {
-                *count += 1;
-                return;
-            }
-        }
-
-        // New unique string
-        candidates.push((bytes.to_vec(), 1));
-        self.total_unique += 1;
-    }
-
-    fn merge(&mut self, other: &FreqTracker) {
-        for (&k, &v) in &other.ints {
-            *self.ints.entry(k).or_insert(0) += v;
-        }
-        for (key, other_candidates) in &other.strings {
-            if self.total_unique >= self.max_strings {
-                break;
-            }
-
-            let candidates = self.strings.entry(*key).or_insert_with(Vec::new);
-            for (other_bytes, other_count) in other_candidates {
-                let mut found = false;
-                for (existing_bytes, count) in candidates.iter_mut() {
-                    if existing_bytes == other_bytes {
-                        *count += other_count;
-                        found = true;
-                        break;
-                    }
-                }
-                if !found && self.total_unique < self.max_strings {
-                    candidates.push((other_bytes.clone(), *other_count));
-                    self.total_unique += 1;
-                }
-            }
-        }
-    }
-
-    fn mode_int(&self) -> Option<(i64, u64)> {
-        self.ints
-            .iter()
-            .max_by_key(|(_, v)| *v)
-            .map(|(&k, &v)| (k, v))
-    }
-
-    fn mode_string(&self) -> Option<(String, u64)> {
-        // Find mode across all candidates.
-        self.strings
-            .values()
-            .flat_map(|candidates| candidates.iter())
-            .max_by_key(|(_, count)| count)
-            .map(|(bytes, count)| (String::from_utf8_lossy(bytes).into_owned(), *count))
-    }
-}
-
 // Per-column statistics.
 
-#[derive(Clone, Default)]
-struct ColStats {
-    count: u64,
-    null_count: u64,
-    type_mask: u8,
-    examples: Vec<String>,
-    num: NumStats,
-    freq: FreqTracker,
-}
-
-impl ColStats {
-    fn merge(&mut self, other: &mut ColStats) {
-        self.count += other.count;
-        self.null_count += other.null_count;
-        self.type_mask |= other.type_mask;
-        for ex in &other.examples {
-            if self.examples.len() < 5 {
-                self.examples.push(ex.clone());
-            }
-        }
-        self.num.merge(&mut other.num);
-        self.freq.merge(&other.freq);
-    }
-
-    fn finalize(&mut self) {
-        self.num.finalize();
-    }
-}
-
-// Fast byte-level utilities.
-
-#[inline(always)]
-fn trim_bytes(bytes: &[u8]) -> &[u8] {
-    // FIX: Single-pass trim (not position + rposition)
-    let mut start = 0;
-    let mut end = bytes.len();
-
-    // Trim start
-    while start < end && bytes[start].is_ascii_whitespace() {
-        start += 1;
-    }
-
-    // Trim end
-    while end > start && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-
-    &bytes[start..end]
-}
-
-fn sniff_delimiter_simd(bytes: &[u8]) -> Option<u8> {
-    if memchr(b',', bytes).is_some() {
-        return Some(b',');
-    }
-    if memchr(b'\t', bytes).is_some() {
-        return Some(b'\t');
-    }
-    if memchr(b';', bytes).is_some() {
-        return Some(b';');
-    }
-    if memchr(b'|', bytes).is_some() {
-        return Some(b'|');
-    }
-    None
-}
-
-fn has_alphabetic(bytes: &[u8]) -> bool {
-    bytes.iter().any(|&b| b.is_ascii_alphabetic())
-}
-
-/// Better header detection: compare numeric parse rate of row 0 vs rows 1-N.
-/// If row 0 is mostly non-numeric and row 1+ are mostly numeric, it's likely a header.
-fn detect_header_smart(bytes: &[u8], delim: u8, num_sample_rows: usize) -> bool {
-    let mut lines = bytes.split(|&b| b == b'\n').take(num_sample_rows + 1);
-
-    let first_line = match lines.next() {
-        Some(l) => l,
-        None => return false,
-    };
-
-    // Count numeric fields in first row
-    let first_row_fields: Vec<&[u8]> = first_line.split(|&b| b == delim).collect();
-    if first_row_fields.is_empty() {
-        return false;
-    }
-
-    let first_numeric_rate = first_row_fields
-        .iter()
-        .filter(|f| {
-            let trimmed = trim_bytes(f);
-            !trimmed.is_empty()
-                && (atoi_simd::parse::<i64>(trimmed).is_ok()
-                    || fast_float::parse::<f64, _>(trimmed).is_ok())
-        })
-        .count() as f64
-        / first_row_fields.len() as f64;
-
-    // Count numeric fields in subsequent rows
-    let mut total_fields = 0usize;
-    let mut numeric_fields = 0usize;
-
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        for field in line.split(|&b| b == delim) {
-            let trimmed = trim_bytes(field);
-            total_fields += 1;
-            if !trimmed.is_empty()
-                && (atoi_simd::parse::<i64>(trimmed).is_ok()
-                    || fast_float::parse::<f64, _>(trimmed).is_ok())
-            {
-                numeric_fields += 1;
-            }
-        }
-    }
-
-    if total_fields == 0 {
-        return has_alphabetic(first_line);
-    }
-
-    let data_numeric_rate = numeric_fields as f64 / total_fields as f64;
-
-    // Header heuristic:
-    // - First row has low numeric rate (< 30%)
-    // - Data rows have higher numeric rate (> 50%), OR
-    // - First row is significantly less numeric than data rows
-    let is_header = (first_numeric_rate < 0.3 && data_numeric_rate > 0.3)
-        || (data_numeric_rate - first_numeric_rate > 0.3)
-        || (first_numeric_rate < 0.1 && has_alphabetic(first_line));
-
-    is_header
-}
-
 // Cell processing (SIMD int parsing + fast-float).
-
-#[inline(always)]
-fn is_integer_bytes(bytes: &[u8]) -> bool {
-    !bytes.is_empty()
-        && (bytes[0] == b'-' || bytes[0] == b'+' || bytes[0].is_ascii_digit())
-        && !bytes.iter().any(|&b| b == b'.' || b == b'e' || b == b'E')
-}
-
-/// Fast-reject non-float bytes before attempting an expensive float parse.
-#[inline(always)]
-fn maybe_float_bytes(bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
-        return false;
-    }
-
-    // Must start with digit, sign, or decimal
-    let first = bytes[0];
-    if !(first.is_ascii_digit() || first == b'-' || first == b'+' || first == b'.') {
-        return false;
-    }
-
-    // Check if it contains float indicators (., e, E) or is all digits
-    // Using memchr2 for SIMD acceleration
-    memchr2(b'.', b'e', bytes).is_some()
-        || memchr(b'E', bytes).is_some()
-        || bytes
-            .iter()
-            .all(|&b| b.is_ascii_digit() || b == b'-' || b == b'+')
-}
-
-/// Full cell processing with type inference, examples, and frequency tracking
-#[inline(always)]
-fn process_cell(
-    bytes: &[u8],
-    stats: &mut ColStats,
-    max_examples: usize,
-    track_freq: bool,
-    collect_examples: bool,
-) {
-    stats.count += 1;
-    let trimmed = trim_bytes(bytes);
-
-    if trimmed.is_empty() {
-        stats.null_count += 1;
-        stats.type_mask |= DType::Null as u8;
-        return;
-    }
-
-    // FIX: Use atoi-simd (same as Polars) for SIMD-accelerated integer parsing
-    if is_integer_bytes(trimmed) {
-        if let Ok(i) = atoi_simd::parse::<i64>(trimmed) {
-            stats.type_mask |= DType::Int as u8;
-            if track_freq {
-                stats.freq.push_int(i);
-            }
-            stats.num.push(i as f64);
-            if collect_examples && stats.examples.len() < max_examples {
-                if let Ok(s) = std::str::from_utf8(trimmed) {
-                    stats.examples.push(s.to_string());
-                }
-            }
-            return;
-        }
-    }
-
-    // Only attempt float parse if bytes look numeric.
-    if maybe_float_bytes(trimmed) {
-        if let Ok(val) = fast_float::parse::<f64, _>(trimmed) {
-            stats.type_mask |= DType::Float as u8;
-            stats.num.push(val);
-            if collect_examples && stats.examples.len() < max_examples {
-                if let Ok(s) = std::str::from_utf8(trimmed) {
-                    stats.examples.push(s.to_string());
-                }
-            }
-            return;
-        }
-    }
-
-    // Bool check
-    if trimmed.eq_ignore_ascii_case(b"true") || trimmed.eq_ignore_ascii_case(b"false") {
-        stats.type_mask |= DType::Bool as u8;
-        if track_freq {
-            stats.freq.push_string_bytes(trimmed);
-        }
-        if collect_examples && stats.examples.len() < max_examples {
-            if let Ok(s) = std::str::from_utf8(trimmed) {
-                stats.examples.push(s.to_string());
-            }
-        }
-        return;
-    }
-
-    // String fallback
-    stats.type_mask |= DType::String as u8;
-    if track_freq {
-        stats.freq.push_string_bytes(trimmed);
-    }
-    if collect_examples && stats.examples.len() < max_examples {
-        if let Ok(s) = std::str::from_utf8(trimmed) {
-            stats.examples.push(s.to_string());
-        }
-    }
-}
-
-/// LITE cell processing - just numeric stats (min/max/mean/std/quantiles)
-/// No type inference, no examples, no frequency tracking.
-/// This is what you use when you just want Polars-equivalent profiling speed.
-#[inline(always)]
-fn process_cell_lite(bytes: &[u8], stats: &mut ColStats) {
-    stats.count += 1;
-    let trimmed = trim_bytes(bytes);
-
-    if trimmed.is_empty() {
-        stats.null_count += 1;
-        return;
-    }
-
-    // Try int first (common case)
-    if is_integer_bytes(trimmed) {
-        if let Ok(i) = atoi_simd::parse::<i64>(trimmed) {
-            stats.num.push(i as f64);
-            return;
-        }
-    }
-
-    // Try float
-    if let Ok(val) = fast_float::parse::<f64, _>(trimmed) {
-        stats.num.push(val);
-    }
-    // Non-numeric: just count, no other work
-}
-
-// Parallel byte chunking (fast path).
-
-/// Splits a raw byte slice into chunks, aligning to newlines.
-/// Uses Polars strategy: 16MB max, 4KB min chunks.
-///
-/// ⚠️ **CORRECTNESS LIMITATION**: This assumes no quoted newlines in CSV fields.
-/// If your CSV contains quoted fields like `"hello\nworld",123`, this will
-/// split in the middle of the field, causing parse errors.
-///
-/// **Fast path assumption**: "Clean" CSVs with no quoted newlines.
-/// For full CSV correctness, use a producer/consumer pipeline with sequential reading.
-fn chunk_bytes_aligned(bytes: &[u8], num_threads: usize) -> Vec<&[u8]> {
-    const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB (Polars pattern)
-    const MIN_CHUNK_SIZE: usize = 4 * 1024; // 4KB
-
-    let len = bytes.len();
-    if len == 0 || num_threads == 0 {
-        return vec![];
-    }
-
-    // Use a Polars-like chunk sizing strategy.
-    let optimal_chunk_size = len / (16 * num_threads);
-    let chunk_size = optimal_chunk_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
-
-    let mut ranges = Vec::new();
-    let mut start = 0;
-
-    while start < len {
-        let mut end = std::cmp::min(start + chunk_size, len);
-
-        // Align 'end' to the next newline to avoid splitting rows
-        // WARNING: This can still split quoted fields with embedded newlines
-        if end < len {
-            if let Some(newline_pos) = memchr(b'\n', &bytes[end..]) {
-                end += newline_pos + 1;
-            } else {
-                end = len;
-            }
-        }
-
-        if end > start {
-            ranges.push(&bytes[start..end]);
-        }
-        start = end;
-    }
-    ranges
-}
 
 // File I/O (mmap for raw files, bounded gzip for profiling).
 
@@ -709,33 +120,28 @@ impl FileData {
 
 // Parallel CSV profiling.
 
-/// Split mode for CSV parsing
-#[derive(Clone, Copy, Debug)]
-enum SplitMode {
-    Delim(u8),  // Split by specific delimiter
-    Whitespace, // Split by whitespace runs (like pandas sep=r"\s+")
-}
+/// Result of scanning a CSV for profiling, before conversion into a Python dict:
+/// (column names, per-column stats, rows scanned, detected delimiter, header present).
+type ProfileScan = (Vec<String>, Vec<ColStats>, usize, Option<u8>, bool);
 
-/// Iterate fields in a line using a single-byte delimiter.
-#[inline(always)]
-fn iter_fields_delim(line: &[u8], delim: u8) -> impl Iterator<Item = &[u8]> {
-    line.split(move |&b| b == delim)
-}
-
-/// Iterate fields in a line by splitting on whitespace runs
-#[inline(always)]
-fn iter_fields_ws(line: &[u8]) -> impl Iterator<Item = &[u8]> {
-    line.split(|b: &u8| b.is_ascii_whitespace())
-        .filter(|f| !f.is_empty())
-}
-
-/// Get fields from a line using the appropriate split mode
-fn get_fields(line: &[u8], mode: SplitMode) -> Vec<&[u8]> {
-    match mode {
-        SplitMode::Delim(d) => iter_fields_delim(line, d).collect(),
-        SplitMode::Whitespace => iter_fields_ws(line).collect(),
-    }
-}
+/// Result of fitting a linear model, before conversion into a Python dict:
+/// (feature names, coefficients, intercept, train rows, test rows used, r2,
+/// test rows assigned, residual sum of squares, total sum of squares, mean y).
+///
+/// TODO: this tuple is load-bearing across a long function and should become a
+/// named struct; the alias documents the positions in the meantime.
+type RegressionFit = (
+    Vec<String>,
+    Vec<f64>,
+    f64,
+    usize,
+    usize,
+    f64,
+    usize,
+    f64,
+    f64,
+    f64,
+);
 
 /// Profile a CSV file.
 ///
@@ -749,6 +155,9 @@ fn get_fields(line: &[u8], mode: SplitMode) -> Vec<&[u8]> {
 ///            Skips type inference, examples, and frequency tracking for speed.
 /// * `track_freq` - If true, track frequency for mode calculation
 /// * `collect_examples` - If true, collect example values
+// Argument count mirrors the public Python signature, which is the API contract;
+// collapsing it into a config struct would only move the arity into the caller.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (path, sample_size=1000, max_examples=5, fast_csv=true, lite=false, track_freq=true, collect_examples=true))]
 fn csv_profile(
@@ -761,230 +170,231 @@ fn csv_profile(
     track_freq: bool,
     collect_examples: bool,
 ) -> PyResult<PyObject> {
-    let result = py.allow_threads(
-        || -> Result<(Vec<String>, Vec<ColStats>, usize, Option<u8>, bool), String> {
-            // Profiling is sampling-first: use bounded gzip when applicable.
-            let file_data = load_file_for_profile(&path, sample_size).map_err(|e| e.to_string())?;
-            let bytes = file_data.as_bytes();
+    let mode = if lite { ScanMode::Lite } else { ScanMode::Full };
+    csv_profile_impl(
+        py,
+        path,
+        sample_size,
+        max_examples,
+        fast_csv,
+        mode,
+        track_freq,
+        collect_examples,
+    )
+}
 
-            if bytes.is_empty() {
-                return Ok((vec![], vec![], 0, None, false));
-            }
+/// The scan behind `csv_profile`, with the mode exposed.
+///
+/// `ScanMode::Moments` is internal-only: it is what the scaler-params
+/// functions run, and it skips the t-digest entirely — the digest costs ~8x
+/// the moments it accompanies, and those callers discard the quantiles.
+#[allow(clippy::too_many_arguments)]
+fn csv_profile_impl(
+    py: Python<'_>,
+    path: String,
+    sample_size: usize,
+    max_examples: usize,
+    fast_csv: bool,
+    mode: ScanMode,
+    track_freq: bool,
+    collect_examples: bool,
+) -> PyResult<PyObject> {
+    let result = py.allow_threads(|| -> Result<ProfileScan, String> {
+        // Profiling is sampling-first: use bounded gzip when applicable.
+        let file_data = load_file_for_profile(&path, sample_size).map_err(|e| e.to_string())?;
+        let bytes = file_data.as_bytes();
 
-            // Find first line for sniffing
-            let first_newline = memchr(b'\n', bytes).unwrap_or(bytes.len());
-            let first_line = &bytes[..first_newline];
+        if bytes.is_empty() {
+            return Ok((vec![], vec![], 0, None, false));
+        }
 
-            // Determine split mode (delimiter or whitespace)
-            let delimiter = sniff_delimiter_simd(first_line);
-            let split_mode = match delimiter {
-                Some(d) => SplitMode::Delim(d),
-                None => SplitMode::Whitespace,
-            };
+        // Find first line for sniffing
+        let first_newline = memchr(b'\n', bytes).unwrap_or(bytes.len());
+        let first_line = &bytes[..first_newline];
 
-            // For header detection and csv crate compat, we need a delimiter byte
-            let delim_byte_for_detection = match split_mode {
-                SplitMode::Delim(d) => d,
-                SplitMode::Whitespace => b' ', // Use space as proxy for detection
-            };
+        // Determine split mode (delimiter or whitespace)
+        let delimiter = sniff_delimiter_simd(first_line);
+        let split_mode = match delimiter {
+            Some(d) => SplitMode::Delim(d),
+            None => SplitMode::Whitespace,
+        };
 
-            // Header detection heuristic: compare numeric rate of row 0 vs subsequent rows.
-            let has_header = detect_header_smart(bytes, delim_byte_for_detection, 5);
+        // For header detection and csv crate compat, we need a delimiter byte
+        let delim_byte_for_detection = match split_mode {
+            SplitMode::Delim(d) => d,
+            SplitMode::Whitespace => b' ', // Use space as proxy for detection
+        };
 
-            // Get column names from first line (fast path - no csv crate)
-            let header_line = if first_line.ends_with(&[b'\r']) {
-                &first_line[..first_line.len() - 1]
-            } else {
-                first_line
-            };
+        // Header detection heuristic: compare numeric rate of row 0 vs subsequent rows.
+        let has_header = detect_header_smart(bytes, delim_byte_for_detection, 5);
 
-            let col_names: Vec<String> = if has_header {
-                get_fields(header_line, split_mode)
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| {
-                        let trimmed = trim_bytes(f);
-                        if trimmed.is_empty() {
-                            format!("col_{i}")
-                        } else {
-                            String::from_utf8_lossy(trimmed).into_owned()
+        // Get column names from first line (fast path - no csv crate)
+        let header_line = if first_line.ends_with(b"\r") {
+            &first_line[..first_line.len() - 1]
+        } else {
+            first_line
+        };
+
+        let col_names: Vec<String> = if has_header {
+            get_fields(header_line, split_mode)
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let trimmed = trim_bytes(f);
+                    if trimmed.is_empty() {
+                        format!("col_{i}")
+                    } else {
+                        String::from_utf8_lossy(trimmed).into_owned()
+                    }
+                })
+                .collect()
+        } else {
+            get_fields(header_line, split_mode)
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("col_{i}"))
+                .collect()
+        };
+
+        let ncols = col_names.len();
+        if ncols == 0 {
+            return Ok((vec![], vec![], 0, delimiter, has_header));
+        }
+
+        // Skip header bytes if present
+        let data_start = if has_header { first_newline + 1 } else { 0 };
+        let data_bytes = &bytes[data_start..];
+
+        let (merged_stats, total_rows): (Vec<ColStats>, usize) = if fast_csv {
+            // Fast path: direct byte splitting (assumes no quoted newlines in fields).
+            let num_threads = rayon::current_num_threads();
+            let byte_chunks = chunk_bytes_aligned(data_bytes, num_threads);
+            let n_chunks = byte_chunks.len();
+
+            // Per-chunk row budget (avoid shared atomics).
+            let per_chunk_budget = sample_size
+                .checked_div(n_chunks)
+                .map_or(sample_size, |budget| budget + 1);
+
+            byte_chunks
+                .into_par_iter()
+                .map(|chunk_bytes| {
+                    let mut local_stats: Vec<ColStats> = (0..ncols)
+                        .map(|_| ColStats {
+                            freq: FreqTracker::new(),
+                            ..Default::default()
+                        })
+                        .collect();
+
+                    let mut rows_in_chunk = 0usize;
+
+                    // Shares FastLineIter with every other reader. The
+                    // hand-rolled loop this replaces treated a blank line as
+                    // end-of-chunk rather than skipping it, so a stray empty
+                    // line silently dropped the rest of its chunk from the
+                    // profile. Fields are visited in order, so no per-row Vec
+                    // is allocated either.
+                    for line in FastLineIter::new(chunk_bytes) {
+                        if rows_in_chunk >= per_chunk_budget {
+                            break;
                         }
-                    })
-                    .collect()
-            } else {
-                get_fields(header_line, split_mode)
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| format!("col_{i}"))
-                    .collect()
-            };
 
-            let ncols = col_names.len();
-            if ncols == 0 {
-                return Ok((vec![], vec![], 0, delimiter, has_header));
-            }
+                        for_each_field(line, split_mode, |i, field| {
+                            if i >= ncols {
+                                return;
+                            }
+                            match mode {
+                                ScanMode::Moments => {
+                                    process_cell_moments(field, &mut local_stats[i])
+                                }
+                                ScanMode::Lite => process_cell_lite(field, &mut local_stats[i]),
+                                ScanMode::Full => process_cell(
+                                    field,
+                                    &mut local_stats[i],
+                                    max_examples,
+                                    track_freq,
+                                    collect_examples,
+                                ),
+                            }
+                        });
 
-            // Skip header bytes if present
-            let data_start = if has_header { first_newline + 1 } else { 0 };
-            let data_bytes = &bytes[data_start..];
+                        rows_in_chunk += 1;
+                    }
 
-            let (merged_stats, total_rows): (Vec<ColStats>, usize) = if fast_csv {
-                // Fast path: direct byte splitting (assumes no quoted newlines in fields).
-                let num_threads = rayon::current_num_threads();
-                let byte_chunks = chunk_bytes_aligned(data_bytes, num_threads);
-                let n_chunks = byte_chunks.len();
+                    for stat in &mut local_stats {
+                        stat.finalize();
+                    }
 
-                // Per-chunk row budget (avoid shared atomics).
-                let per_chunk_budget = if n_chunks > 0 {
-                    sample_size / n_chunks + 1
-                } else {
-                    sample_size
-                };
-
-                byte_chunks
-                    .into_par_iter()
-                    .map(|chunk_bytes| {
-                        let mut local_stats: Vec<ColStats> = (0..ncols)
+                    (local_stats, rows_in_chunk)
+                })
+                .reduce(
+                    || {
+                        let empty_stats: Vec<ColStats> = (0..ncols)
                             .map(|_| ColStats {
                                 freq: FreqTracker::new(),
                                 ..Default::default()
                             })
                             .collect();
-
-                        let mut rows_in_chunk = 0usize;
-                        let mut pos = 0usize;
-
-                        // Direct byte iteration.
-                        while pos < chunk_bytes.len() && rows_in_chunk < per_chunk_budget {
-                            // Find end of line
-                            let line_end = memchr(b'\n', &chunk_bytes[pos..])
-                                .map(|i| pos + i)
-                                .unwrap_or(chunk_bytes.len());
-
-                            if line_end <= pos {
-                                break;
-                            }
-
-                            // Handle \r\n
-                            let line_len = if line_end > pos
-                                && chunk_bytes.get(line_end - 1) == Some(&b'\r')
-                            {
-                                line_end - 1
-                            } else {
-                                line_end
-                            };
-
-                            let line = &chunk_bytes[pos..line_len];
-                            pos = line_end + 1;
-
-                            if line.is_empty() {
-                                continue;
-                            }
-
-                            // Split fields and process
-                            let fields = get_fields(line, split_mode);
-                            if lite {
-                                // LITE MODE: Just numeric stats
-                                for (i, field) in fields.iter().enumerate() {
-                                    if i < ncols {
-                                        process_cell_lite(field, &mut local_stats[i]);
-                                    }
-                                }
-                            } else {
-                                // FULL MODE: Type inference + examples + freq
-                                for (i, field) in fields.iter().enumerate() {
-                                    if i < ncols {
-                                        process_cell(
-                                            field,
-                                            &mut local_stats[i],
-                                            max_examples,
-                                            track_freq,
-                                            collect_examples,
-                                        );
-                                    }
-                                }
-                            }
-
-                            rows_in_chunk += 1;
-                        }
-
-                        for stat in &mut local_stats {
-                            stat.finalize();
-                        }
-
-                        (local_stats, rows_in_chunk)
-                    })
-                    .reduce(
-                        || {
-                            let empty_stats: Vec<ColStats> = (0..ncols)
-                                .map(|_| ColStats {
-                                    freq: FreqTracker::new(),
-                                    ..Default::default()
-                                })
-                                .collect();
-                            (empty_stats, 0)
-                        },
-                        |(mut a_stats, a_rows), (mut b_stats, b_rows)| {
-                            for (i, b_stat) in b_stats.iter_mut().enumerate() {
-                                if i < a_stats.len() {
-                                    a_stats[i].merge(b_stat);
-                                }
-                            }
-                            (a_stats, a_rows + b_rows)
-                        },
-                    )
-            } else {
-                // SAFE PATH: Sequential reading (correct for any CSV including quoted newlines)
-                // Use csv crate when we need full CSV correctness (handles quoted newlines, etc.)
-                let mut stats: Vec<ColStats> = (0..ncols)
-                    .map(|_| ColStats {
-                        freq: FreqTracker::new(),
-                        ..Default::default()
-                    })
-                    .collect();
-
-                let mut reader = ReaderBuilder::new()
-                    .has_headers(has_header)
-                    .delimiter(delim_byte_for_detection)
-                    .flexible(true)
-                    .from_reader(bytes);
-
-                let mut total_rows = 0usize;
-
-                for result in reader.byte_records().take(sample_size) {
-                    if let Ok(record) = result {
-                        for (i, field) in record.iter().enumerate() {
-                            if i < ncols {
-                                if lite {
-                                    process_cell_lite(field, &mut stats[i]);
-                                } else {
-                                    process_cell(
-                                        field,
-                                        &mut stats[i],
-                                        max_examples,
-                                        track_freq,
-                                        collect_examples,
-                                    );
-                                }
+                        (empty_stats, 0)
+                    },
+                    |(mut a_stats, a_rows), (mut b_stats, b_rows)| {
+                        for (i, b_stat) in b_stats.iter_mut().enumerate() {
+                            if i < a_stats.len() {
+                                a_stats[i].merge(b_stat);
                             }
                         }
-                        total_rows += 1;
+                        (a_stats, a_rows + b_rows)
+                    },
+                )
+        } else {
+            // SAFE PATH: Sequential reading (correct for any CSV including quoted newlines)
+            // Use csv crate when we need full CSV correctness (handles quoted newlines, etc.)
+            let mut stats: Vec<ColStats> = (0..ncols)
+                .map(|_| ColStats {
+                    freq: FreqTracker::new(),
+                    ..Default::default()
+                })
+                .collect();
+
+            let mut reader = ReaderBuilder::new()
+                .has_headers(has_header)
+                .delimiter(delim_byte_for_detection)
+                .flexible(true)
+                .from_reader(bytes);
+
+            let mut total_rows = 0usize;
+
+            for record in reader.byte_records().take(sample_size).flatten() {
+                for (i, field) in record.iter().enumerate() {
+                    if i < ncols {
+                        match mode {
+                            ScanMode::Moments => process_cell_moments(field, &mut stats[i]),
+                            ScanMode::Lite => process_cell_lite(field, &mut stats[i]),
+                            ScanMode::Full => process_cell(
+                                field,
+                                &mut stats[i],
+                                max_examples,
+                                track_freq,
+                                collect_examples,
+                            ),
+                        }
                     }
                 }
+                total_rows += 1;
+            }
 
-                for stat in &mut stats {
-                    stat.finalize();
-                }
+            for stat in &mut stats {
+                stat.finalize();
+            }
 
-                (stats, total_rows)
-            };
+            (stats, total_rows)
+        };
 
-            Ok((col_names, merged_stats, total_rows, delimiter, has_header))
-        },
-    );
+        Ok((col_names, merged_stats, total_rows, delimiter, has_header))
+    });
 
     let (col_names, stats, rows_sampled, delimiter, has_header) =
-        result.map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        result.map_err(pyo3::exceptions::PyIOError::new_err)?;
 
     // Build Python output
     let out = PyDict::new(py);
@@ -1020,11 +430,21 @@ fn csv_profile(
             d.set_item("max", s.num.max)?;
             d.set_item("mean", s.num.mean)?;
             d.set_item("std", s.num.std_pop().unwrap_or(0.0))?;
-            d.set_item("median", s.num.quantile(0.5).unwrap_or(0.0))?;
-            d.set_item("p25", s.num.quantile(0.25).unwrap_or(0.0))?;
-            d.set_item("p75", s.num.quantile(0.75).unwrap_or(0.0))?;
-            d.set_item("p90", s.num.quantile(0.90).unwrap_or(0.0))?;
-            d.set_item("p95", s.num.quantile(0.95).unwrap_or(0.0))?;
+            // Quantiles are None when the scan never fed the t-digest
+            // (ScanMode::Moments); emitting a number there would be inventing
+            // one. Full and Lite scans always have them when n > 0.
+            for (key, q) in [
+                ("median", 0.5),
+                ("p25", 0.25),
+                ("p75", 0.75),
+                ("p90", 0.90),
+                ("p95", 0.95),
+            ] {
+                match s.num.quantile(q) {
+                    Some(v) => d.set_item(key, v)?,
+                    None => d.set_item(key, py.None())?,
+                }
+            }
             d.set_item("outliers_3sigma", 0)?;
         } else {
             d.set_item("min", py.None())?;
@@ -1062,8 +482,18 @@ fn csv_profile(
 
 #[pyfunction]
 fn csv_minmax_params(py: Python<'_>, path: String, sample_size: usize) -> PyResult<PyObject> {
-    // Use lite mode - we only need min/max, not type inference or examples
-    let prof_obj = csv_profile(py, path.clone(), sample_size, 0, true, true, false, false)?;
+    // Moments-only scan: min/max is all this needs, and the t-digest a lite
+    // scan would build costs ~8x the moments themselves.
+    let prof_obj = csv_profile_impl(
+        py,
+        path.clone(),
+        sample_size,
+        0,
+        true,
+        ScanMode::Moments,
+        false,
+        false,
+    )?;
     let prof = prof_obj.bind(py).downcast::<PyDict>()?;
     let out = PyDict::new(py);
     out.set_item("path", path)?;
@@ -1097,119 +527,57 @@ fn csv_minmax_params(py: Python<'_>, path: String, sample_size: usize) -> PyResu
     Ok(out.into())
 }
 
-// Parallel transform (min-max scaling).
-
-/// Check whether a field needs CSV quoting.
-#[inline(always)]
-fn needs_quote_simd(field: &[u8], delim: u8) -> bool {
-    memchr3(delim, b'"', b'\n', field).is_some() || memchr(b'\r', field).is_some()
+/// Write `buf` at an absolute file offset, without moving a shared cursor.
+///
+/// Positioned writes are what allow the output chunks to be written
+/// concurrently: each knows exactly where it belongs, so no writer has to wait
+/// for another to finish appending. `File::write_all_at` is Unix-only and
+/// `seek_write` is the Windows equivalent, hence the split.
+#[cfg(unix)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
 }
 
-/// Write a field with proper CSV quoting if needed
-#[inline(always)]
-fn write_field_csv(output: &mut Vec<u8>, field: &[u8], delim: u8) {
-    if !needs_quote_simd(field, delim) {
-        output.extend_from_slice(field);
-        return;
-    }
-
-    // Needs quoting
-    output.push(b'"');
-    // Use memchr to find quotes efficiently.
-    let mut start = 0;
-    while let Some(pos) = memchr(b'"', &field[start..]) {
-        let i = start + pos;
-        output.extend_from_slice(&field[start..=i]); // Include the quote
-        output.push(b'"'); // Double it
-        start = i + 1;
-    }
-    output.extend_from_slice(&field[start..]);
-    output.push(b'"');
-}
-
-// Fast row iterator: splits on newlines and then splits fields by the selected mode.
-
-/// Fast row iterator - splits on newlines, yields field slices.
-/// ⚠️ Assumes no quoted fields (use only in fast_transform mode).
-struct FastRowIter<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-    split_mode: SplitMode,
-}
-
-impl<'a> FastRowIter<'a> {
-    fn new(bytes: &'a [u8], split_mode: SplitMode) -> Self {
-        Self {
-            bytes,
-            pos: 0,
-            split_mode,
+#[cfg(windows)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut written = 0usize;
+    while written < buf.len() {
+        // seek_write is not guaranteed to consume the whole buffer.
+        let n = file.seek_write(&buf[written..], offset + written as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "positioned write made no progress",
+            ));
         }
+        written += n;
     }
+    Ok(())
 }
 
-impl<'a> Iterator for FastRowIter<'a> {
-    type Item = Vec<&'a [u8]>;
+// Parallel streaming transforms.
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.bytes.len() {
-            return None;
-        }
-
-        // Find end of line
-        let line_end = memchr(b'\n', &self.bytes[self.pos..])
-            .map(|i| self.pos + i)
-            .unwrap_or(self.bytes.len());
-
-        if line_end <= self.pos {
-            return None;
-        }
-
-        // Handle \r\n
-        let line_len = if line_end > self.pos && self.bytes.get(line_end - 1) == Some(&b'\r') {
-            line_end - 1
-        } else {
-            line_end
-        };
-
-        let line = &self.bytes[self.pos..line_len];
-        self.pos = line_end + 1;
-
-        if line.is_empty() {
-            return self.next(); // Skip empty lines
-        }
-
-        // Split by mode
-        let fields = get_fields(line, self.split_mode);
-        Some(fields)
-    }
-}
-
-#[pyfunction]
-#[pyo3(signature = (input_path, output_path, params, delimiter=None, has_header=None))]
-fn csv_transform_minmax(
+/// Apply a per-column affine transform `(x - offset) / scale`, streaming.
+///
+/// Min-max scaling and standardization differ only in how `(offset, scale)` is
+/// derived -- `(min, max - min)` versus `(mean, std)` -- so they share this one
+/// parallel writer instead of two near-identical copies of it. Rows are read,
+/// transformed, and written in chunks, so memory stays bounded by the chunk
+/// size rather than the file size.
+///
+/// A non-finite or effectively-zero scale maps the column to 0.0: a constant
+/// column has no spread to scale by, and emitting NaN or infinity would poison
+/// every downstream consumer of the output file.
+fn transform_affine(
     py: Python<'_>,
     input_path: String,
     output_path: String,
-    params: Bound<'_, PyDict>,
+    params_map: AHashMap<String, (f64, f64)>,
     delimiter: Option<String>,
     has_header: Option<bool>,
 ) -> PyResult<PyObject> {
-    // Parse params
-    let mut params_map: AHashMap<String, (f64, f64)> = AHashMap::new();
-    for (k, v) in params.iter() {
-        let col_name: String = k.extract()?;
-        let v_dict = v.downcast::<PyDict>()?;
-        let min_val: f64 = v_dict
-            .get_item("min")?
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing min"))?
-            .extract()?;
-        let max_val: f64 = v_dict
-            .get_item("max")?
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing max"))?
-            .extract()?;
-        params_map.insert(col_name, (min_val, max_val));
-    }
-
     let input_clone = input_path.clone();
     let output_clone = output_path.clone();
 
@@ -1247,7 +615,7 @@ fn csv_transform_minmax(
                 .unwrap_or_else(|| detect_header_smart(bytes, delim_byte_for_detection, 5));
 
             // Get first line fields for column count and naming
-            let first_line_clean = if first_line.ends_with(&[b'\r']) {
+            let first_line_clean = if first_line.ends_with(b"\r") {
                 &first_line[..first_line.len() - 1]
             } else {
                 first_line
@@ -1307,76 +675,117 @@ fn csv_transform_minmax(
             };
 
             // Collect per-chunk output buffers.
-            let chunk_results: Vec<(Vec<u8>, usize)> = byte_chunks
-                .into_par_iter()
-                .map(|chunk_bytes| {
-                    let mut output_buf =
-                        Vec::with_capacity(chunk_bytes.len() + chunk_bytes.len() / 4);
-                    let mut ryu_buf = ryu::Buffer::new();
-                    let mut rows = 0usize;
+            // Output capacity estimate. Scaling a value written with a handful
+            // of decimals produces a full round-trip double -- "3.141593"
+            // becomes "0.4724761615149732" -- so a scaled file is roughly twice
+            // its input. Reserving the old 1.25x guaranteed a reallocation and
+            // a full copy of a multi-megabyte buffer in every chunk.
+            let growth_numerator = if numeric_cols_to_scale > 0 { 9 } else { 5 };
+            let estimate_capacity = |len: usize| len.saturating_mul(growth_numerator) / 4 + 64;
 
-                    for fields in FastRowIter::new(chunk_bytes, split_mode) {
-                        for (i, field) in fields.iter().enumerate() {
-                            if i > 0 {
-                                output_buf.push(output_delim);
-                            }
-
-                            let trimmed = trim_bytes(field);
-
-                            if let Some(Some((min_v, max_v))) = col_params.get(i) {
-                                // Only parse columns with params (known numeric).
-                                if let Ok(x) = fast_float::parse::<f64, _>(trimmed) {
-                                    let range = max_v - min_v;
-                                    let scaled = if range > 1e-12 {
-                                        (x - min_v) / range
-                                    } else {
-                                        0.0
-                                    };
-                                    let s = ryu_buf.format(scaled);
-                                    output_buf.extend_from_slice(s.as_bytes());
-                                } else {
-                                    // Non-numeric value in numeric column, pass through
-                                    write_field_csv(&mut output_buf, trimmed, output_delim);
-                                }
-                            } else {
-                                // No transform, fast path for non-numeric columns
-                                write_field_csv(&mut output_buf, trimmed, output_delim);
-                            }
-                        }
-                        output_buf.push(b'\n');
-                        rows += 1;
-                    }
-
-                    (output_buf, rows)
-                })
-                .collect();
-
-            // Write header + all chunk buffers.
-            let file = File::create(&output_clone).map_err(|e| e.to_string())?;
-            let mut writer = BufWriter::with_capacity(8 << 20, file);
-
-            // Write header
+            // Build the header first: its length is the starting file offset,
+            // and every chunk's destination is derived from it.
+            let mut header = Vec::new();
             for (i, name) in col_names.iter().enumerate() {
                 if i > 0 {
-                    std::io::Write::write_all(&mut writer, &[output_delim])
-                        .map_err(|e| e.to_string())?;
+                    header.push(output_delim);
                 }
-                let mut header_buf = Vec::new();
-                write_field_csv(&mut header_buf, name.as_bytes(), output_delim);
-                std::io::Write::write_all(&mut writer, &header_buf).map_err(|e| e.to_string())?;
+                write_field_csv(&mut header, name.as_bytes(), output_delim);
             }
-            std::io::Write::write_all(&mut writer, b"\n").map_err(|e| e.to_string())?;
+            header.push(b'\n');
+
+            let file = File::create(&output_clone).map_err(|e| e.to_string())?;
+            write_at(&file, &header, 0).map_err(|e| e.to_string())?;
+
+            // Chunks are processed in batches rather than all at once.
+            //
+            // Formatting every chunk up front and only then writing meant the
+            // whole output existed in memory simultaneously: a 100 MB input
+            // produced 200 MB of live buffers and a 327 MB peak RSS, which also
+            // made the "memory bounded by chunk size" claim in the docs false.
+            // Batching bounds live output to one batch, and lets the allocator
+            // reuse the same blocks for every batch instead of faulting in
+            // fresh pages for each of ~128 chunks.
+            let batch_size = (rayon::current_num_threads() * 2).max(1);
 
             let mut total_rows = 0usize;
-            for (buffer, rows) in chunk_results {
-                std::io::Write::write_all(&mut writer, &buffer).map_err(|e| e.to_string())?;
-                total_rows += rows;
+            let mut cursor = header.len() as u64;
+
+            for batch in byte_chunks.chunks(batch_size) {
+                let batch_results: Vec<(Vec<u8>, usize)> = batch
+                    .par_iter()
+                    .map(|&chunk_bytes| {
+                        let mut output_buf =
+                            Vec::with_capacity(estimate_capacity(chunk_bytes.len()));
+                        let mut ryu_buf = ryu::Buffer::new();
+                        let mut rows = 0usize;
+
+                        // Fields are visited in order and written as they are seen,
+                        // so there is no reason to collect them into a Vec first.
+                        for line in FastLineIter::new(chunk_bytes) {
+                            for_each_field(line, split_mode, |i, field| {
+                                if i > 0 {
+                                    output_buf.push(output_delim);
+                                }
+
+                                let trimmed = trim_bytes(field);
+
+                                if let Some(Some((offset, scale))) = col_params.get(i) {
+                                    // Only parse columns with params (known numeric).
+                                    if let Ok(x) = fast_float::parse::<f64, _>(trimmed) {
+                                        let scaled = if scale.is_finite() && scale.abs() > 1e-12 {
+                                            (x - offset) / scale
+                                        } else {
+                                            0.0
+                                        };
+                                        // format(), not format_finite(): fast_float
+                                        // parses "inf" and "nan", so `scaled` is not
+                                        // guaranteed finite and format_finite's
+                                        // output would be unspecified for those.
+                                        let s = ryu_buf.format(scaled);
+                                        output_buf.extend_from_slice(s.as_bytes());
+                                    } else {
+                                        // Non-numeric value in numeric column, pass through
+                                        write_field_csv(&mut output_buf, trimmed, output_delim);
+                                    }
+                                } else {
+                                    // No transform, fast path for non-numeric columns
+                                    write_field_csv(&mut output_buf, trimmed, output_delim);
+                                }
+                            });
+                            output_buf.push(b'\n');
+                            rows += 1;
+                        }
+
+                        (output_buf, rows)
+                    })
+                    .collect();
+
+                // Offsets within the batch are known once it is formatted, so
+                // the batch is written in parallel too: each buffer knows
+                // exactly where it belongs and no writer waits on another.
+                let mut offsets = Vec::with_capacity(batch_results.len());
+                for (buffer, rows) in &batch_results {
+                    offsets.push(cursor);
+                    cursor += buffer.len() as u64;
+                    total_rows += rows;
+                }
+
+                batch_results
+                    .par_iter()
+                    .zip(offsets.par_iter())
+                    .try_for_each(|((buffer, _), &offset)| {
+                        write_at(&file, buffer, offset).map_err(|e| e.to_string())
+                    })?;
             }
 
-            std::io::Write::flush(&mut writer).map_err(|e| e.to_string())?;
+            // Deliberately no fsync. The previous implementation flushed a
+            // BufWriter, which only pushes into the page cache; forcing durable
+            // media writes would be a different guarantee and a much slower one,
+            // and it is not what the libraries this is measured against do.
             Ok((total_rows, numeric_cols_to_scale, has_header_actual))
         })
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        .map_err(pyo3::exceptions::PyIOError::new_err)?;
 
     let out = PyDict::new(py);
     out.set_item("input_path", input_path)?;
@@ -1385,6 +794,133 @@ fn csv_transform_minmax(
     out.set_item("numeric_cols_scaled", numeric_cols_scaled)?;
     out.set_item("has_header", has_header_detected)?;
     Ok(out.into())
+}
+
+/// Read `params` as a mapping of column name to two named f64 fields.
+fn affine_params_from_dict(
+    params: &Bound<'_, PyDict>,
+    offset_key: &str,
+    scale_key: &str,
+) -> PyResult<AHashMap<String, (f64, f64)>> {
+    let mut out: AHashMap<String, (f64, f64)> = AHashMap::new();
+    for (k, v) in params.iter() {
+        let col_name: String = k.extract()?;
+        let v_dict = v.downcast::<PyDict>()?;
+        let offset: f64 = v_dict
+            .get_item(offset_key)?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "column {col_name:?} is missing {offset_key:?}"
+                ))
+            })?
+            .extract()?;
+        let scale: f64 = v_dict
+            .get_item(scale_key)?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "column {col_name:?} is missing {scale_key:?}"
+                ))
+            })?
+            .extract()?;
+        out.insert(col_name, (offset, scale));
+    }
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (input_path, output_path, params, delimiter=None, has_header=None))]
+fn csv_transform_minmax(
+    py: Python<'_>,
+    input_path: String,
+    output_path: String,
+    params: Bound<'_, PyDict>,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+) -> PyResult<PyObject> {
+    // (x - min) / (max - min)
+    let mut params_map = affine_params_from_dict(&params, "min", "max")?;
+    for value in params_map.values_mut() {
+        value.1 -= value.0;
+    }
+    transform_affine(
+        py,
+        input_path,
+        output_path,
+        params_map,
+        delimiter,
+        has_header,
+    )
+}
+
+/// Mean and population standard deviation per numeric column, from one pass.
+#[pyfunction]
+fn csv_standardize_params(py: Python<'_>, path: String, sample_size: usize) -> PyResult<PyObject> {
+    // Moments-only scan: mean and std come from the streaming accumulator,
+    // and the quantiles a lite scan would compute are discarded here anyway.
+    let prof_obj = csv_profile_impl(
+        py,
+        path.clone(),
+        sample_size,
+        0,
+        true,
+        ScanMode::Moments,
+        false,
+        false,
+    )?;
+    let prof = prof_obj.bind(py).downcast::<PyDict>()?;
+    let out = PyDict::new(py);
+    out.set_item("path", path)?;
+    let params = PyDict::new(py);
+
+    let cols_any = prof
+        .get_item("columns")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing columns"))?;
+    let cols_list = cols_any.downcast::<PyList>()?;
+
+    for c in cols_list.iter() {
+        let cd = c.downcast::<PyDict>()?;
+        let name: String = cd
+            .get_item("name")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing name"))?
+            .extract()?;
+
+        let (Some(mean_v), Some(std_v)) = (cd.get_item("mean")?, cd.get_item("std")?) else {
+            continue;
+        };
+        if mean_v.is_none() || std_v.is_none() {
+            continue;
+        }
+        let d = PyDict::new(py);
+        d.set_item("mean", &mean_v)?;
+        d.set_item("std", &std_v)?;
+        params.set_item(name, d)?;
+    }
+
+    out.set_item("params", params)?;
+    Ok(out.into())
+}
+
+/// Standardize numeric columns to zero mean and unit variance, streaming.
+#[pyfunction]
+#[pyo3(signature = (input_path, output_path, params, delimiter=None, has_header=None))]
+fn csv_transform_standardize(
+    py: Python<'_>,
+    input_path: String,
+    output_path: String,
+    params: Bound<'_, PyDict>,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+) -> PyResult<PyObject> {
+    // (x - mean) / std
+    let params_map = affine_params_from_dict(&params, "mean", "std")?;
+    transform_affine(
+        py,
+        input_path,
+        output_path,
+        params_map,
+        delimiter,
+        has_header,
+    )
 }
 
 // Python object schema detection (compatibility path).
@@ -1447,6 +983,17 @@ fn add_example(_py: Python<'_>, col: &mut PyColStats, v: &Bound<'_, PyAny>, max_
     }
 }
 
+/// Maximum nesting depth `flatten_value` will descend into.
+///
+/// This is a stack-safety bound, not a stylistic one. `flatten_value` recurses
+/// once per level of nesting, so without a cap a sufficiently deep input
+/// overflows the Rust stack and takes the whole interpreter down with SIGSEGV
+/// -- not a catchable Python exception. The observed crash threshold is around
+/// 20k-30k levels; 512 is far above any real-world nested record and far below
+/// the danger zone.
+const MAX_NESTING_DEPTH: usize = 512;
+
+#[allow(clippy::too_many_arguments)]
 fn flatten_value(
     py: Python<'_>,
     cols: &mut BTreeMap<String, PyColStats>,
@@ -1454,8 +1001,32 @@ fn flatten_value(
     v: &Bound<'_, PyAny>,
     sample_budget: &mut i64,
     max_examples: usize,
+    depth: usize,
+    depth_exceeded: &mut bool,
 ) -> PyResult<()> {
     if *sample_budget <= 0 {
+        return Ok(());
+    }
+    if depth >= MAX_NESTING_DEPTH {
+        // Stop descending rather than overflow the stack. The caller reports
+        // this to Python so the truncation is visible instead of silent.
+        *depth_exceeded = true;
+        *sample_budget -= 1;
+        // Still record the node, so the caller sees where truncation happened
+        // rather than an empty schema. Deliberately does NOT call add_example:
+        // repr() of a deeply nested object recurses inside CPython and would
+        // reintroduce the very stack overflow this guard exists to prevent.
+        let col_key = if path.is_empty() {
+            "value".to_string()
+        } else {
+            path.to_string()
+        };
+        let entry = cols.entry(col_key).or_default();
+        entry.count += 1;
+        if v.is_none() {
+            entry.null_count += 1;
+        }
+        entry.types.insert(type_name(v));
         return Ok(());
     }
     *sample_budget -= 1;
@@ -1468,7 +1039,16 @@ fn flatten_value(
             } else {
                 format!("{path}.{key}")
             };
-            flatten_value(py, cols, &p, &vv, sample_budget, max_examples)?;
+            flatten_value(
+                py,
+                cols,
+                &p,
+                &vv,
+                sample_budget,
+                max_examples,
+                depth + 1,
+                depth_exceeded,
+            )?;
         }
         return Ok(());
     }
@@ -1488,7 +1068,16 @@ fn flatten_value(
             } else {
                 format!("{path}.{key}")
             };
-            flatten_value(py, cols, &p, &vv, sample_budget, max_examples)?;
+            flatten_value(
+                py,
+                cols,
+                &p,
+                &vv,
+                sample_budget,
+                max_examples,
+                depth + 1,
+                depth_exceeded,
+            )?;
         }
         return Ok(());
     }
@@ -1502,7 +1091,16 @@ fn flatten_value(
         if let Ok(list) = v.downcast::<PyList>() {
             for i in 0..list.len().min(50) {
                 let item = list.get_item(i)?;
-                flatten_value(py, cols, &p, &item, sample_budget, max_examples)?;
+                flatten_value(
+                    py,
+                    cols,
+                    &p,
+                    &item,
+                    sample_budget,
+                    max_examples,
+                    depth + 1,
+                    depth_exceeded,
+                )?;
                 if *sample_budget <= 0 {
                     break;
                 }
@@ -1512,7 +1110,16 @@ fn flatten_value(
         if let Ok(tup) = v.downcast::<PyTuple>() {
             for i in 0..tup.len().min(50) {
                 let item = tup.get_item(i)?;
-                flatten_value(py, cols, &p, &item, sample_budget, max_examples)?;
+                flatten_value(
+                    py,
+                    cols,
+                    &p,
+                    &item,
+                    sample_budget,
+                    max_examples,
+                    depth + 1,
+                    depth_exceeded,
+                )?;
                 if *sample_budget <= 0 {
                     break;
                 }
@@ -1525,7 +1132,16 @@ fn flatten_value(
                     break;
                 }
                 let item = item?;
-                flatten_value(py, cols, &p, &item, sample_budget, max_examples)?;
+                flatten_value(
+                    py,
+                    cols,
+                    &p,
+                    &item,
+                    sample_budget,
+                    max_examples,
+                    depth + 1,
+                    depth_exceeded,
+                )?;
                 if *sample_budget <= 0 {
                     break;
                 }
@@ -1580,12 +1196,22 @@ fn detect_schema(
 ) -> PyResult<PyObject> {
     let mut cols: BTreeMap<String, PyColStats> = BTreeMap::new();
     let mut budget = sample_size as i64;
+    let mut depth_exceeded = false;
 
     if is_sequence_like(&data) {
         if let Ok(list) = data.downcast::<PyList>() {
             for i in 0..list.len().min(sample_size) {
                 let item = list.get_item(i)?;
-                flatten_value(py, &mut cols, "", &item, &mut budget, max_examples)?;
+                flatten_value(
+                    py,
+                    &mut cols,
+                    "",
+                    &item,
+                    &mut budget,
+                    max_examples,
+                    0,
+                    &mut depth_exceeded,
+                )?;
                 if budget <= 0 {
                     break;
                 }
@@ -1593,7 +1219,16 @@ fn detect_schema(
         } else if let Ok(tup) = data.downcast::<PyTuple>() {
             for i in 0..tup.len().min(sample_size) {
                 let item = tup.get_item(i)?;
-                flatten_value(py, &mut cols, "", &item, &mut budget, max_examples)?;
+                flatten_value(
+                    py,
+                    &mut cols,
+                    "",
+                    &item,
+                    &mut budget,
+                    max_examples,
+                    0,
+                    &mut depth_exceeded,
+                )?;
                 if budget <= 0 {
                     break;
                 }
@@ -1604,16 +1239,43 @@ fn detect_schema(
                     break;
                 }
                 let item = item?;
-                flatten_value(py, &mut cols, "", &item, &mut budget, max_examples)?;
+                flatten_value(
+                    py,
+                    &mut cols,
+                    "",
+                    &item,
+                    &mut budget,
+                    max_examples,
+                    0,
+                    &mut depth_exceeded,
+                )?;
                 if budget <= 0 {
                     break;
                 }
             }
         } else {
-            flatten_value(py, &mut cols, "", &data, &mut budget, max_examples)?;
+            flatten_value(
+                py,
+                &mut cols,
+                "",
+                &data,
+                &mut budget,
+                max_examples,
+                0,
+                &mut depth_exceeded,
+            )?;
         }
     } else {
-        flatten_value(py, &mut cols, "", &data, &mut budget, max_examples)?;
+        flatten_value(
+            py,
+            &mut cols,
+            "",
+            &data,
+            &mut budget,
+            max_examples,
+            0,
+            &mut depth_exceeded,
+        )?;
     }
 
     let out = PyDict::new(py);
@@ -1630,18 +1292,550 @@ fn detect_schema(
     }
     out.set_item("columns", col_list)?;
     out.set_item("sample_size", sample_size)?;
+    // Report truncation rather than silently returning a partial schema.
+    out.set_item("max_depth_exceeded", depth_exceeded)?;
+    out.set_item("max_depth", MAX_NESTING_DEPTH)?;
     Ok(out.into())
 }
 
+mod parse;
+use parse::*;
+mod stats;
+use stats::*;
+
+// Streaming SGD regression.
+
+/// Where the data starts and what the columns are called.
+///
+/// Shared setup for anything that streams a CSV: delimiter, header presence,
+/// column names, and the byte offset of the first data row.
+struct CsvLayout {
+    split_mode: SplitMode,
+    col_names: Vec<String>,
+    data_start: usize,
+}
+
+fn csv_layout(
+    bytes: &[u8],
+    delimiter: Option<u8>,
+    has_header: Option<bool>,
+) -> Result<CsvLayout, String> {
+    if bytes.is_empty() {
+        return Err("Empty file".to_string());
+    }
+    let first_newline = memchr(b'\n', bytes).unwrap_or(bytes.len());
+    let first_line = &bytes[..first_newline];
+
+    let split_mode = match delimiter {
+        Some(d) => SplitMode::Delim(d),
+        None => match sniff_delimiter_simd(first_line) {
+            Some(d) => SplitMode::Delim(d),
+            None => SplitMode::Whitespace,
+        },
+    };
+    let delim_for_detection = match split_mode {
+        SplitMode::Delim(d) => d,
+        SplitMode::Whitespace => b' ',
+    };
+    let has_header_actual =
+        has_header.unwrap_or_else(|| detect_header_smart(bytes, delim_for_detection, 5));
+
+    let first_line_clean = if first_line.ends_with(b"\r") {
+        &first_line[..first_line.len() - 1]
+    } else {
+        first_line
+    };
+    let first_fields = get_fields(first_line_clean, split_mode);
+    if first_fields.is_empty() {
+        return Err("No columns detected in CSV".to_string());
+    }
+
+    let col_names: Vec<String> = if has_header_actual {
+        first_fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let t = trim_bytes(f);
+                if t.is_empty() {
+                    format!("col_{i}")
+                } else {
+                    String::from_utf8_lossy(t).into_owned()
+                }
+            })
+            .collect()
+    } else {
+        (0..first_fields.len())
+            .map(|i| format!("col_{i}"))
+            .collect()
+    };
+
+    let data_start = if has_header_actual {
+        first_newline + 1
+    } else {
+        0
+    };
+
+    Ok(CsvLayout {
+        split_mode,
+        col_names,
+        data_start,
+    })
+}
+
+/// Outcome of a streaming SGD fit, before conversion into a Python dict:
+/// (feature names, coefficients, intercept, train rows, test rows, test r2,
+/// epochs run, final training MSE).
+type SgdFit = (Vec<String>, Vec<f64>, f64, usize, usize, f64, usize, f64);
+
+/// One SGD update, shared verbatim by the streaming and replay paths.
+///
+/// Kept as a single function so the cached-epoch replay cannot drift from the
+/// streaming arithmetic: identical inputs through identical operations is what
+/// makes the two paths bit-identical, and the tests assert exactly that.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn sgd_step(
+    x: &[f64],
+    y: f64,
+    w: &mut [f64],
+    b: &mut f64,
+    lr: f64,
+    l2: f64,
+    grad_clip: f64,
+    sq_err: &mut f64,
+    seen: &mut usize,
+) {
+    let p = w.len();
+    let mut pred = *b;
+    for j in 0..p {
+        pred += w[j] * x[j];
+    }
+    let err = pred - y;
+    *sq_err += err * err;
+    *seen += 1;
+
+    // Clip the per-sample gradient. Real data has outliers that survive
+    // standardization -- a mis-metered taxi trip of 100,000 miles sits a
+    // thousand standard deviations out -- and a single such row produces a
+    // step large enough to diverge the fit. Clipping bounds any one row's
+    // influence without the caller hand-tuning the learning rate per dataset.
+    // intercept gradient is err * 1, hence the leading 1.0
+    let grad_sq = 1.0 + x.iter().map(|v| v * v).sum::<f64>();
+    let grad_norm = err.abs() * grad_sq.sqrt();
+    let step = if grad_norm > grad_clip && grad_norm > 0.0 {
+        lr * (grad_clip / grad_norm)
+    } else {
+        lr
+    };
+
+    for j in 0..p {
+        w[j] -= step * (err * x[j] + l2 * w[j]);
+    }
+    *b -= step * err;
+}
+
+/// Fit a linear model by stochastic gradient descent, streaming from CSV.
+///
+/// The closed-form solver in `csv_linear_regression` accumulates an X'X matrix,
+/// which costs O(p^2) memory and O(n p^2) time -- fine for tens of features,
+/// hopeless for the wide sparse data typical of ad-tech or recommender
+/// training sets. This path holds only the weight vector, so memory is O(p)
+/// and each epoch is O(n p), and it never materialises a design matrix.
+///
+/// Features are standardized on the fly using the mean and standard deviation
+/// from a prior profiling pass. That is not cosmetic: raw features on wildly
+/// different scales make a single global learning rate either diverge on the
+/// large ones or crawl on the small ones. Coefficients are converted back to
+/// the original feature space before returning, so they are directly
+/// comparable with the closed-form solver's.
+///
+/// Rows are visited in file order within each epoch. Shuffling a stream would
+/// mean buffering it, which would give up the bounded memory that is the point
+/// of this path; data with meaningful row order should be shuffled on disk
+/// first.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (path, target, features=None, epochs=5, learning_rate=0.05, l2=0.0, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, grad_clip=10.0, cache_budget_mb=512))]
+fn csv_sgd_regression(
+    py: Python<'_>,
+    path: String,
+    target: String,
+    features: Option<Vec<String>>,
+    epochs: usize,
+    learning_rate: f64,
+    l2: f64,
+    train_frac: f64,
+    seed: u64,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+    shuffle: bool,
+    grad_clip: f64,
+    cache_budget_mb: usize,
+) -> PyResult<PyObject> {
+    if !(0.0 < train_frac && train_frac < 1.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "train_frac must be in (0,1)",
+        ));
+    }
+    if epochs == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "epochs must be >= 1",
+        ));
+    }
+    if !(learning_rate.is_finite() && learning_rate > 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "learning_rate must be positive and finite",
+        ));
+    }
+    // Infinity is a legitimate value here: it disables clipping.
+    if grad_clip.is_nan() || grad_clip <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "grad_clip must be positive (use infinity to disable clipping)",
+        ));
+    }
+
+    // Standardization statistics, from one profiling pass over the same file.
+    let stats_obj = csv_standardize_params(py, path.clone(), sample_size)?;
+    let stats_dict = stats_obj.bind(py).downcast::<PyDict>()?.clone();
+    let params_any = stats_dict
+        .get_item("params")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing params"))?;
+    let params = params_any.downcast::<PyDict>()?;
+    let mut moments: AHashMap<String, (f64, f64)> = AHashMap::new();
+    for (k, v) in params.iter() {
+        let name: String = k.extract()?;
+        let d = v.downcast::<PyDict>()?;
+        let mean: f64 = d
+            .get_item("mean")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing mean"))?
+            .extract()?;
+        let std: f64 = d
+            .get_item("std")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing std"))?
+            .extract()?;
+        moments.insert(name, (mean, std));
+    }
+
+    let delim_byte = delimiter.and_then(|d| d.bytes().next());
+    let path_for_thread = path.clone();
+    let target_for_thread = target.clone();
+
+    let result = py.allow_threads(move || -> Result<SgdFit, String> {
+        let target = target_for_thread;
+        let file_data = load_file_data(&path_for_thread).map_err(|e| e.to_string())?;
+        let bytes = file_data.as_bytes();
+        let layout = csv_layout(bytes, delim_byte, has_header)?;
+        let col_names = &layout.col_names;
+
+        let target_idx = col_names
+            .iter()
+            .position(|c| c == &target)
+            .ok_or_else(|| format!("target column {target:?} not found"))?;
+
+        let feature_idx: Vec<usize> = match &features {
+            Some(names) => names
+                .iter()
+                .map(|n| {
+                    col_names
+                        .iter()
+                        .position(|c| c == n)
+                        .ok_or_else(|| format!("feature column {n:?} not found"))
+                })
+                .collect::<Result<_, _>>()?,
+            None => (0..col_names.len()).filter(|&i| i != target_idx).collect(),
+        };
+        if feature_idx.is_empty() {
+            return Err("no feature columns selected".to_string());
+        }
+
+        // Per-feature standardization constants. A feature with no usable
+        // spread is centred but not divided, which leaves it contributing
+        // nothing rather than producing NaN.
+        let p = feature_idx.len();
+        let mut mean = vec![0.0f64; p];
+        let mut scale = vec![1.0f64; p];
+        for (j, &idx) in feature_idx.iter().enumerate() {
+            if let Some((m, s)) = moments.get(&col_names[idx]) {
+                mean[j] = *m;
+                if s.is_finite() && *s > 1e-12 {
+                    scale[j] = *s;
+                }
+            }
+        }
+
+        let data_bytes = &bytes[layout.data_start..];
+        let split_mode = layout.split_mode;
+
+        // Row count, for a split defined against the data rather than the cap.
+        let counted = FastLineIter::new(data_bytes).take(sample_size).count();
+        let n_rows = counted.max(1);
+        let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
+
+        let is_train_mask: Option<Vec<bool>> = if shuffle {
+            let mut perm: Vec<usize> = (0..n_rows).collect();
+            for i in (1..n_rows).rev() {
+                let r = splitmix64(seed ^ (i as u64));
+                let j = (r % ((i + 1) as u64)) as usize;
+                perm.swap(i, j);
+            }
+            let mut mask = vec![false; n_rows];
+            for &idx in perm.iter().take(train_cut) {
+                mask[idx] = true;
+            }
+            Some(mask)
+        } else {
+            None
+        };
+
+        let is_train = |row_idx: usize| -> bool {
+            match &is_train_mask {
+                Some(mask) => mask[row_idx],
+                None => row_idx < train_cut,
+            }
+        };
+
+        // Weights live in standardized space; O(p) total.
+        let mut w = vec![0.0f64; p];
+        let mut b = 0.0f64;
+        let mut x = vec![0.0f64; p];
+
+        let mut train_n = 0usize;
+        let mut final_mse = 0.0f64;
+
+        // Multi-epoch training re-reads the file per epoch, and parsing is
+        // most of an epoch's cost. When the standardized training matrix fits
+        // under the caller's budget, epoch 0 fills a cache while it streams
+        // and later epochs replay from memory: parse once, train N times.
+        //
+        // The budget decision uses train_cut (an upper bound on train rows),
+        // so it is made before any parsing. Over budget, or with the budget
+        // set to 0, every epoch streams — the bounded-memory behavior is the
+        // caller's to keep. Replay feeds the exact f64s streaming would have
+        // recomputed through the same sgd_step, so the fitted weights are
+        // bit-identical either way; the tests assert that.
+        let cache_bytes = train_cut.saturating_mul(p + 1).saturating_mul(8);
+        let use_cache = epochs > 1
+            && cache_budget_mb > 0
+            && cache_bytes <= cache_budget_mb.saturating_mul(1024 * 1024);
+        let mut cache_x: Vec<f64> = Vec::new();
+        let mut cache_y: Vec<f64> = Vec::new();
+        if use_cache {
+            cache_x.reserve_exact(train_cut.saturating_mul(p));
+            cache_y.reserve_exact(train_cut);
+        }
+
+        let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
+
+        for epoch in 0..epochs {
+            // Decay the step size each epoch so later passes refine rather
+            // than bounce around the optimum.
+            let lr = learning_rate / (1.0 + epoch as f64);
+            let mut sq_err = 0.0f64;
+            let mut seen = 0usize;
+
+            if epoch > 0 && use_cache {
+                // Replay from the cache filled during epoch 0.
+                for (xrow, &y) in cache_x.chunks_exact(p).zip(cache_y.iter()) {
+                    sgd_step(
+                        xrow,
+                        y,
+                        &mut w,
+                        &mut b,
+                        lr,
+                        l2,
+                        grad_clip,
+                        &mut sq_err,
+                        &mut seen,
+                    );
+                }
+            } else {
+                for (this_row, line) in FastLineIter::new(data_bytes).enumerate() {
+                    if this_row >= n_rows {
+                        break;
+                    }
+                    // Split first: nothing is needed from a test row here, so
+                    // it is not worth splitting into fields.
+                    if !is_train(this_row) {
+                        continue;
+                    }
+
+                    fields.clear();
+                    for_each_field(line, split_mode, |_, f| fields.push(f));
+                    if fields.len() <= target_idx {
+                        continue;
+                    }
+
+                    let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                        continue;
+                    };
+                    let mut usable = true;
+                    for (j, &idx) in feature_idx.iter().enumerate() {
+                        match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                            Some(v) => x[j] = (v - mean[j]) / scale[j],
+                            None => {
+                                usable = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !usable {
+                        continue;
+                    }
+
+                    sgd_step(
+                        &x,
+                        y,
+                        &mut w,
+                        &mut b,
+                        lr,
+                        l2,
+                        grad_clip,
+                        &mut sq_err,
+                        &mut seen,
+                    );
+
+                    if epoch == 0 {
+                        train_n += 1;
+                        if use_cache {
+                            cache_x.extend_from_slice(&x);
+                            cache_y.push(y);
+                        }
+                    }
+                }
+            }
+
+            if seen > 0 {
+                final_mse = sq_err / seen as f64;
+            }
+            if !b.is_finite() || w.iter().any(|v| !v.is_finite()) {
+                return Err(format!(
+                    "SGD diverged at epoch {epoch}; lower learning_rate (was {learning_rate})"
+                ));
+            }
+        }
+
+        // Convert weights back to the original feature space so they can be
+        // compared with the closed-form solver:
+        //   y = b + sum_j w_j * (x_j - mean_j) / scale_j
+        //     = (b - sum_j w_j * mean_j / scale_j) + sum_j (w_j / scale_j) x_j
+        let coef: Vec<f64> = (0..p).map(|j| w[j] / scale[j]).collect();
+        let intercept = b - (0..p).map(|j| w[j] * mean[j] / scale[j]).sum::<f64>();
+
+        // Test-set R2, evaluated in the original space.
+        let mut ss_res = 0.0f64;
+        let mut sum_y = 0.0f64;
+        let mut sum_y2 = 0.0f64;
+        let mut test_n = 0usize;
+        for (this_row, line) in FastLineIter::new(data_bytes).enumerate() {
+            if this_row >= n_rows {
+                break;
+            }
+            if is_train(this_row) {
+                continue;
+            }
+            fields.clear();
+            for_each_field(line, split_mode, |_, f| fields.push(f));
+            if fields.len() <= target_idx {
+                continue;
+            }
+            let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                continue;
+            };
+            let mut pred = intercept;
+            let mut usable = true;
+            for (j, &idx) in feature_idx.iter().enumerate() {
+                match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                    Some(v) => pred += coef[j] * v,
+                    None => {
+                        usable = false;
+                        break;
+                    }
+                }
+            }
+            if !usable {
+                continue;
+            }
+            let d = y - pred;
+            ss_res += d * d;
+            sum_y += y;
+            sum_y2 += y * y;
+            test_n += 1;
+        }
+
+        let r2 = if test_n > 1 {
+            let mean_y = sum_y / test_n as f64;
+            let ss_tot = sum_y2 - 2.0 * mean_y * sum_y + (test_n as f64) * mean_y * mean_y;
+            if ss_tot > 1e-12 {
+                1.0 - ss_res / ss_tot
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let feature_names: Vec<String> =
+            feature_idx.iter().map(|&i| col_names[i].clone()).collect();
+
+        Ok((
+            feature_names,
+            coef,
+            intercept,
+            train_n,
+            test_n,
+            r2,
+            epochs,
+            final_mse,
+        ))
+    });
+
+    let (feature_names, coef, intercept, train_n, test_n, r2, epochs_run, final_mse) =
+        result.map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+    let out = PyDict::new(py);
+    out.set_item("path", path)?;
+    out.set_item("target", target)?;
+    out.set_item("features", feature_names)?;
+    out.set_item("coef", coef)?;
+    out.set_item("intercept", intercept)?;
+    out.set_item("train_n", train_n)?;
+    out.set_item("test_n", test_n)?;
+    out.set_item("r2", r2)?;
+    out.set_item("epochs", epochs_run)?;
+    out.set_item("final_train_mse", final_mse)?;
+    Ok(out.into())
+}
+
+#[cfg(test)]
+mod tests;
+
 // Module registration.
+
+/// Panic on purpose, to verify how panics cross the FFI boundary.
+///
+/// PyO3 wraps every #[pyfunction] body in catch_unwind and converts a caught
+/// panic into a Python PanicException. That only works if panics unwind: under
+/// `panic = "abort"` the process dies instead, and no Python-level handler ever
+/// runs. Gated behind the `testing` feature so it never ships.
+#[cfg(feature = "testing")]
+#[pyfunction]
+fn _force_panic() {
+    panic!("deliberate panic: verifying panic propagation across the FFI boundary");
+}
 
 #[pymodule]
 fn _grizzly(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(feature = "testing")]
+    m.add_function(wrap_pyfunction!(_force_panic, m)?)?;
     m.add_function(wrap_pyfunction!(detect_schema, m)?)?;
     m.add_function(wrap_pyfunction!(csv_profile, m)?)?;
     m.add_function(wrap_pyfunction!(csv_minmax_params, m)?)?;
     m.add_function(wrap_pyfunction!(csv_transform_minmax, m)?)?;
+    m.add_function(wrap_pyfunction!(csv_standardize_params, m)?)?;
+    m.add_function(wrap_pyfunction!(csv_transform_standardize, m)?)?;
     m.add_function(wrap_pyfunction!(csv_linear_regression, m)?)?;
+    m.add_function(wrap_pyfunction!(csv_sgd_regression, m)?)?;
     Ok(())
 }
 
@@ -1655,13 +1849,6 @@ fn splitmix64(mut x: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
-}
-
-#[inline(always)]
-fn u64_to_unit_f64(x: u64) -> f64 {
-    // Convert to [0,1)
-    const DEN: f64 = (u64::MAX as f64) + 1.0;
-    (x as f64) / DEN
 }
 
 #[inline(always)]
@@ -1729,6 +1916,8 @@ fn gaussian_solve(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Option<Vec<f64>
     Some(x)
 }
 
+// Argument count mirrors the public Python signature (see csv_profile above).
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (path, target, features=None, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, fast_csv=true, shuffle=true, ridge_lambda=0.0, return_debug=false))]
 fn csv_linear_regression(
@@ -1752,304 +1941,545 @@ fn csv_linear_regression(
         ));
     }
 
-    let result = py.allow_threads(
-        || -> Result<(Vec<String>, Vec<f64>, f64, usize, usize, f64, usize, f64, f64, f64), String> {
-        let file_data = load_file_data(&path).map_err(|e| e.to_string())?;
-        let bytes = file_data.as_bytes();
-        if bytes.is_empty() {
-            return Err("Empty file".to_string());
-        }
-
-        // Determine split mode
-        let first_newline = memchr(b'\n', bytes).unwrap_or(bytes.len());
-        let first_line = &bytes[..first_newline];
-        let split_mode = if let Some(d) = delimiter.and_then(|d| d.bytes().next()) {
-            SplitMode::Delim(d)
-        } else {
-            match sniff_delimiter_simd(first_line) {
-                Some(d) => SplitMode::Delim(d),
-                None => SplitMode::Whitespace,
+    let result = py
+        .allow_threads(|| -> Result<RegressionFit, String> {
+            let file_data = load_file_data(&path).map_err(|e| e.to_string())?;
+            let bytes = file_data.as_bytes();
+            if bytes.is_empty() {
+                return Err("Empty file".to_string());
             }
-        };
-        let delim_byte_for_detection = match split_mode {
-            SplitMode::Delim(d) => d,
-            SplitMode::Whitespace => b' ',
-        };
-        let has_header_actual = has_header.unwrap_or_else(|| detect_header_smart(bytes, delim_byte_for_detection, 5));
 
-        // Column names
-        let first_line_clean = if first_line.ends_with(&[b'\r']) { &first_line[..first_line.len()-1] } else { first_line };
-        let first_fields = get_fields(first_line_clean, split_mode);
-        let ncols = first_fields.len();
-        if ncols == 0 {
-            return Err("No columns detected".to_string());
-        }
-        let col_names: Vec<String> = if has_header_actual {
-            first_fields.iter().enumerate().map(|(i, f)| {
-                let t = trim_bytes(f);
-                if t.is_empty() { format!("col_{i}") } else { String::from_utf8_lossy(t).into_owned() }
-            }).collect()
-        } else {
-            (0..ncols).map(|i| format!("col_{i}")).collect()
-        };
-
-        let target_idx = col_names.iter().position(|c| c == &target)
-            .ok_or_else(|| format!("target not found: {target}. Available: {:?}", col_names))?;
-
-        let feature_names: Vec<String> = if let Some(fs) = features {
-            fs.into_iter().filter(|c| c != &target).collect()
-        } else {
-            col_names.iter().filter(|c| *c != &target).cloned().collect()
-        };
-        if feature_names.is_empty() {
-            return Err("No feature columns selected".to_string());
-        }
-        let mut feature_idx: Vec<usize> = Vec::with_capacity(feature_names.len());
-        for f in &feature_names {
-            let idx = col_names.iter().position(|c| c == f)
-                .ok_or_else(|| format!("feature not found: {f}. Available: {:?}", col_names))?;
-            feature_idx.push(idx);
-        }
-
-        let p = feature_idx.len();
-        let dim = p + 1; // + intercept
-        let mut xtx = vec![0.0f64; dim * dim];
-        let mut xty = vec![0.0f64; dim];
-
-        // Second pass to evaluate test R2 after solving
-        // We'll do two passes over bytes (fast for in-memory).
-
-        // Helper to iterate rows (fast path) – reuse existing FastRowIter
-        let data_start = if has_header_actual { first_newline + 1 } else { 0 };
-        let data_bytes = &bytes[data_start..];
-
-        // Build a stable split that is consistent across both passes.
-        // If shuffle=true, use a Fisher–Yates permutation (parity with Python rng.permutation).
-        // If shuffle=false, use a simple sequential split (first train_cut rows).
-        let n_rows = if shuffle {
-            // Pre-count rows up to sample_size so we can permute indices deterministically.
-            let mut n = 0usize;
-            if fast_csv {
-                let mut it = FastRowIter::new(data_bytes, split_mode);
-                while it.next().is_some() && n < sample_size {
-                    n += 1;
+            // Determine split mode
+            let first_newline = memchr(b'\n', bytes).unwrap_or(bytes.len());
+            let first_line = &bytes[..first_newline];
+            let split_mode = if let Some(d) = delimiter.and_then(|d| d.bytes().next()) {
+                SplitMode::Delim(d)
+            } else {
+                match sniff_delimiter_simd(first_line) {
+                    Some(d) => SplitMode::Delim(d),
+                    None => SplitMode::Whitespace,
                 }
+            };
+            let delim_byte_for_detection = match split_mode {
+                SplitMode::Delim(d) => d,
+                SplitMode::Whitespace => b' ',
+            };
+            let has_header_actual = has_header
+                .unwrap_or_else(|| detect_header_smart(bytes, delim_byte_for_detection, 5));
+
+            // Column names
+            let first_line_clean = if first_line.ends_with(b"\r") {
+                &first_line[..first_line.len() - 1]
+            } else {
+                first_line
+            };
+            let first_fields = get_fields(first_line_clean, split_mode);
+            let ncols = first_fields.len();
+            if ncols == 0 {
+                return Err("No columns detected".to_string());
+            }
+            let col_names: Vec<String> = if has_header_actual {
+                first_fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let t = trim_bytes(f);
+                        if t.is_empty() {
+                            format!("col_{i}")
+                        } else {
+                            String::from_utf8_lossy(t).into_owned()
+                        }
+                    })
+                    .collect()
+            } else {
+                (0..ncols).map(|i| format!("col_{i}")).collect()
+            };
+
+            let target_idx = col_names
+                .iter()
+                .position(|c| c == &target)
+                .ok_or_else(|| format!("target not found: {target}. Available: {:?}", col_names))?;
+
+            let feature_names: Vec<String> = if let Some(fs) = features {
+                fs.into_iter().filter(|c| c != &target).collect()
+            } else {
+                col_names
+                    .iter()
+                    .filter(|c| *c != &target)
+                    .cloned()
+                    .collect()
+            };
+            if feature_names.is_empty() {
+                return Err("No feature columns selected".to_string());
+            }
+            let mut feature_idx: Vec<usize> = Vec::with_capacity(feature_names.len());
+            for f in &feature_names {
+                let idx = col_names
+                    .iter()
+                    .position(|c| c == f)
+                    .ok_or_else(|| format!("feature not found: {f}. Available: {:?}", col_names))?;
+                feature_idx.push(idx);
+            }
+
+            let p = feature_idx.len();
+            let dim = p + 1; // + intercept
+                             // XtX is symmetric, so only the upper triangle (row-major, r <= c)
+                             // is accumulated: dim*(dim+1)/2 slots instead of dim^2, which also
+                             // halves the multiply-adds per row in the hot loop. Mirrored into a
+                             // full matrix just before the solve.
+            let tri = dim * (dim + 1) / 2;
+            let mut xtx_tri = vec![0.0f64; tri];
+            let mut xty = vec![0.0f64; dim];
+
+            // Two passes over the mmapped bytes: accumulate on train, then
+            // evaluate on test with the solved coefficients.
+
+            // Helper to iterate rows (fast path) – reuse existing FastRowIter
+            let data_start = if has_header_actual {
+                first_newline + 1
+            } else {
+                0
+            };
+            let data_bytes = &bytes[data_start..];
+
+            // Build a stable split that is consistent across both passes.
+            // If shuffle=true, use a Fisher–Yates permutation (parity with Python rng.permutation).
+            // If shuffle=false, use a simple sequential split (first train_cut rows).
+            // Pre-count the rows actually present, capped at sample_size.
+            //
+            // This must happen for both split strategies. Deriving n_rows from
+            // sample_size instead (as the sequential branch previously did)
+            // makes train_cut a fraction of the *requested* cap rather than of
+            // the data: with the default sample_size of 1,000,000, every file
+            // under 800,000 rows put every row on the train side, leaving the
+            // test set empty and reporting r2 = 0.0 for a perfectly good model.
+            // Chunk the data once; the same chunks serve the row count, the
+            // training pass, and the evaluation pass. Counting is a parallel
+            // newline scan per chunk, and the per-chunk counts prefix-sum into
+            // each chunk's global starting row index — which is what lets the
+            // accumulation passes run chunk-parallel while agreeing with the
+            // split about which global row is which.
+            let num_threads = rayon::current_num_threads();
+            let byte_chunks: Vec<&[u8]> = if fast_csv {
+                chunk_bytes_aligned(data_bytes, num_threads)
+            } else {
+                Vec::new()
+            };
+            let chunk_rows: Vec<usize> = byte_chunks
+                .par_iter()
+                .map(|c| FastLineIter::new(c).count())
+                .collect();
+            let chunk_base: Vec<usize> = {
+                let mut bases = Vec::with_capacity(chunk_rows.len());
+                let mut acc = 0usize;
+                for &r in &chunk_rows {
+                    bases.push(acc);
+                    acc += r;
+                }
+                bases
+            };
+
+            let counted = if fast_csv {
+                chunk_rows.iter().sum::<usize>().min(sample_size)
             } else {
                 let mut reader = ReaderBuilder::new()
                     .has_headers(has_header_actual)
                     .delimiter(delim_byte_for_detection)
                     .flexible(true)
                     .from_reader(bytes);
-                for _ in reader.byte_records().take(sample_size) {
-                    n += 1;
+                reader.byte_records().take(sample_size).count()
+            };
+            let n_rows = counted.max(1);
+            let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
+
+            let mut is_train_mask: Option<Vec<bool>> = None;
+            if shuffle {
+                let mut perm: Vec<usize> = (0..n_rows).collect();
+                // Fisher–Yates using splitmix64
+                for i in (1..n_rows).rev() {
+                    let r = splitmix64(seed ^ (i as u64));
+                    let j = (r % ((i + 1) as u64)) as usize;
+                    perm.swap(i, j);
                 }
-            }
-            n.max(1)
-        } else {
-            sample_size.max(1)
-        };
-        let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
-
-        let mut is_train_mask: Option<Vec<bool>> = None;
-        if shuffle {
-            let mut perm: Vec<usize> = (0..n_rows).collect();
-            // Fisher–Yates using splitmix64
-            for i in (1..n_rows).rev() {
-                let r = splitmix64(seed ^ (i as u64));
-                let j = (r % ((i + 1) as u64)) as usize;
-                perm.swap(i, j);
-            }
-            let mut mask = vec![false; n_rows];
-            for &idx in perm.iter().take(train_cut) {
-                mask[idx] = true;
-            }
-            is_train_mask = Some(mask);
-        }
-
-        let mut rows_seen = 0usize;
-        let mut train_n = 0usize;
-        let mut test_assigned = 0usize;
-
-        // PASS 1: accumulate XtX/Xty on TRAIN
-        if fast_csv {
-            let mut iter = FastRowIter::new(data_bytes, split_mode);
-            while let Some(fields) = iter.next() {
-                if rows_seen >= n_rows { break; }
-                let row_idx = rows_seen;
-                rows_seen += 1;
-
-                if fields.len() < ncols { continue; }
-
-                // Split assignment (stable across passes)
-                let is_train = if let Some(mask) = &is_train_mask {
-                    mask[row_idx]
-                } else {
-                    row_idx < train_cut
-                };
-
-                let yv = match parse_f64_opt(fields[target_idx]) { Some(v) => v, None => continue };
-                let mut x = vec![0.0f64; dim];
-                for (j, &idx) in feature_idx.iter().enumerate() {
-                    let v = match parse_f64_opt(fields[idx]) { Some(v) => v, None => { x.clear(); break; } };
-                    x[j] = v;
+                let mut mask = vec![false; n_rows];
+                for &idx in perm.iter().take(train_cut) {
+                    mask[idx] = true;
                 }
-                if x.is_empty() { continue; }
-                x[p] = 1.0; // intercept
+                is_train_mask = Some(mask);
+            }
 
-                if is_train {
-                    // xtx += x x^T
-                    for r in 0..dim {
-                        let xr = x[r];
-                        for c in 0..dim {
-                            xtx[r * dim + c] += xr * x[c];
+            let mut train_n = 0usize;
+            let mut test_assigned = 0usize;
+
+            // PASS 1: accumulate XtX/Xty on TRAIN
+            if fast_csv {
+                // Chunk-parallel. Each chunk accumulates its own triangle and
+                // counters; partials are folded in chunk order afterwards, so
+                // the summation order — and therefore the result — is
+                // deterministic for a given thread count.
+                struct TrainPartial {
+                    xtx_tri: Vec<f64>,
+                    xty: Vec<f64>,
+                    train_n: usize,
+                    test_assigned: usize,
+                }
+
+                let partials: Vec<TrainPartial> = byte_chunks
+                    .par_iter()
+                    .zip(chunk_base.par_iter())
+                    .map(|(&chunk, &base)| {
+                        let mut part = TrainPartial {
+                            xtx_tri: vec![0.0f64; tri],
+                            xty: vec![0.0f64; dim],
+                            train_n: 0,
+                            test_assigned: 0,
+                        };
+                        if base >= n_rows {
+                            return part;
                         }
+                        // Scratch reused across rows: no per-row allocation.
+                        let mut fields: Vec<&[u8]> = Vec::with_capacity(ncols);
+                        let mut x = vec![0.0f64; dim];
+
+                        for (local, line) in FastLineIter::new(chunk).enumerate() {
+                            let row_idx = base + local;
+                            if row_idx >= n_rows {
+                                break;
+                            }
+                            // Split assignment first: pass 1 needs nothing
+                            // from a test row, so it is not worth parsing.
+                            let is_train = if let Some(mask) = &is_train_mask {
+                                mask[row_idx]
+                            } else {
+                                row_idx < train_cut
+                            };
+                            if !is_train {
+                                part.test_assigned += 1;
+                                continue;
+                            }
+
+                            fields.clear();
+                            for_each_field(line, split_mode, |_, f| fields.push(f));
+                            if fields.len() < ncols {
+                                continue;
+                            }
+
+                            let yv = match parse_f64_opt(fields[target_idx]) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            let mut ok = true;
+                            for (j, &idx) in feature_idx.iter().enumerate() {
+                                match parse_f64_opt(fields[idx]) {
+                                    Some(v) => x[j] = v,
+                                    None => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !ok {
+                                continue;
+                            }
+                            x[p] = 1.0; // intercept
+
+                            // Upper triangle only: xtx[r][c] for r <= c.
+                            let mut k = 0usize;
+                            for r in 0..dim {
+                                let xr = x[r];
+                                part.xty[r] += xr * yv;
+                                for &xc in &x[r..dim] {
+                                    part.xtx_tri[k] += xr * xc;
+                                    k += 1;
+                                }
+                            }
+                            part.train_n += 1;
+                        }
+                        part
+                    })
+                    .collect();
+
+                for part in partials {
+                    for (a, b) in xtx_tri.iter_mut().zip(&part.xtx_tri) {
+                        *a += b;
+                    }
+                    for (a, b) in xty.iter_mut().zip(&part.xty) {
+                        *a += b;
+                    }
+                    train_n += part.train_n;
+                    test_assigned += part.test_assigned;
+                }
+            } else {
+                let mut rows_seen = 0usize;
+                let mut x_scratch = vec![0.0f64; dim];
+                // Safe path: fall back to csv crate parsing (quoted newlines, etc.)
+                let mut reader = ReaderBuilder::new()
+                    .has_headers(has_header_actual)
+                    .delimiter(delim_byte_for_detection)
+                    .flexible(true)
+                    .from_reader(bytes);
+
+                for result in reader.byte_records().take(n_rows) {
+                    let record = match result {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let row_idx = rows_seen;
+                    rows_seen += 1;
+                    // Same shape as the fast path: split first, parse only
+                    // train rows, accumulate the upper triangle.
+                    let is_train = if let Some(mask) = &is_train_mask {
+                        mask[row_idx]
+                    } else {
+                        row_idx < train_cut
+                    };
+                    if !is_train {
+                        test_assigned += 1;
+                        continue;
+                    }
+                    if record.len() < ncols {
+                        continue;
+                    }
+
+                    let yv = match parse_f64_opt(record.get(target_idx).unwrap_or(&[])) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let mut ok = true;
+                    for (j, &idx) in feature_idx.iter().enumerate() {
+                        match record.get(idx).and_then(parse_f64_opt) {
+                            Some(v) => x_scratch[j] = v,
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    x_scratch[p] = 1.0;
+                    let mut k = 0usize;
+                    for r in 0..dim {
+                        let xr = x_scratch[r];
                         xty[r] += xr * yv;
+                        for &xc in &x_scratch[r..dim] {
+                            xtx_tri[k] += xr * xc;
+                            k += 1;
+                        }
                     }
                     train_n += 1;
-                } else {
-                    test_assigned += 1;
                 }
             }
-        } else {
-            // Safe path: fall back to csv crate parsing (quoted newlines, etc.)
-            let mut reader = ReaderBuilder::new()
-                .has_headers(has_header_actual)
-                .delimiter(delim_byte_for_detection)
-                .flexible(true)
-                .from_reader(bytes);
 
-            for result in reader.byte_records().take(n_rows) {
-                let record = match result { Ok(r) => r, Err(_) => continue };
-                let row_idx = rows_seen;
-                rows_seen += 1;
-                if record.len() < ncols { continue; }
-                let is_train = if let Some(mask) = &is_train_mask {
-                    mask[row_idx]
-                } else {
-                    row_idx < train_cut
-                };
+            if train_n < dim {
+                return Err(format!(
+                    "Not enough training rows to fit model (train_n={train_n}, params={dim})"
+                ));
+            }
 
-                let yv = match parse_f64_opt(record.get(target_idx).unwrap_or(&[])) { Some(v) => v, None => continue };
-                let mut x = vec![0.0f64; dim];
-                for (j, &idx) in feature_idx.iter().enumerate() {
-                    let v = match record.get(idx).and_then(|b| parse_f64_opt(b)) { Some(v) => v, None => { x.clear(); break; } };
-                    x[j] = v;
-                }
-                if x.is_empty() { continue; }
-                x[p] = 1.0;
-                if is_train {
-                    for r in 0..dim {
-                        let xr = x[r];
-                        for c in 0..dim {
-                            xtx[r * dim + c] += xr * x[c];
-                        }
-                        xty[r] += xr * yv;
+            // Mirror the accumulated upper triangle into the full symmetric
+            // matrix the solver expects.
+            let mut xtx = vec![0.0f64; dim * dim];
+            {
+                let mut k = 0usize;
+                for r in 0..dim {
+                    for c in r..dim {
+                        xtx[r * dim + c] = xtx_tri[k];
+                        xtx[c * dim + r] = xtx_tri[k];
+                        k += 1;
                     }
-                    train_n += 1;
-                } else {
-                    test_assigned += 1;
                 }
             }
-        }
 
-        if train_n < dim {
-            return Err(format!("Not enough training rows to fit model (train_n={train_n}, params={dim})"));
-        }
-
-        // Optional ridge for stability: XtX += λI
-        if ridge_lambda > 0.0 {
-            for i in 0..dim {
-                xtx[i * dim + i] += ridge_lambda;
-            }
-        }
-
-        let w = gaussian_solve(xtx.clone(), xty.clone(), dim)
-            .ok_or_else(|| "Failed to solve linear system (singular/ill-conditioned)".to_string())?;
-        let coef = w[..p].to_vec();
-        let intercept = w[p];
-
-        // PASS 2: compute test R^2
-        let mut ss_res = 0.0f64;
-        let mut sum_y = 0.0f64;
-        let mut sum_y2 = 0.0f64;
-        let mut test_used = 0usize;
-        let mut rows_seen2 = 0usize;
-
-        if fast_csv {
-            let mut iter = FastRowIter::new(data_bytes, split_mode);
-            while let Some(fields) = iter.next() {
-                if rows_seen2 >= n_rows { break; }
-                let row_idx = rows_seen2;
-                rows_seen2 += 1;
-                if fields.len() < ncols { continue; }
-                let is_train = if let Some(mask) = &is_train_mask {
-                    mask[row_idx]
-                } else {
-                    row_idx < train_cut
-                };
-                if is_train { continue; }
-
-                let yv = match parse_f64_opt(fields[target_idx]) { Some(v) => v, None => continue };
-                let mut pred = intercept;
-                for (j, &idx) in feature_idx.iter().enumerate() {
-                    let xv = match parse_f64_opt(fields[idx]) { Some(v) => v, None => { pred = f64::NAN; break; } };
-                    pred += coef[j] * xv;
+            // Optional ridge for stability: XtX += λI
+            if ridge_lambda > 0.0 {
+                for i in 0..dim {
+                    xtx[i * dim + i] += ridge_lambda;
                 }
-                if !pred.is_finite() { continue; }
-                let r = yv - pred;
-                ss_res += r * r;
-                sum_y += yv;
-                sum_y2 += yv * yv;
-                test_used += 1;
             }
-        } else {
-            let mut reader = ReaderBuilder::new()
-                .has_headers(has_header_actual)
-                .delimiter(delim_byte_for_detection)
-                .flexible(true)
-                .from_reader(bytes);
-            for result in reader.byte_records().take(n_rows) {
-                let record = match result { Ok(r) => r, Err(_) => continue };
-                let row_idx = rows_seen2;
-                rows_seen2 += 1;
-                if record.len() < ncols { continue; }
-                let is_train = if let Some(mask) = &is_train_mask {
-                    mask[row_idx]
-                } else {
-                    row_idx < train_cut
-                };
-                if is_train { continue; }
-                let yv = match record.get(target_idx).and_then(|b| parse_f64_opt(b)) { Some(v) => v, None => continue };
-                let mut pred = intercept;
-                for (j, &idx) in feature_idx.iter().enumerate() {
-                    let xv = match record.get(idx).and_then(|b| parse_f64_opt(b)) { Some(v) => v, None => { pred = f64::NAN; break; } };
-                    pred += coef[j] * xv;
+
+            let w = gaussian_solve(xtx.clone(), xty.clone(), dim).ok_or_else(|| {
+                "Failed to solve linear system (singular/ill-conditioned)".to_string()
+            })?;
+            let coef = w[..p].to_vec();
+            let intercept = w[p];
+
+            // PASS 2: compute test R^2
+            let mut ss_res = 0.0f64;
+            let mut sum_y = 0.0f64;
+            let mut sum_y2 = 0.0f64;
+            let mut test_used = 0usize;
+
+            if fast_csv {
+                // Same chunk-parallel shape as pass 1, same deterministic
+                // in-order fold of the partial sums.
+                #[derive(Default)]
+                struct EvalPartial {
+                    ss_res: f64,
+                    sum_y: f64,
+                    sum_y2: f64,
+                    test_used: usize,
                 }
-                if !pred.is_finite() { continue; }
-                let r = yv - pred;
-                ss_res += r * r;
-                sum_y += yv;
-                sum_y2 += yv * yv;
-                test_used += 1;
+
+                let partials: Vec<EvalPartial> = byte_chunks
+                    .par_iter()
+                    .zip(chunk_base.par_iter())
+                    .map(|(&chunk, &base)| {
+                        let mut part = EvalPartial::default();
+                        if base >= n_rows {
+                            return part;
+                        }
+                        let mut fields: Vec<&[u8]> = Vec::with_capacity(ncols);
+
+                        for (local, line) in FastLineIter::new(chunk).enumerate() {
+                            let row_idx = base + local;
+                            if row_idx >= n_rows {
+                                break;
+                            }
+                            let is_train = if let Some(mask) = &is_train_mask {
+                                mask[row_idx]
+                            } else {
+                                row_idx < train_cut
+                            };
+                            if is_train {
+                                continue;
+                            }
+
+                            fields.clear();
+                            for_each_field(line, split_mode, |_, f| fields.push(f));
+                            if fields.len() < ncols {
+                                continue;
+                            }
+
+                            let yv = match parse_f64_opt(fields[target_idx]) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            let mut pred = intercept;
+                            for (j, &idx) in feature_idx.iter().enumerate() {
+                                let xv = match parse_f64_opt(fields[idx]) {
+                                    Some(v) => v,
+                                    None => {
+                                        pred = f64::NAN;
+                                        break;
+                                    }
+                                };
+                                pred += coef[j] * xv;
+                            }
+                            if !pred.is_finite() {
+                                continue;
+                            }
+                            let r = yv - pred;
+                            part.ss_res += r * r;
+                            part.sum_y += yv;
+                            part.sum_y2 += yv * yv;
+                            part.test_used += 1;
+                        }
+                        part
+                    })
+                    .collect();
+
+                for part in partials {
+                    ss_res += part.ss_res;
+                    sum_y += part.sum_y;
+                    sum_y2 += part.sum_y2;
+                    test_used += part.test_used;
+                }
+            } else {
+                let mut rows_seen2 = 0usize;
+                let mut reader = ReaderBuilder::new()
+                    .has_headers(has_header_actual)
+                    .delimiter(delim_byte_for_detection)
+                    .flexible(true)
+                    .from_reader(bytes);
+                for result in reader.byte_records().take(n_rows) {
+                    let record = match result {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let row_idx = rows_seen2;
+                    rows_seen2 += 1;
+                    if record.len() < ncols {
+                        continue;
+                    }
+                    let is_train = if let Some(mask) = &is_train_mask {
+                        mask[row_idx]
+                    } else {
+                        row_idx < train_cut
+                    };
+                    if is_train {
+                        continue;
+                    }
+                    let yv = match record.get(target_idx).and_then(parse_f64_opt) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let mut pred = intercept;
+                    for (j, &idx) in feature_idx.iter().enumerate() {
+                        let xv = match record.get(idx).and_then(parse_f64_opt) {
+                            Some(v) => v,
+                            None => {
+                                pred = f64::NAN;
+                                break;
+                            }
+                        };
+                        pred += coef[j] * xv;
+                    }
+                    if !pred.is_finite() {
+                        continue;
+                    }
+                    let r = yv - pred;
+                    ss_res += r * r;
+                    sum_y += yv;
+                    sum_y2 += yv * yv;
+                    test_used += 1;
+                }
             }
-        }
 
-        // IMPORTANT: R^2 must be computed on the same set of rows that were actually scored.
-        // Using the split-assigned `test_n` while skipping parse-failed rows corrupts mean_y/ss_tot.
-        let n = test_used.max(1) as f64;
-        let mean_y = sum_y / n;
-        let ss_tot = sum_y2 - n * mean_y * mean_y;
-        let r2 = if ss_tot > 0.0 { 1.0 - (ss_res / ss_tot) } else { 0.0 };
+            // IMPORTANT: R^2 must be computed on the same set of rows that were actually scored.
+            // Using the split-assigned `test_n` while skipping parse-failed rows corrupts mean_y/ss_tot.
+            let n = test_used.max(1) as f64;
+            let mean_y = sum_y / n;
+            let ss_tot = sum_y2 - n * mean_y * mean_y;
+            let r2 = if ss_tot > 0.0 {
+                1.0 - (ss_res / ss_tot)
+            } else {
+                0.0
+            };
 
-        // Return test_used to reflect actual evaluated rows
-        // Return debug-friendly counts
-        if return_debug {
-            Ok((feature_names, coef, intercept, train_n, test_used, r2, test_assigned, ss_res, ss_tot, mean_y))
-        } else {
-            // Keep tuple shape stable even when not returning debug fields
-            Ok((feature_names, coef, intercept, train_n, test_used, r2, 0usize, 0.0f64, 0.0f64, 0.0f64))
-        }
-    }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+            // Return test_used to reflect actual evaluated rows
+            // Return debug-friendly counts
+            if return_debug {
+                Ok((
+                    feature_names,
+                    coef,
+                    intercept,
+                    train_n,
+                    test_used,
+                    r2,
+                    test_assigned,
+                    ss_res,
+                    ss_tot,
+                    mean_y,
+                ))
+            } else {
+                // Keep tuple shape stable even when not returning debug fields
+                Ok((
+                    feature_names,
+                    coef,
+                    intercept,
+                    train_n,
+                    test_used,
+                    r2,
+                    0usize,
+                    0.0f64,
+                    0.0f64,
+                    0.0f64,
+                ))
+            }
+        })
+        .map_err(pyo3::exceptions::PyIOError::new_err)?;
 
     let (
         feature_names,

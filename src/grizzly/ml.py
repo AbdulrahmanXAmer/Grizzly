@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 
 def _require_numpy():
@@ -25,7 +25,7 @@ class LinearRegression:
     """
 
     fit_intercept: bool = True
-    coef_: Optional["Any"] = None
+    coef_: Any | None = None
     intercept_: float = 0.0
 
     def fit(self, X, y):
@@ -88,7 +88,7 @@ class RidgeRegression:
 
     alpha: float = 1.0
     fit_intercept: bool = True
-    coef_: Optional["Any"] = None
+    coef_: Any | None = None
     intercept_: float = 0.0
 
     def fit(self, X, y):
@@ -111,8 +111,8 @@ class RidgeRegression:
         # Ridge: solve (A + alpha I) w = b
         A = Xb.T @ Xb
         b = Xb.T @ y
-        I = np.eye(A.shape[0], dtype="float64")
-        w = np.linalg.solve(A + self.alpha * I, b)
+        identity = np.eye(A.shape[0], dtype="float64")
+        w = np.linalg.solve(A + self.alpha * identity, b)
 
         if self.fit_intercept:
             self.coef_ = w[:-1]
@@ -124,9 +124,11 @@ class RidgeRegression:
 
     def predict(self, X):
         # Same as linear regression
-        return LinearRegression(fit_intercept=self.fit_intercept, coef_=self.coef_, intercept_=self.intercept_).predict(X)
+        return LinearRegression(
+            fit_intercept=self.fit_intercept, coef_=self.coef_, intercept_=self.intercept_
+        ).predict(X)
 
     def score(self, X, y) -> float:
-        return LinearRegression(fit_intercept=self.fit_intercept, coef_=self.coef_, intercept_=self.intercept_).score(X, y)
-
-
+        return LinearRegression(
+            fit_intercept=self.fit_intercept, coef_=self.coef_, intercept_=self.intercept_
+        ).score(X, y)

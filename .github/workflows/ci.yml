@@ -1,0 +1,329 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same ref cancels the previous run. Keeps queue time low
+# without letting main go unverified.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Fail the build on any Python warning that escapes a test.
+  PYTHONWARNDEFAULTENCODING: 1
+
+jobs:
+  rust-lint:
+    name: Rust lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Unit tests for the parser and statistics internals. These need no
+      # Python interpreter, so they run in the lint job rather than the matrix.
+      - name: cargo test
+        run: cargo test
+
+  fuzz:
+    name: Fuzz the parser
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-fuzz requires nightly for -Z sanitizer support.
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nfuzz -> fuzz/target"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # A short run on every push is a smoke test, not a fuzzing campaign: it
+      # catches a target that no longer builds and any crash reachable within
+      # a minute from the committed seeds. Deeper runs belong in a scheduled
+      # job with a persisted corpus.
+      - name: Fuzz CSV parsing
+        run: |
+          cargo fuzz run parse_csv fuzz/corpus/parse_csv fuzz/seeds/parse_csv \
+            -- -max_total_time=60 -print_final_stats=1
+
+      - name: Fuzz chunk alignment
+        run: |
+          cargo fuzz run chunk_alignment fuzz/corpus/chunk_alignment fuzz/seeds/chunk_alignment \
+            -- -max_total_time=60 -print_final_stats=1
+
+      # A crash reproducer is the whole point of the job, so make sure it
+      # leaves the runner even when the step above fails.
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  python-lint:
+    name: Python lint (ruff + mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install tooling
+        run: |
+          python -m pip install -U pip
+          python -m pip install ruff==0.14.2 mypy==1.19.0
+          python -m pip install -r benches/requirements.txt
+
+      # The native module must exist before mypy runs, or every `import grizzly`
+      # in the package resolves to a missing stub rather than the real thing.
+      - name: Build native extension
+        run: maturin develop --release
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format
+        run: ruff format --check .
+
+      - name: mypy
+        run: mypy src/grizzly benches
+
+  test:
+    name: Test ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Full interpreter sweep on Linux; the ends of the supported range on
+        # macOS and Windows. Catches platform breakage without paying for a
+        # 15-cell matrix on every push.
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python: "3.10"
+          - os: macos-latest
+            python: "3.14"
+          - os: windows-latest
+            python: "3.10"
+          - os: windows-latest
+            python: "3.14"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.python }}
+
+      - name: Install build tooling
+        run: |
+          python -m pip install -U pip
+          python -m pip install maturin==1.14.1 pytest==9.1.1
+
+      # Build and install a real wheel rather than an editable install, so the
+      # tests exercise the artifact users actually receive.
+      - name: Build wheel
+        run: maturin build --release --out dist --interpreter python
+
+      - name: Install wheel (Unix)
+        if: runner.os != 'Windows'
+        run: python -m pip install --no-index --find-links dist grizzly
+
+      - name: Install wheel (Windows)
+        if: runner.os == 'Windows'
+        run: python -m pip install --no-index --find-links dist grizzly
+
+      - name: Verify the native extension loaded
+        run: python -c "import grizzly, sys; sys.exit(0 if grizzly.is_native() else 'native extension did not load')"
+
+      # Run from a directory without ./src on the path, so the import under
+      # test is the installed wheel and not the source tree.
+      - name: Run tests
+        run: python -m pytest tests -v
+
+      # The differential and property suites need their reference libraries and
+      # Hypothesis. Without them those tests skip rather than fail, which would
+      # quietly reduce this job to the smoke tests.
+      - name: Run tests with optional dependencies present
+        run: |
+          python -m pip install "numpy>=2.0" "pandas>=2.2" "pyarrow>=15.0" "polars>=1.0" "hypothesis>=6.100"
+          python -m pytest tests -v
+
+  # Panic propagation can only be exercised when the crate exposes the
+  # `testing`-gated _force_panic hook. Nothing else builds with that feature, so
+  # without this job those tests would skip on every run and the guarantee that
+  # a Rust panic reaches Python as a catchable exception would go unverified.
+  panic-propagation:
+    name: Rust panics surface as Python exceptions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install tooling
+        run: |
+          python -m pip install -U pip
+          python -m pip install maturin==1.14.1 pytest==9.1.1
+
+      - name: Build with the testing feature
+        run: maturin develop --release --features testing
+
+      # The tests skip themselves when _force_panic is absent, so a green run
+      # here would otherwise prove nothing. Fail if anything skipped: that
+      # means the feature flag did not reach the build.
+      - name: Verify panics unwind into PanicException
+        run: |
+          python -m pytest tests/test_panic_propagation.py -v | tee result.txt
+          if grep -qi skipped result.txt; then
+            echo "::error::panic propagation tests skipped; the testing feature did not take effect"
+            exit 1
+          fi
+
+  # Confirms the benchmark suite still runs and that Grizzly still agrees with
+  # pandas and polars. Deliberately tiny: this gate is about correctness of the
+  # harness, not about timing. Published timings come from bench.yml.
+  bench-smoke:
+    name: Benchmark smoke + equivalence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r benches/requirements.txt
+
+      - name: Build native extension
+        run: maturin develop --release
+
+      # --strict turns any cross-library disagreement into a failed build.
+      - name: Run benchmark suite (small, strict)
+        run: |
+          python -m benches.bench \
+            --rows 20000 \
+            --repetitions 2 \
+            --strict \
+            --out /tmp/smoke-results.json
+
+      # Same gate for the fit benchmark: five methods must land on the same
+      # model, or the run fails rather than publishing a fast wrong answer.
+      - name: Run fit benchmark (small, strict)
+        run: |
+          python -m benches.bench_fit \
+            --rows 20000 \
+            --repetitions 2 \
+            --strict \
+            --out /tmp/smoke-fit.json
+
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-smoke-results
+          path: /tmp/smoke-results.json
+
+  # The demo is the project's front door, so a broken one is a broken README.
+  # Run it offline: CI should not depend on an external dataset host staying up,
+  # and the generated fallback exercises every stage the same way.
+  demo:
+    name: End-to-end demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r benches/requirements.txt
+
+      - name: Build native extension
+        run: maturin develop --release
+
+      - name: Run the pipeline end to end
+        run: python -m demo.pipeline --offline --rows 100000 --json-out /tmp/demo.json
+
+      # The offline fixture injects known drift, so a run reporting none means
+      # a stage silently stopped working.
+      - name: Assert the demo detected the injected drift
+        run: python demo/assert_drift.py /tmp/demo.json
+
+  # Fails if the README's published numbers no longer match the committed
+  # results.json. Makes it impossible to edit a benchmark table by hand.
+  readme-sync:
+    name: README benchmark tables in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check README against results.json
+        run: python -m benches.render --check

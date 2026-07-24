@@ -1,0 +1,12 @@
+# Build output
+target/
+
+# libFuzzer's evolving corpus and coverage data. Regenerated on every run and
+# frequently tens of thousands of files; the committed starting points live in
+# seeds/ instead.
+corpus/
+coverage/
+
+# Crash reproducers. A real one should be turned into a unit test in
+# src/tests.rs and committed there, not left as an opaque binary blob.
+artifacts/
