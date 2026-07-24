@@ -601,6 +601,114 @@ fn for_each_field_matches_get_fields() {
 }
 
 // ---------------------------------------------------------------------------
+// moments-only scanning
+// ---------------------------------------------------------------------------
+
+#[test]
+fn push_moments_matches_push_bitwise() {
+    // The moments-only path exists purely to skip the t-digest; the moments it
+    // produces must be indistinguishable from a full push, bit for bit, or the
+    // scaler params would depend on which scan computed them.
+    let values: Vec<f64> = (0..10_000)
+        .map(|i| ((splitmix64(7 ^ i) as f64) / (u64::MAX as f64)) * 500.0 - 250.0)
+        .collect();
+
+    let mut full = NumStats::default();
+    let mut moments = NumStats::default();
+    for &v in &values {
+        full.push(v);
+        moments.push_moments(v);
+    }
+    full.finalize();
+
+    assert_eq!(moments.n, full.n);
+    assert_eq!(moments.min.to_bits(), full.min.to_bits(), "min");
+    assert_eq!(moments.max.to_bits(), full.max.to_bits(), "max");
+    assert_eq!(moments.mean.to_bits(), full.mean.to_bits(), "mean");
+    assert_eq!(moments.m2.to_bits(), full.m2.to_bits(), "m2");
+}
+
+#[test]
+fn moments_only_stats_report_no_quantiles() {
+    // An empty digest's estimate is not an answer. quantile() must say None
+    // rather than invent a number.
+    let mut moments = NumStats::default();
+    for i in 0..1_000 {
+        moments.push_moments(i as f64);
+    }
+
+    assert_eq!(moments.n, 1_000);
+    assert!(
+        moments.std_pop().is_some(),
+        "moments themselves are present"
+    );
+    assert!(moments.quantile(0.5).is_none(), "no digest was fed");
+
+    // And the distinction survives a merge of two moments-only accumulators.
+    let mut other = NumStats::default();
+    other.push_moments(5.0);
+    moments.merge(&mut other);
+    assert!(moments.quantile(0.5).is_none());
+    assert_eq!(moments.n, 1_001);
+}
+
+#[test]
+fn merge_carries_quantile_availability() {
+    // Merging a digest-fed accumulator into a moments-only one must keep the
+    // quantiles that exist.
+    let mut moments = NumStats::default();
+    moments.push_moments(1.0);
+
+    let mut full = NumStats::default();
+    for i in 0..100 {
+        full.push(i as f64);
+    }
+
+    moments.merge(&mut full);
+    assert_eq!(moments.n, 101);
+    assert!(moments.quantile(0.5).is_some());
+}
+
+#[test]
+fn process_cell_moments_matches_lite_classification() {
+    // Same trim, same parse order, same null handling — only the digest
+    // differs. Any divergence would make scaler params disagree with the
+    // profile on the same file.
+    let fields: &[&[u8]] = &[
+        b"42",
+        b"-7",
+        b"3.25",
+        b"  1e3 ",
+        b"",
+        b"   ",
+        b"not_a_number",
+        b"+0.5",
+    ];
+
+    let mut lite = ColStats {
+        freq: FreqTracker::new(),
+        ..Default::default()
+    };
+    let mut moments = ColStats {
+        freq: FreqTracker::new(),
+        ..Default::default()
+    };
+    for f in fields {
+        process_cell_lite(f, &mut lite);
+        process_cell_moments(f, &mut moments);
+    }
+    lite.finalize();
+
+    assert_eq!(moments.count, lite.count);
+    assert_eq!(moments.null_count, lite.null_count);
+    assert_eq!(moments.num.n, lite.num.n);
+    assert_eq!(moments.num.min.to_bits(), lite.num.min.to_bits());
+    assert_eq!(moments.num.max.to_bits(), lite.num.max.to_bits());
+    assert_eq!(moments.num.mean.to_bits(), lite.num.mean.to_bits());
+    assert_eq!(moments.num.m2.to_bits(), lite.num.m2.to_bits());
+}
+
+// ---------------------------------------------------------------------------
 // micro-benchmarks
 // ---------------------------------------------------------------------------
 //
@@ -643,21 +751,12 @@ fn bench_numstats_digest_overhead() {
 
     // Moments only: what a scaler-params scan actually needs.
     let start = Instant::now();
-    let (mut n, mut mean, mut m2, mut min, mut max) = (0u64, 0.0f64, 0.0f64, f64::MAX, f64::MIN);
+    let mut moments = NumStats::default();
     for &v in &values {
-        if v < min {
-            min = v;
-        }
-        if v > max {
-            max = v;
-        }
-        n += 1;
-        let delta = v - mean;
-        mean += delta / (n as f64);
-        m2 += (v - mean) * delta;
+        moments.push_moments(v);
     }
     let moments_time = start.elapsed();
-    black_box((n, mean, m2, min, max));
+    black_box(moments.std_pop());
 
     let per_value_digest = digest_time.as_nanos() as f64 / values.len() as f64;
     let per_value_moments = moments_time.as_nanos() as f64 / values.len() as f64;

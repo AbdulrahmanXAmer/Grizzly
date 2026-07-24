@@ -170,6 +170,35 @@ fn csv_profile(
     track_freq: bool,
     collect_examples: bool,
 ) -> PyResult<PyObject> {
+    let mode = if lite { ScanMode::Lite } else { ScanMode::Full };
+    csv_profile_impl(
+        py,
+        path,
+        sample_size,
+        max_examples,
+        fast_csv,
+        mode,
+        track_freq,
+        collect_examples,
+    )
+}
+
+/// The scan behind `csv_profile`, with the mode exposed.
+///
+/// `ScanMode::Moments` is internal-only: it is what the scaler-params
+/// functions run, and it skips the t-digest entirely — the digest costs ~8x
+/// the moments it accompanies, and those callers discard the quantiles.
+#[allow(clippy::too_many_arguments)]
+fn csv_profile_impl(
+    py: Python<'_>,
+    path: String,
+    sample_size: usize,
+    max_examples: usize,
+    fast_csv: bool,
+    mode: ScanMode,
+    track_freq: bool,
+    collect_examples: bool,
+) -> PyResult<PyObject> {
     let result = py.allow_threads(|| -> Result<ProfileScan, String> {
         // Profiling is sampling-first: use bounded gzip when applicable.
         let file_data = load_file_for_profile(&path, sample_size).map_err(|e| e.to_string())?;
@@ -274,18 +303,18 @@ fn csv_profile(
                             if i >= ncols {
                                 return;
                             }
-                            if lite {
-                                // LITE MODE: Just numeric stats
-                                process_cell_lite(field, &mut local_stats[i]);
-                            } else {
-                                // FULL MODE: Type inference + examples + freq
-                                process_cell(
+                            match mode {
+                                ScanMode::Moments => {
+                                    process_cell_moments(field, &mut local_stats[i])
+                                }
+                                ScanMode::Lite => process_cell_lite(field, &mut local_stats[i]),
+                                ScanMode::Full => process_cell(
                                     field,
                                     &mut local_stats[i],
                                     max_examples,
                                     track_freq,
                                     collect_examples,
-                                );
+                                ),
                             }
                         });
 
@@ -338,16 +367,16 @@ fn csv_profile(
             for record in reader.byte_records().take(sample_size).flatten() {
                 for (i, field) in record.iter().enumerate() {
                     if i < ncols {
-                        if lite {
-                            process_cell_lite(field, &mut stats[i]);
-                        } else {
-                            process_cell(
+                        match mode {
+                            ScanMode::Moments => process_cell_moments(field, &mut stats[i]),
+                            ScanMode::Lite => process_cell_lite(field, &mut stats[i]),
+                            ScanMode::Full => process_cell(
                                 field,
                                 &mut stats[i],
                                 max_examples,
                                 track_freq,
                                 collect_examples,
-                            );
+                            ),
                         }
                     }
                 }
@@ -401,11 +430,21 @@ fn csv_profile(
             d.set_item("max", s.num.max)?;
             d.set_item("mean", s.num.mean)?;
             d.set_item("std", s.num.std_pop().unwrap_or(0.0))?;
-            d.set_item("median", s.num.quantile(0.5).unwrap_or(0.0))?;
-            d.set_item("p25", s.num.quantile(0.25).unwrap_or(0.0))?;
-            d.set_item("p75", s.num.quantile(0.75).unwrap_or(0.0))?;
-            d.set_item("p90", s.num.quantile(0.90).unwrap_or(0.0))?;
-            d.set_item("p95", s.num.quantile(0.95).unwrap_or(0.0))?;
+            // Quantiles are None when the scan never fed the t-digest
+            // (ScanMode::Moments); emitting a number there would be inventing
+            // one. Full and Lite scans always have them when n > 0.
+            for (key, q) in [
+                ("median", 0.5),
+                ("p25", 0.25),
+                ("p75", 0.75),
+                ("p90", 0.90),
+                ("p95", 0.95),
+            ] {
+                match s.num.quantile(q) {
+                    Some(v) => d.set_item(key, v)?,
+                    None => d.set_item(key, py.None())?,
+                }
+            }
             d.set_item("outliers_3sigma", 0)?;
         } else {
             d.set_item("min", py.None())?;
@@ -443,8 +482,18 @@ fn csv_profile(
 
 #[pyfunction]
 fn csv_minmax_params(py: Python<'_>, path: String, sample_size: usize) -> PyResult<PyObject> {
-    // Use lite mode - we only need min/max, not type inference or examples
-    let prof_obj = csv_profile(py, path.clone(), sample_size, 0, true, true, false, false)?;
+    // Moments-only scan: min/max is all this needs, and the t-digest a lite
+    // scan would build costs ~8x the moments themselves.
+    let prof_obj = csv_profile_impl(
+        py,
+        path.clone(),
+        sample_size,
+        0,
+        true,
+        ScanMode::Moments,
+        false,
+        false,
+    )?;
     let prof = prof_obj.bind(py).downcast::<PyDict>()?;
     let out = PyDict::new(py);
     out.set_item("path", path)?;
@@ -806,9 +855,18 @@ fn csv_transform_minmax(
 /// Mean and population standard deviation per numeric column, from one pass.
 #[pyfunction]
 fn csv_standardize_params(py: Python<'_>, path: String, sample_size: usize) -> PyResult<PyObject> {
-    // lite mode: mean and std come from the streaming accumulator, so no type
-    // inference, examples, or frequency tracking is needed.
-    let prof_obj = csv_profile(py, path.clone(), sample_size, 0, true, true, false, false)?;
+    // Moments-only scan: mean and std come from the streaming accumulator,
+    // and the quantiles a lite scan would compute are discarded here anyway.
+    let prof_obj = csv_profile_impl(
+        py,
+        path.clone(),
+        sample_size,
+        0,
+        true,
+        ScanMode::Moments,
+        false,
+        false,
+    )?;
     let prof = prof_obj.bind(py).downcast::<PyDict>()?;
     let out = PyDict::new(py);
     out.set_item("path", path)?;

@@ -69,6 +69,22 @@ pub fn infer_from_mask(mask: u8) -> &'static str {
     "mixed"
 }
 
+/// What a profiling scan computes per numeric cell.
+///
+/// The distinction earns its keep in the hot path: the t-digest costs ~8x the
+/// moments it rides along with (measured by `bench_numstats_digest_overhead`),
+/// and the scaler-params scans only ever read min/max/mean/std.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScanMode {
+    /// Type inference, examples, frequency tracking, moments, and quantiles.
+    Full,
+    /// Moments and quantiles only.
+    Lite,
+    /// Moments only: min/max/mean/std, no t-digest. What min-max scaling and
+    /// standardization need, at a fraction of the per-cell cost.
+    Moments,
+}
+
 #[derive(Clone)]
 pub struct NumStats {
     pub n: u64,
@@ -78,6 +94,11 @@ pub struct NumStats {
     pub max: f64,
     pub digest: TDigest,
     pub pending: Vec<f64>,
+    /// Values fed to the digest path. Tracked separately from `n` so that
+    /// `quantile()` can answer honestly when a moments-only scan populated the
+    /// moments but never fed the digest: the alternative is returning whatever
+    /// an empty digest estimates, which is a number that looks like an answer.
+    pub quant_n: u64,
 }
 
 impl Default for NumStats {
@@ -90,13 +111,19 @@ impl Default for NumStats {
             max: f64::MIN,
             digest: TDigest::new_with_size(100),
             pending: Vec::with_capacity(1024),
+            quant_n: 0,
         }
     }
 }
 
 impl NumStats {
+    /// Update count, min, max, mean, and m2 — and nothing else.
+    ///
+    /// This is the shared moments arithmetic for both push paths, kept in one
+    /// place so a moments-only scan is bit-identical to the moments a full
+    /// scan would have produced.
     #[inline(always)]
-    pub fn push(&mut self, x: f64) {
+    pub fn push_moments(&mut self, x: f64) {
         if self.n == 0 {
             self.min = x;
             self.max = x;
@@ -113,6 +140,12 @@ impl NumStats {
         self.mean += delta / (self.n as f64);
         let delta2 = x - self.mean;
         self.m2 += delta * delta2;
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, x: f64) {
+        self.push_moments(x);
+        self.quant_n += 1;
 
         self.pending.push(x);
         if self.pending.len() >= 1024 {
@@ -160,6 +193,7 @@ impl NumStats {
         self.mean = new_mean;
         self.m2 = new_m2;
         self.n = n_combined;
+        self.quant_n += other.quant_n;
 
         // Use std::mem::take to avoid cloning digests.
         let self_digest = std::mem::take(&mut self.digest);
@@ -176,7 +210,9 @@ impl NumStats {
     }
 
     pub fn quantile(&self, q: f64) -> Option<f64> {
-        if self.n == 0 {
+        // Keyed off quant_n, not n: a moments-only scan has n > 0 but never
+        // fed the digest, and an empty digest's estimate is not an answer.
+        if self.quant_n == 0 {
             None
         } else {
             Some(self.digest.estimate_quantile(q))
@@ -423,4 +459,33 @@ pub fn process_cell_lite(bytes: &[u8], stats: &mut ColStats) {
         stats.num.push(val);
     }
     // Non-numeric: just count, no other work
+}
+
+/// MOMENTS cell processing - min/max/mean/std only, no t-digest.
+///
+/// The scaler-params scans (min-max, standardization) read exactly these four
+/// statistics and nothing else, and the digest they would otherwise feed costs
+/// ~8x the moments themselves. Mirrors `process_cell_lite`'s classification
+/// exactly — same trim, same int-then-float parse order — so the moments it
+/// produces are bit-identical to what a lite scan would have reported.
+#[inline(always)]
+pub fn process_cell_moments(bytes: &[u8], stats: &mut ColStats) {
+    stats.count += 1;
+    let trimmed = trim_bytes(bytes);
+
+    if trimmed.is_empty() {
+        stats.null_count += 1;
+        return;
+    }
+
+    if is_integer_bytes(trimmed) {
+        if let Ok(i) = atoi_simd::parse::<i64>(trimmed) {
+            stats.num.push_moments(i as f64);
+            return;
+        }
+    }
+
+    if let Ok(val) = fast_float::parse::<f64, _>(trimmed) {
+        stats.num.push_moments(val);
+    }
 }
