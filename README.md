@@ -499,15 +499,38 @@ Everything CI enforces, runnable locally:
 |---------|------|
 | `cargo fmt --all -- --check` | Rust formatting |
 | `cargo clippy --all-targets -- -D warnings` | Rust lints, warnings are errors |
+| `cargo test` | Rust unit tests for the parser and statistics internals |
 | `ruff check . && ruff format --check .` | Python lints and formatting |
 | `mypy src/grizzly benches` | Type checking |
-| `pytest tests` | Test suite |
+| `pytest tests` | Python test suite |
 | `python -m benches.bench --strict` | Benchmarks + cross-library equivalence |
 | `python -m benches.render --check` | README numbers match `results.json` |
 
-The test suite runs twice in CI, once without the optional dependencies
-(numpy, pandas, pyarrow) and once with, because `normalize()` changes behaviour
-depending on what is installed.
+### How the tests are layered
+
+| Layer | Where | What it catches |
+|-------|-------|-----------------|
+| Rust unit tests | [`src/tests.rs`](src/tests.rs) | Internals in isolation, especially that per-chunk merges equal a single pass. A wrong merge yields plausible but incorrect statistics. |
+| Differential | [`tests/test_differential.py`](tests/test_differential.py) | Disagreement with pandas, polars, and a closed-form NumPy least-squares solution. Found the train/test split bug. |
+| Property-based | [`tests/test_schema_properties.py`](tests/test_schema_properties.py) | Invariants over Hypothesis-generated nested data, plus native-vs-fallback agreement. Found the path-detection bug. |
+| Accuracy | [`tests/test_quantile_accuracy.py`](tests/test_quantile_accuracy.py) | Quantile error drifting beyond its measured bounds. |
+| Fuzzing | [`fuzz/`](fuzz/) | Panics, out-of-bounds reads, and broken chunk partitioning on arbitrary bytes. |
+| Crash regression | [`tests/test_deep_nesting.py`](tests/test_deep_nesting.py) | The stack overflow that used to kill the interpreter. Runs in a subprocess. |
+
+The Python suite runs twice in CI, once without the optional dependencies and
+once with, because `normalize()` changes behaviour depending on what is
+installed and because the differential and property suites skip themselves
+when their reference libraries are missing.
+
+Two suites need a non-default build:
+
+```bash
+# Panic propagation: requires the `testing` feature, which exposes _force_panic
+maturin develop --release --features testing && pytest tests/test_panic_propagation.py
+
+# Fuzzing: requires nightly and cargo-fuzz
+cargo +nightly fuzz run parse_csv fuzz/corpus/parse_csv fuzz/seeds/parse_csv -- -max_total_time=60
+```
 
 ### Project status
 

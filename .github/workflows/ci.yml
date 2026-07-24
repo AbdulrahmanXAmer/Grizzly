@@ -181,10 +181,51 @@ jobs:
       - name: Run tests
         run: python -m pytest tests -v
 
+      # The differential and property suites need their reference libraries and
+      # Hypothesis. Without them those tests skip rather than fail, which would
+      # quietly reduce this job to the smoke tests.
       - name: Run tests with optional dependencies present
         run: |
-          python -m pip install "numpy>=2.0" "pandas>=2.2" "pyarrow>=15.0"
+          python -m pip install "numpy>=2.0" "pandas>=2.2" "pyarrow>=15.0" "polars>=1.0" "hypothesis>=6.100"
           python -m pytest tests -v
+
+  # Panic propagation can only be exercised when the crate exposes the
+  # `testing`-gated _force_panic hook. Nothing else builds with that feature, so
+  # without this job those tests would skip on every run and the guarantee that
+  # a Rust panic reaches Python as a catchable exception would go unverified.
+  panic-propagation:
+    name: Rust panics surface as Python exceptions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install tooling
+        run: |
+          python -m pip install -U pip
+          python -m pip install maturin==1.14.1 pytest==9.1.1
+
+      - name: Build with the testing feature
+        run: maturin develop --release --features testing
+
+      # The tests skip themselves when _force_panic is absent, so a green run
+      # here would otherwise prove nothing. Fail if anything skipped: that
+      # means the feature flag did not reach the build.
+      - name: Verify panics unwind into PanicException
+        run: |
+          python -m pytest tests/test_panic_propagation.py -v | tee result.txt
+          if grep -qi skipped result.txt; then
+            echo "::error::panic propagation tests skipped; the testing feature did not take effect"
+            exit 1
+          fi
 
   # Confirms the benchmark suite still runs and that Grizzly still agrees with
   # pandas and polars. Deliberately tiny: this gate is about correctness of the
