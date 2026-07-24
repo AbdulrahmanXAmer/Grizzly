@@ -513,8 +513,23 @@ depending on what is installed.
 
 Alpha. Specific things worth knowing before depending on it:
 
-- **Quantiles are approximate.** Percentiles come from a t-digest. The
-  approximation error is not yet quantified; `min`, `max`, and `mean` are exact.
+- **Quantiles are approximate**, and measurably so. Percentiles come from a
+  t-digest; `min`, `max`, `mean`, and `std` are exact. Measured by
+  [`tests/test_quantile_accuracy.py`](tests/test_quantile_accuracy.py):
+
+  | Metric | Worst measured | What it means |
+  |--------|---------------:|---------------|
+  | Rank error | **0.16%** | The returned value sits within 0.16 percentage points of the requested quantile's true position. This is the guarantee a t-digest actually makes. |
+  | Value error (smooth data) | **0.21% of range** | How far the number itself is from the exact quantile. |
+  | Value error (zero-inflated) | **7.8% of range** | Not bounded by the algorithm. See below. |
+
+  The last row is the case to know about. If a column is mostly one value --
+  95% zeros, say, which is normal for counts, spend, and sparse features --
+  then a quantile landing on the jump is *rank-correct but far from the exact
+  value*. For that column the p95 came back as 83.0 where the exact answer was
+  5.0, while its rank was exactly right. If you threshold outliers on p95/p99
+  of a zero-inflated column, compute those exactly rather than from the
+  profile.
 - **`std` is a population standard deviation**, where pandas and polars default
   to the sample standard deviation (`ddof=1`).
 - **`fast_csv=True` assumes no quoted newlines.** Pass `fast_csv=False` for
