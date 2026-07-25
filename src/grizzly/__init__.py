@@ -3,9 +3,12 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
 from importlib.metadata import version as _version
 
-from . import drift
+from . import drift, models
 from .api import (
+    csv_classification_metrics,
+    csv_gaussian_nb,
     csv_linear_regression,
+    csv_logistic_regression,
     csv_minmax_params,
     csv_profile,
     csv_sgd_regression,
@@ -19,6 +22,7 @@ from .api import (
     native_module,
 )
 from .drift import compare_profiles, detect_drift, load_reference, save_reference
+from .models import load_model, predict, save_model
 from .grizzly import Grizzly, MinMaxScaler
 from .ml import LinearRegression, RidgeRegression
 from .normalize import normalize
@@ -37,6 +41,13 @@ __all__ = [
     "csv_transform_standardize",
     "csv_linear_regression",
     "csv_sgd_regression",
+    "csv_logistic_regression",
+    "csv_gaussian_nb",
+    "csv_classification_metrics",
+    "models",
+    "save_model",
+    "load_model",
+    "predict",
     "drift",
     "detect_drift",
     "compare_profiles",

@@ -869,3 +869,236 @@ fn splitmix64_is_deterministic_and_mixes_adjacent_inputs() {
     assert_ne!(a, b);
     assert!(a.abs_diff(b) > 1_000_000, "adjacent seeds barely differed");
 }
+
+// ---------------------------------------------------------------------------
+// classification: loss and metrics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sigmoid_is_stable_at_the_extremes() {
+    // The naive 1/(1+exp(-z)) overflows to inf around z = -750 and returns NaN.
+    // An early SGD iterate reaches logits this large routinely.
+    assert!(sigmoid(-1000.0).is_finite());
+    assert!(sigmoid(1000.0).is_finite());
+    assert_close(sigmoid(-1000.0), 0.0, 1e-12, "sigmoid(-1000)");
+    assert_close(sigmoid(1000.0), 1.0, 1e-12, "sigmoid(1000)");
+    assert_close(sigmoid(0.0), 0.5, 1e-15, "sigmoid(0)");
+
+    // Symmetry: s(-z) == 1 - s(z), which the branched implementation must not
+    // break at the sign boundary it branches on.
+    for z in [0.5, 1.0, 7.5, 40.0] {
+        assert_close(sigmoid(-z), 1.0 - sigmoid(z), 1e-12, "sigmoid symmetry");
+    }
+}
+
+#[test]
+fn logistic_loss_matches_the_definition_and_stays_finite() {
+    // -[y log s(z) + (1-y) log(1-s(z))], computed the naive way for reference.
+    let naive = |z: f64, y: f64| -> f64 {
+        let s = 1.0 / (1.0 + (-z).exp());
+        -(y * s.ln() + (1.0 - y) * (1.0 - s).ln())
+    };
+    for z in [-3.0, -0.5, 0.0, 0.5, 3.0, 12.0] {
+        for y in [0.0, 1.0] {
+            assert_close(Loss::Logistic.loss(z, y), naive(z, y), 1e-9, "log-loss");
+        }
+    }
+
+    // Where the naive form dies, the stable one must not. A confidently wrong
+    // prediction has a large finite loss, not an infinite one.
+    let wrong = Loss::Logistic.loss(-800.0, 1.0);
+    assert!(wrong.is_finite(), "log-loss went infinite: {wrong}");
+    assert_close(wrong, 800.0, 1e-6, "loss of a confidently wrong prediction");
+    assert!(naive(-800.0, 1.0).is_infinite(), "naive form was expected to overflow");
+}
+
+#[test]
+fn logistic_residual_is_the_probability_error() {
+    // The gradient scalar for log-loss is exactly s(z) - y. If this drifts, the
+    // classifier trains on the wrong gradient and still returns a plausible
+    // model, which no smoke test would catch.
+    for z in [-2.0, 0.0, 1.5] {
+        for y in [0.0, 1.0] {
+            assert_close(
+                Loss::Logistic.residual(z, y),
+                sigmoid(z) - y,
+                1e-15,
+                "logistic residual",
+            );
+        }
+    }
+    // Squared loss is unchanged by the refactor that introduced Loss.
+    assert_close(Loss::Squared.residual(3.0, 1.0), 2.0, 1e-15, "squared residual");
+}
+
+/// Exact ROC-AUC by definition: every positive/negative pair, ties count half.
+///
+/// O(n^2) and only used to check the binned estimate on small inputs.
+fn auc_by_pairs(scored: &[(f64, f64)]) -> f64 {
+    let pos: Vec<f64> = scored.iter().filter(|(_, y)| *y > 0.5).map(|(s, _)| *s).collect();
+    let neg: Vec<f64> = scored.iter().filter(|(_, y)| *y <= 0.5).map(|(s, _)| *s).collect();
+    let mut wins = 0.0;
+    for p in &pos {
+        for n in &neg {
+            wins += if p > n {
+                1.0
+            } else if (p - n).abs() < 1e-12 {
+                0.5
+            } else {
+                0.0
+            };
+        }
+    }
+    wins / (pos.len() * neg.len()) as f64
+}
+
+fn eval_of(scored: &[(f64, f64)]) -> ClassificationMetrics {
+    let mut ev = BinaryEval::default();
+    for &(s, y) in scored {
+        ev.push(s, y);
+    }
+    ev.finish()
+}
+
+#[test]
+fn roc_auc_matches_the_pairwise_definition() {
+    // The textbook worked example; sklearn returns 0.75 for this input.
+    let scored = [(0.1, 0.0), (0.4, 0.0), (0.35, 1.0), (0.8, 1.0)];
+    assert_close(auc_by_pairs(&scored), 0.75, 1e-12, "reference AUC");
+    assert_close(eval_of(&scored).roc_auc, 0.75, 1e-3, "binned AUC");
+}
+
+#[test]
+fn roc_auc_handles_separation_ties_and_inversion() {
+    // Perfectly separated.
+    let perfect = [(0.9, 1.0), (0.95, 1.0), (0.1, 0.0), (0.2, 0.0)];
+    assert_close(eval_of(&perfect).roc_auc, 1.0, 1e-9, "perfect separation");
+
+    // Exactly inverted: the model is perfectly wrong, which is 0.0, not 0.5.
+    let inverted = [(0.1, 1.0), (0.2, 1.0), (0.9, 0.0), (0.95, 0.0)];
+    assert_close(eval_of(&inverted).roc_auc, 0.0, 1e-9, "inverted ranking");
+
+    // All scores identical: no discrimination at all. This is the case the
+    // 0.5-credit-for-ties rule exists for; without it the answer would be 0 or 1
+    // depending on which way the comparison happened to fall.
+    let tied = [(0.5, 1.0), (0.5, 0.0), (0.5, 1.0), (0.5, 0.0)];
+    assert_close(eval_of(&tied).roc_auc, 0.5, 1e-9, "all ties");
+}
+
+#[test]
+fn roc_auc_is_defined_when_only_one_class_is_present() {
+    // AUC needs both classes. A tiny or badly stratified test split can contain
+    // one, and that must not produce NaN or a division by zero.
+    let all_positive = [(0.3, 1.0), (0.7, 1.0)];
+    assert_close(eval_of(&all_positive).roc_auc, 0.5, 1e-9, "single class");
+
+    let empty = BinaryEval::default().finish();
+    assert_close(empty.roc_auc, 0.5, 1e-9, "no rows at all");
+    assert!(empty.accuracy.is_finite() && empty.log_loss.is_finite());
+}
+
+#[test]
+fn binned_auc_tracks_the_exact_value_on_many_distinct_scores() {
+    // Binning is an approximation; this pins how good it has to be. Scores are
+    // spread across the whole [0,1] range with a deliberate class overlap, so
+    // the answer is neither 0 nor 1 and bin boundaries actually matter.
+    let scored: Vec<(f64, f64)> = (0..2000)
+        .map(|i| {
+            let s = i as f64 / 2000.0;
+            let y = if (i * 7 + 3) % 11 < 5 { 1.0 } else { 0.0 };
+            (s, y)
+        })
+        .collect();
+    let exact = auc_by_pairs(&scored);
+    let binned = eval_of(&scored).roc_auc;
+    assert!(exact > 0.05 && exact < 0.95, "degenerate reference AUC {exact}");
+    assert_close(binned, exact, 1e-3, "binned vs exact AUC");
+}
+
+#[test]
+fn confusion_matrix_and_accuracy_use_a_half_threshold() {
+    // 0.5 is the decision boundary, inclusive on the positive side.
+    let scored = [
+        (0.9, 1.0), // tp
+        (0.5, 1.0), // tp -- exactly at the threshold
+        (0.8, 0.0), // fp
+        (0.2, 0.0), // tn
+        (0.1, 0.0), // tn
+        (0.4, 1.0), // fn
+    ];
+    let m = eval_of(&scored);
+    assert_eq!((m.true_positives, m.false_positives), (2, 1));
+    assert_eq!((m.true_negatives, m.false_negatives), (2, 1));
+    assert_close(m.accuracy, 4.0 / 6.0, 1e-12, "accuracy");
+    assert_close(m.positive_rate, 3.0 / 6.0, 1e-12, "positive rate");
+}
+
+#[test]
+fn log_loss_is_clamped_against_saturated_probabilities() {
+    // A saturated sigmoid returning exactly 0 or 1 while being wrong would make
+    // log(0) = -inf and destroy the whole metric for every other row.
+    let m = eval_of(&[(1.0, 0.0), (0.0, 1.0)]);
+    assert!(m.log_loss.is_finite(), "log-loss went infinite: {}", m.log_loss);
+    // ~-ln(1e-15) per row, both maximally wrong. The tolerance is loose
+    // because the upper clamp does not round-trip: 1 - (1 - 1e-15) is
+    // 1.11e-15, not 1e-15, which moves that row's term in the fourth decimal.
+    assert_close(m.log_loss, -(1e-15f64).ln(), 1e-2, "clamped log-loss");
+
+    // And a confidently correct pair is near zero.
+    let good = eval_of(&[(1.0 - 1e-9, 1.0), (1e-9, 0.0)]);
+    assert!(good.log_loss < 1e-6, "log-loss of a correct fit: {}", good.log_loss);
+}
+
+// ---------------------------------------------------------------------------
+// grouped moments (Gaussian Naive Bayes machinery)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mom_matches_numstats_moments_bitwise() {
+    // `Mom` documents itself as the same arithmetic as NumStats::push_moments
+    // and NumStats::merge. This makes that claim load-bearing: if either side
+    // changes its update or merge formula, the fit's standardization and the
+    // profiler's reported moments would quietly disagree.
+    let values: Vec<f64> = (0..500)
+        .map(|i| ((i * 37 + 11) % 101) as f64 * 0.7 - 30.0)
+        .collect();
+
+    let mut ns_a = NumStats::default();
+    let mut ns_b = NumStats::default();
+    let mut mom_a = Mom::default();
+    let mut mom_b = Mom::default();
+    for (i, &v) in values.iter().enumerate() {
+        if i < 313 {
+            ns_a.push_moments(v);
+            mom_a.push(v);
+        } else {
+            ns_b.push_moments(v);
+            mom_b.push(v);
+        }
+    }
+    assert_eq!(mom_a.mean.to_bits(), ns_a.mean.to_bits());
+    assert_eq!(mom_a.m2.to_bits(), ns_a.m2.to_bits());
+
+    ns_a.merge(&mut ns_b);
+    mom_a.merge(&mom_b);
+    assert_eq!(mom_a.n, ns_a.n);
+    assert_eq!(mom_a.mean.to_bits(), ns_a.mean.to_bits());
+    assert_eq!(mom_a.m2.to_bits(), ns_a.m2.to_bits());
+}
+
+#[test]
+fn mom_population_variance_matches_the_definition() {
+    let values = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+    let mut m = Mom::default();
+    for v in values {
+        m.push(v);
+    }
+    // Textbook example: mean 5, population variance 4.
+    assert_close(m.mean, 5.0, 1e-12, "mean");
+    assert_close(m.var_pop(), 4.0, 1e-12, "population variance");
+
+    // Merging in an empty accumulator changes nothing, bitwise.
+    let before = (m.mean.to_bits(), m.m2.to_bits(), m.n);
+    m.merge(&Mom::default());
+    assert_eq!(before, (m.mean.to_bits(), m.m2.to_bits(), m.n));
+}

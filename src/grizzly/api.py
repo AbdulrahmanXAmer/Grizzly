@@ -243,8 +243,9 @@ def csv_sgd_regression(
     memory and O(n p^2) time; this holds only the weight vector, so memory is
     O(p) and each epoch is O(n p). It never builds a design matrix.
 
-    Features are standardized on the fly from a prior profiling pass, because a
-    single global learning rate cannot suit features on very different scales.
+    Features are standardized on the fly, from moments computed in the same
+    parallel pass that reads the data, because a single global learning rate
+    cannot suit features on very different scales.
     Coefficients are returned in the original feature space, so they are
     directly comparable with the closed-form solver's.
 
@@ -263,13 +264,15 @@ def csv_sgd_regression(
     a property of z-score scaling rather than of SGD; winsorize such columns
     before fitting.
 
-    `cache_budget_mb` trades memory for epoch speed. Parsing is most of an
-    epoch's cost, so when the standardized training matrix fits under the
-    budget, epoch 0 fills a cache while it streams and later epochs replay
-    from memory — parse once, train N times. The fitted weights are
-    bit-identical either way, because replay feeds the exact values streaming
-    would have recomputed through the same update. Set 0 to always stream;
-    over-budget data falls back to streaming on its own.
+    `cache_budget_mb` trades memory for speed. Parsing is most of the cost of
+    a fit, and it otherwise happens once per epoch plus once for evaluation;
+    when the standardized matrix fits under the budget, the file is parsed
+    exactly once instead — in parallel, into a cache that every epoch and the
+    evaluation pass then replay from memory. The fitted weights are
+    bit-identical either way, because the fill computes the exact values
+    streaming would have recomputed, in the same per-row order, through the
+    same update. Set 0 to always stream in O(p) memory; over-budget data
+    falls back to streaming on its own.
 
     Returns a dict with `coef`, `intercept`, `r2` (test set), `train_n`,
     `test_n`, `epochs`, and `final_train_mse`.
@@ -298,6 +301,223 @@ def csv_sgd_regression(
         shuffle=shuffle,
         grad_clip=grad_clip,
         cache_budget_mb=cache_budget_mb,
+    )
+
+
+def csv_logistic_regression(
+    path: str,
+    *,
+    target: str,
+    features: list[str] | None = None,
+    epochs: int = 5,
+    learning_rate: float = 0.05,
+    l2: float = 0.0,
+    train_frac: float = 0.8,
+    seed: int = 0,
+    sample_size: int = 1_000_000,
+    delimiter: str | None = None,
+    has_header: bool | None = None,
+    shuffle: bool = True,
+    grad_clip: float = 10.0,
+    cache_budget_mb: int = 512,
+    class_weight: str | dict[int, float] | list[float] | tuple[float, float] | None = None,
+) -> dict[str, Any]:
+    """Fit a binary logistic classifier by SGD, streaming from CSV.
+
+    The classification counterpart to :func:`csv_sgd_regression`, sharing all of
+    its machinery -- on-the-fly standardization, the deterministic split, the
+    cached-replay optimisation, gradient clipping -- with log-loss in place of
+    squared error. Memory is O(p) in the feature count, independent of rows.
+
+    The target column must contain only 0 and 1. A parseable label outside that
+    set raises rather than being coerced, because a classifier quietly trained
+    on labels of 2 and 7 returns a plausible-looking model that means nothing.
+
+    `coef` and `intercept` are returned in the original feature space and
+    parameterise a logit: ``p = sigmoid(intercept + coef . x)``. They are
+    directly comparable with scikit-learn's
+    ``LogisticRegression(penalty=None)``.
+
+    See :func:`csv_sgd_regression` for `grad_clip`, `cache_budget_mb`, and the
+    row-order caveat, which behave identically here.
+
+    `class_weight` rebalances training on skewed labels, as scikit-learn's
+    parameter of the same name does: ``"balanced"`` weighs each class
+    inversely to its train-split frequency, or pass explicit weights as
+    ``{0: w0, 1: w1}`` or ``[w0, w1]``. Weighting changes the training
+    objective only — held-out metrics stay unweighted, so the usual trade
+    (accuracy down, minority-class recall up) is visible in the confusion
+    matrix rather than averaged away.
+
+    Returns a dict with `coef`, `intercept`, `train_n`, `test_n`, `epochs`,
+    `final_train_loss` (mean training log-loss), and held-out `accuracy`,
+    `log_loss`, `roc_auc`, `positive_rate`, and `confusion_matrix` (a dict of
+    `tp`/`fp`/`tn`/`fn`). `r2` is present for symmetry with the regression
+    path but means little for a classifier.
+
+    ROC-AUC is computed from a 4096-bin histogram of the held-out scores rather
+    than by sorting them, which keeps evaluation within the same bounded memory
+    as the fit; it agrees with scikit-learn to about 1e-3.
+
+    Raises:
+        ValueError: if the target contains a label outside {0, 1}, or if the
+            fit diverges, which usually means `learning_rate` is too high.
+    """
+    native = _load_native()
+    if native is None:
+        raise RuntimeError(
+            "csv_logistic_regression requires the native Rust extension; "
+            "build with `maturin develop`."
+        )
+
+    balanced = False
+    weights: list[float] | None = None
+    if class_weight is not None:
+        if class_weight == "balanced":
+            balanced = True
+        elif isinstance(class_weight, str):
+            raise ValueError(
+                f"class_weight must be 'balanced', a mapping, or a pair; got {class_weight!r}"
+            )
+        elif isinstance(class_weight, dict):
+            try:
+                weights = [float(class_weight[0]), float(class_weight[1])]
+            except KeyError as exc:
+                raise ValueError("class_weight dict must have keys 0 and 1") from exc
+        else:
+            weights = [float(v) for v in class_weight]
+
+    return native.csv_logistic_regression(
+        path,
+        target=target,
+        features=features,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        l2=l2,
+        train_frac=train_frac,
+        seed=seed,
+        sample_size=sample_size,
+        delimiter=delimiter,
+        has_header=has_header,
+        shuffle=shuffle,
+        grad_clip=grad_clip,
+        cache_budget_mb=cache_budget_mb,
+        class_weight=weights,
+        class_weight_balanced=balanced,
+    )
+
+
+def csv_gaussian_nb(
+    path: str,
+    *,
+    target: str,
+    features: list[str] | None = None,
+    train_frac: float = 0.8,
+    seed: int = 0,
+    sample_size: int = 1_000_000,
+    delimiter: str | None = None,
+    has_header: bool | None = None,
+    shuffle: bool = True,
+    var_smoothing: float = 1e-9,
+    priors: list[float] | tuple[float, float] | None = None,
+) -> dict[str, Any]:
+    """Fit a binary Gaussian Naive Bayes classifier from CSV.
+
+    Naive Bayes is the model whose fitted parameters *are* summary statistics:
+    a class prior and a per-(class, feature) mean and variance. Training is one
+    chunk-parallel grouped-moments pass over the file and evaluation a second,
+    so there are no epochs, no learning rate, and no cache — memory is
+    O(classes × features) regardless of file size, at full parallel speed.
+    This is the strongest bounded-memory guarantee of any model here: even
+    `cache_budget_mb` does not exist because nothing needs caching.
+
+    The target column must contain only 0 and 1, as for
+    :func:`csv_logistic_regression`; a parseable label outside that set raises.
+
+    `var_smoothing` matches scikit-learn's ``GaussianNB`` exactly — the largest
+    per-feature variance of the pooled training data, times this factor, is
+    added to every class variance so a constant feature cannot inject a
+    division by zero.
+
+    `priors` overrides the class priors learned from the train split, as
+    scikit-learn's ``GaussianNB(priors=...)`` does: two non-negative values
+    summing to 1. Use it when the file's class balance is not the deployment
+    class balance — likelihoods stay learned, only the prior belief changes.
+
+    Returns a dict with `priors`, `theta` (per-class means), `var` (per-class
+    smoothed variances) — directly comparable with scikit-learn's ``theta_``
+    and ``var_`` — plus `class_counts`, `train_n`, `test_n`, and held-out
+    `accuracy`, `log_loss`, `roc_auc`, `positive_rate`, and
+    `confusion_matrix`.
+
+    Raises:
+        ValueError: if the target contains a parseable label outside {0, 1}.
+    """
+    native = _load_native()
+    if native is None:
+        raise RuntimeError(
+            "csv_gaussian_nb requires the native Rust extension; "
+            "build with `maturin develop`."
+        )
+    return native.csv_gaussian_nb(
+        path,
+        target=target,
+        features=features,
+        train_frac=train_frac,
+        seed=seed,
+        sample_size=sample_size,
+        delimiter=delimiter,
+        has_header=has_header,
+        shuffle=shuffle,
+        var_smoothing=var_smoothing,
+        priors=[float(v) for v in priors] if priors is not None else None,
+    )
+
+
+def csv_classification_metrics(
+    path: str,
+    *,
+    label: str,
+    score: str,
+    sample_size: int = 1_000_000,
+    delimiter: str | None = None,
+    has_header: bool | None = None,
+) -> dict[str, Any]:
+    """Score a predictions file: labels and probabilities in, metrics out.
+
+    The fits report metrics on their own held-out split; this covers everything
+    else — a model trained elsewhere, an older grizzly model reapplied, a
+    vendor's scores — where the predictions already exist as two CSV columns
+    and the question is how good they are. One chunk-parallel pass in O(1)
+    memory per row, same accumulator the fits use, so the numbers are
+    directly comparable with theirs.
+
+    `label` must contain only 0 and 1 where parseable; a parseable value
+    outside that set raises. Rows where either column is missing, unparseable,
+    or the score is not finite are skipped and counted in `n_skipped` — never
+    silently dropped. ROC-AUC uses the same 4096-bin streaming estimate as the
+    fits (agrees with scikit-learn to ~1e-3); accuracy and log-loss are exact.
+
+    Returns a dict with `n`, `n_skipped`, `accuracy`, `log_loss`, `roc_auc`,
+    `positive_rate`, and `confusion_matrix`.
+
+    Raises:
+        ValueError: if the label column contains a parseable value outside
+            {0, 1}, or a named column does not exist.
+    """
+    native = _load_native()
+    if native is None:
+        raise RuntimeError(
+            "csv_classification_metrics requires the native Rust extension; "
+            "build with `maturin develop`."
+        )
+    return native.csv_classification_metrics(
+        path,
+        label=label,
+        score=score,
+        sample_size=sample_size,
+        delimiter=delimiter,
+        has_header=has_header,
     )
 
 

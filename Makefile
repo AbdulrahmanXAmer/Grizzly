@@ -82,6 +82,10 @@ bench:  ## Run the benchmark suite (host — noisy, see docker-bench)
 bench-fit:  ## Run the model-fitting benchmark (host)
 	$(PYTHON) -m benches.bench_fit --strict
 
+.PHONY: bench-classify
+bench-classify:  ## Run the classification benchmark (host)
+	$(PYTHON) -m benches.bench_classify --strict
+
 .PHONY: study
 study:  ## Run the sampling accuracy-vs-speed study
 	$(PYTHON) -m benches.study_sampling
@@ -138,6 +142,14 @@ docker-bench-fit: docker-build  ## Run the fit benchmark in the container
 	  python -m benches.bench_fit --strict --out $(DATA_DIR)/container-fit.json
 	@echo
 	@echo "To publish: cp $(DATA_DIR)/container-fit.json benches/results/fit_results.json && make render"
+
+.PHONY: docker-bench-classify
+docker-bench-classify: docker-build  ## Run the classification benchmark in the container
+	@mkdir -p $(DATA_DIR)
+	$(DOCKER_RUN_PINNED) $(IMAGE) \
+	  python -m benches.bench_classify --strict --out $(DATA_DIR)/container-classify.json
+	@echo
+	@echo "To publish: cp $(DATA_DIR)/container-classify.json benches/results/classify_results.json && make render"
 
 .PHONY: docker-study
 docker-study: docker-build  ## Run the sampling study in the container

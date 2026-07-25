@@ -1,0 +1,2453 @@
+//! Model fitting: linear regression, and the shared machinery every model
+//! after it reuses.
+//!
+//! Unlike `parse` and `stats`, this module does depend on PyO3 — these are the
+//! `#[pyfunction]` entry points. It is separated anyway because it is where
+//! every additional model goes, and lib.rs had already grown past the point
+//! where adding one more was reasonable.
+//!
+//! Three pieces here are load-bearing for anything added later:
+//!
+//! * [`sgd_step`] — the per-sample update. Shared verbatim by the streaming
+//!   and cached-replay paths so the two cannot drift; new losses plug in here.
+//! * The XtX accumulation in [`csv_linear_regression`] — chunk-parallel
+//!   sufficient statistics with prefix-summed row indices, folded in chunk
+//!   order for determinism. Any model that fits by accumulating a fixed-size
+//!   statistic over rows reuses this shape.
+//! * [`csv_layout`] and the split/mask machinery — deterministic train/test
+//!   assignment that every fit and eval pass agrees on.
+
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+
+use csv::ReaderBuilder;
+use memchr::memchr;
+use rayon::prelude::*;
+
+use crate::parse::{
+    chunk_bytes_aligned, detect_header_smart, for_each_field, get_fields, sniff_delimiter_simd,
+    trim_bytes, FastLineIter, SplitMode,
+};
+use crate::load_file_data;
+
+/// Result of fitting a linear model, before conversion into a Python dict:
+/// (feature names, coefficients, intercept, train rows, test rows used, r2,
+/// test rows assigned, residual sum of squares, total sum of squares, mean y).
+///
+/// TODO: this tuple is load-bearing across a long function and should become a
+/// named struct; the alias documents the positions in the meantime.
+pub type RegressionFit = (
+    Vec<String>,
+    Vec<f64>,
+    f64,
+    usize,
+    usize,
+    f64,
+    usize,
+    f64,
+    f64,
+    f64,
+);
+
+/// Where the data starts and what the columns are called.
+///
+/// Shared setup for anything that streams a CSV: delimiter, header presence,
+/// column names, and the byte offset of the first data row.
+pub struct CsvLayout {
+    pub split_mode: SplitMode,
+    pub col_names: Vec<String>,
+    pub data_start: usize,
+}
+
+pub fn csv_layout(
+    bytes: &[u8],
+    delimiter: Option<u8>,
+    has_header: Option<bool>,
+) -> Result<CsvLayout, String> {
+    if bytes.is_empty() {
+        return Err("Empty file".to_string());
+    }
+    let first_newline = memchr(b'\n', bytes).unwrap_or(bytes.len());
+    let first_line = &bytes[..first_newline];
+
+    let split_mode = match delimiter {
+        Some(d) => SplitMode::Delim(d),
+        None => match sniff_delimiter_simd(first_line) {
+            Some(d) => SplitMode::Delim(d),
+            None => SplitMode::Whitespace,
+        },
+    };
+    let delim_for_detection = match split_mode {
+        SplitMode::Delim(d) => d,
+        SplitMode::Whitespace => b' ',
+    };
+    let has_header_actual =
+        has_header.unwrap_or_else(|| detect_header_smart(bytes, delim_for_detection, 5));
+
+    let first_line_clean = if first_line.ends_with(b"\r") {
+        &first_line[..first_line.len() - 1]
+    } else {
+        first_line
+    };
+    let first_fields = get_fields(first_line_clean, split_mode);
+    if first_fields.is_empty() {
+        return Err("No columns detected in CSV".to_string());
+    }
+
+    let col_names: Vec<String> = if has_header_actual {
+        first_fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let t = trim_bytes(f);
+                if t.is_empty() {
+                    format!("col_{i}")
+                } else {
+                    String::from_utf8_lossy(t).into_owned()
+                }
+            })
+            .collect()
+    } else {
+        (0..first_fields.len())
+            .map(|i| format!("col_{i}"))
+            .collect()
+    };
+
+    let data_start = if has_header_actual {
+        first_newline + 1
+    } else {
+        0
+    };
+
+    Ok(CsvLayout {
+        split_mode,
+        col_names,
+        data_start,
+    })
+}
+
+/// Outcome of a streaming SGD fit, before conversion into a Python dict.
+///
+/// A struct rather than the ten-element tuple this used to be: classification
+/// adds five more fields, and positional access was already the wrong shape.
+pub struct SgdOutcome {
+    pub feature_names: Vec<String>,
+    pub coef: Vec<f64>,
+    pub intercept: f64,
+    pub train_n: usize,
+    pub test_n: usize,
+    pub epochs: usize,
+    /// Mean per-sample value of the objective on the final training epoch.
+    pub final_train_loss: f64,
+    /// Held-out R^2. Meaningful for regression losses only.
+    pub r2: f64,
+    /// Present when the loss is a classification objective.
+    pub classification: Option<ClassificationMetrics>,
+}
+
+/// Held-out classification metrics.
+pub struct ClassificationMetrics {
+    pub accuracy: f64,
+    pub log_loss: f64,
+    pub roc_auc: f64,
+    pub true_positives: u64,
+    pub false_positives: u64,
+    pub true_negatives: u64,
+    pub false_negatives: u64,
+    pub positive_rate: f64,
+}
+
+/// Number of score bins used for the streaming ROC-AUC estimate.
+///
+/// AUC is a rank statistic, so the direct computation sorts every score --
+/// which means holding the whole test set in memory and would give up the
+/// bounded-memory property that is the point of this path. Binning the scores
+/// instead makes it O(bins): with 4096 bins over [0,1] the estimate is within
+/// ~1e-3 of exact, which the tests assert against scikit-learn.
+const AUC_BINS: usize = 4096;
+
+/// Streaming accumulator for binary classification metrics.
+///
+/// Fixed size regardless of how many rows it sees.
+pub struct BinaryEval {
+    pos_bins: Vec<u64>,
+    neg_bins: Vec<u64>,
+    correct: u64,
+    total: u64,
+    log_loss_sum: f64,
+    tp: u64,
+    fp: u64,
+    tn: u64,
+    r#fn: u64,
+}
+
+impl Default for BinaryEval {
+    fn default() -> Self {
+        Self {
+            pos_bins: vec![0; AUC_BINS],
+            neg_bins: vec![0; AUC_BINS],
+            correct: 0,
+            total: 0,
+            log_loss_sum: 0.0,
+            tp: 0,
+            fp: 0,
+            tn: 0,
+            r#fn: 0,
+        }
+    }
+}
+
+impl BinaryEval {
+    /// Record one held-out row. `score` is a probability in [0, 1].
+    pub fn push(&mut self, score: f64, label: f64) {
+        let positive = label > 0.5;
+        let predicted = score >= 0.5;
+
+        self.total += 1;
+        if predicted == positive {
+            self.correct += 1;
+        }
+        match (positive, predicted) {
+            (true, true) => self.tp += 1,
+            (false, true) => self.fp += 1,
+            (false, false) => self.tn += 1,
+            (true, false) => self.r#fn += 1,
+        }
+
+        // Clamped so a saturated probability cannot contribute -inf and
+        // destroy the whole metric; 1e-15 matches scikit-learn's eps.
+        let p = score.clamp(1e-15, 1.0 - 1e-15);
+        self.log_loss_sum -= if positive { p.ln() } else { (1.0 - p).ln() };
+
+        let bin = ((score.clamp(0.0, 1.0)) * (AUC_BINS - 1) as f64).round() as usize;
+        if positive {
+            self.pos_bins[bin] += 1;
+        } else {
+            self.neg_bins[bin] += 1;
+        }
+    }
+
+    /// Fold another accumulator in. Counts add exactly; the only floating
+    /// sum is `log_loss_sum`, so callers merging chunk partials must fold in
+    /// chunk order to keep the metric deterministic.
+    pub fn merge(&mut self, other: &BinaryEval) {
+        for (a, b) in self.pos_bins.iter_mut().zip(&other.pos_bins) {
+            *a += b;
+        }
+        for (a, b) in self.neg_bins.iter_mut().zip(&other.neg_bins) {
+            *a += b;
+        }
+        self.correct += other.correct;
+        self.total += other.total;
+        self.log_loss_sum += other.log_loss_sum;
+        self.tp += other.tp;
+        self.fp += other.fp;
+        self.tn += other.tn;
+        self.r#fn += other.r#fn;
+    }
+
+    /// Mann-Whitney U over the binned scores.
+    ///
+    /// Walking bins in ascending score order, each positive outranks every
+    /// negative in a lower bin and ties with those in its own; the 0.5 credit
+    /// for ties is what makes this agree with scikit-learn rather than
+    /// systematically over- or under-counting.
+    fn roc_auc(&self) -> f64 {
+        let n_pos: u64 = self.pos_bins.iter().sum();
+        let n_neg: u64 = self.neg_bins.iter().sum();
+        if n_pos == 0 || n_neg == 0 {
+            // Undefined with only one class present. 0.5 is the honest
+            // "no discrimination measurable" answer.
+            return 0.5;
+        }
+
+        let mut negatives_below = 0u64;
+        let mut rank_sum = 0.0f64;
+        for bin in 0..AUC_BINS {
+            let pos = self.pos_bins[bin] as f64;
+            let neg = self.neg_bins[bin] as f64;
+            if pos > 0.0 {
+                rank_sum += pos * (negatives_below as f64 + 0.5 * neg);
+            }
+            negatives_below += self.neg_bins[bin];
+        }
+        rank_sum / (n_pos as f64 * n_neg as f64)
+    }
+
+    pub fn finish(&self) -> ClassificationMetrics {
+        let total = self.total.max(1) as f64;
+        ClassificationMetrics {
+            accuracy: self.correct as f64 / total,
+            log_loss: self.log_loss_sum / total,
+            roc_auc: self.roc_auc(),
+            true_positives: self.tp,
+            false_positives: self.fp,
+            true_negatives: self.tn,
+            false_negatives: self.r#fn,
+            positive_rate: (self.tp + self.r#fn) as f64 / total,
+        }
+    }
+}
+
+/// Streaming mean/variance accumulator: the same arithmetic as
+/// `NumStats::push_moments` / `NumStats::merge`, without the digest machinery
+/// the model paths never use.
+///
+/// This is the shared statistic under two different jobs. The SGD fit
+/// accumulates one per feature for standardization; Gaussian Naive Bayes
+/// accumulates one per (class, feature), because its fitted parameters *are*
+/// grouped moments. In both, per-chunk partials are folded in chunk order, so
+/// the result is deterministic for a given thread count.
+#[derive(Clone, Copy, Default)]
+pub struct Mom {
+    pub n: u64,
+    pub mean: f64,
+    pub m2: f64,
+}
+
+impl Mom {
+    #[inline(always)]
+    pub fn push(&mut self, x: f64) {
+        self.n += 1;
+        let delta = x - self.mean;
+        self.mean += delta / (self.n as f64);
+        self.m2 += delta * (x - self.mean);
+    }
+
+    pub fn merge(&mut self, o: &Mom) {
+        if o.n == 0 {
+            return;
+        }
+        if self.n == 0 {
+            *self = *o;
+            return;
+        }
+        let n_combined = self.n + o.n;
+        let delta = o.mean - self.mean;
+        self.mean += delta * (o.n as f64 / n_combined as f64);
+        self.m2 += o.m2 + delta * delta * (self.n as f64) * (o.n as f64) / (n_combined as f64);
+        self.n = n_combined;
+    }
+
+    /// Population variance, `m2 / n` -- the convention scikit-learn's
+    /// `GaussianNB` and `np.var` use, which the differential tests rely on.
+    pub fn var_pop(&self) -> f64 {
+        if self.n == 0 {
+            0.0
+        } else {
+            self.m2 / self.n as f64
+        }
+    }
+}
+
+/// The objective an SGD fit minimises.
+///
+/// Every one of these has the same gradient *shape* with respect to the
+/// weights -- `dL/dw_j = g * x_j` for a scalar `g` that depends only on the
+/// prediction and the label. So a single update kernel serves all of them, and
+/// adding a linear model means adding a variant here rather than another
+/// training loop -- hinge (linear SVM) and Huber both fit this shape and drop
+/// in without touching [`sgd_step`]. `residual()` returns that `g`; `loss()`
+/// returns the value being minimised, for the reported training metric.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Loss {
+    /// Ordinary least squares. Labels are real-valued.
+    Squared,
+    /// Binary logistic (log-loss). Labels must be 0 or 1; `pred` is a logit
+    /// and the reported probability is its sigmoid.
+    Logistic,
+}
+
+/// Numerically stable logistic function.
+///
+/// The naive `1/(1+exp(-z))` overflows to inf for `z` around -750 and then
+/// produces NaN. Branching on the sign keeps the exponent negative, which is
+/// the standard trick and matters here because an early SGD iterate can
+/// easily produce a logit that large before the weights settle.
+#[inline(always)]
+pub fn sigmoid(z: f64) -> f64 {
+    if z >= 0.0 {
+        1.0 / (1.0 + (-z).exp())
+    } else {
+        let e = z.exp();
+        e / (1.0 + e)
+    }
+}
+
+impl Loss {
+    /// The scalar `g` in `dL/dw_j = g * x_j`.
+    #[inline(always)]
+    pub fn residual(&self, pred: f64, y: f64) -> f64 {
+        match *self {
+            Loss::Squared => pred - y,
+            // d/dz of -[y log s(z) + (1-y) log(1-s(z))] is exactly s(z) - y,
+            // which is why logistic costs no more per row than squared.
+            Loss::Logistic => sigmoid(pred) - y,
+        }
+    }
+
+    /// The value being minimised, accumulated as the reported training metric.
+    #[inline(always)]
+    pub fn loss(&self, pred: f64, y: f64) -> f64 {
+        match *self {
+            Loss::Squared => {
+                let r = pred - y;
+                r * r
+            }
+            Loss::Logistic => {
+                // log(1 + exp(-|z|)) + max(z,0) - y*z, the stable form of
+                // -[y log s + (1-y) log(1-s)]: never takes log of an
+                // underflowed sigmoid, which would be -inf.
+                let z = pred;
+                (1.0 + (-z.abs()).exp()).ln() + z.max(0.0) - y * z
+            }
+        }
+    }
+
+    /// Whether labels are expected to be 0/1.
+    pub fn is_classification(&self) -> bool {
+        matches!(self, Loss::Logistic)
+    }
+}
+
+/// Dot product with four independent accumulators.
+///
+/// The naive loop is a strict sequential chain of floating-point adds --
+/// each one waits ~4 cycles on the previous -- which makes it the single
+/// hottest dependency in the training epoch. Splitting across four
+/// accumulators lets the CPU overlap them, at the cost of a different (but
+/// fixed and deterministic) summation order than left-to-right. Every
+/// prediction in this module -- training and evaluation, cached and streamed
+/// -- goes through this one function, which is what keeps those paths
+/// bit-identical to each other.
+#[inline(always)]
+pub fn dot(w: &[f64], x: &[f64]) -> f64 {
+    let p = w.len().min(x.len());
+    let (mut a0, mut a1, mut a2, mut a3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut j = 0;
+    while j + 4 <= p {
+        a0 += w[j] * x[j];
+        a1 += w[j + 1] * x[j + 1];
+        a2 += w[j + 2] * x[j + 2];
+        a3 += w[j + 3] * x[j + 3];
+        j += 4;
+    }
+    let mut tail = 0.0f64;
+    while j < p {
+        tail += w[j] * x[j];
+        j += 1;
+    }
+    (a0 + a2) + (a1 + a3) + tail
+}
+
+/// One SGD update, shared verbatim by the streaming and replay paths.
+///
+/// Kept as a single function so the cached-epoch replay cannot drift from the
+/// streaming arithmetic: identical inputs through identical operations is what
+/// makes the two paths bit-identical, and the tests assert exactly that. The
+/// `loss` parameter is what lets regression and classification share it:
+/// only the scalar residual differs.
+///
+/// `xx` is the row's precomputed `sum(x_j^2)`, hoisted to the caller because
+/// it is constant across epochs: the cached path computes it once at fill time
+/// instead of on every one of N epochs, and the streaming path computes it
+/// per row exactly as this function used to. `track_loss` gates the loss-value
+/// accumulation, which never feeds the weights -- only the final epoch's value
+/// is ever reported, so the other epochs need not pay the `ln` per row.
+///
+/// `weight` is the row's sample weight: it scales the gradient and the loss
+/// contribution, exactly as scikit-learn applies class weights. The clip then
+/// bounds the *weighted* gradient, so a heavily weighted outlier still cannot
+/// take an unbounded step. The reported loss divides by the weight sum, so it
+/// stays a weighted mean. An unweighted fit passes 1.0, and multiplying by
+/// 1.0 is exact -- which is why adding this parameter changed no unweighted
+/// result anywhere.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn sgd_step(
+    x: &[f64],
+    y: f64,
+    weight: f64,
+    w: &mut [f64],
+    b: &mut f64,
+    lr: f64,
+    l2: f64,
+    grad_clip: f64,
+    xx: f64,
+    loss: Loss,
+    track_loss: bool,
+    sq_err: &mut f64,
+    weight_sum: &mut f64,
+) {
+    let p = w.len();
+    let pred = *b + dot(w, x);
+    let err = weight * loss.residual(pred, y);
+    if track_loss {
+        *sq_err += weight * loss.loss(pred, y);
+    }
+    *weight_sum += weight;
+
+    // Clip the per-sample gradient. Real data has outliers that survive
+    // standardization -- a mis-metered taxi trip of 100,000 miles sits a
+    // thousand standard deviations out -- and a single such row produces a
+    // step large enough to diverge the fit. Clipping bounds any one row's
+    // influence without the caller hand-tuning the learning rate per dataset.
+    // intercept gradient is err * 1, hence the leading 1.0
+    let grad_sq = 1.0 + xx;
+    let grad_norm = err.abs() * grad_sq.sqrt();
+    let step = if grad_norm > grad_clip && grad_norm > 0.0 {
+        lr * (grad_clip / grad_norm)
+    } else {
+        lr
+    };
+
+    for j in 0..p {
+        w[j] -= step * (err * x[j] + l2 * w[j]);
+    }
+    *b -= step * err;
+}
+
+/// Fit a linear model by stochastic gradient descent, streaming from CSV.
+///
+/// The closed-form solver in `csv_linear_regression` accumulates an X'X matrix,
+/// which costs O(p^2) memory and O(n p^2) time -- fine for tens of features,
+/// hopeless for the wide sparse data typical of ad-tech or recommender
+/// training sets. This path holds only the weight vector, so memory is O(p)
+/// and each epoch is O(n p), and it never materialises a design matrix.
+///
+/// Features are standardized on the fly, using mean and standard deviation
+/// computed in the same parallel pass that reads the data. That is not
+/// cosmetic: raw features on wildly different scales make a single global
+/// learning rate either diverge on the large ones or crawl on the small ones.
+/// Coefficients are converted back to the original feature space before
+/// returning, so they are directly comparable with the closed-form solver's.
+///
+/// Rows are visited in file order within each epoch. Shuffling a stream would
+/// mean buffering it, which would give up the bounded memory that is the point
+/// of this path; data with meaningful row order should be shuffled on disk
+/// first.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (path, target, features=None, epochs=5, learning_rate=0.05, l2=0.0, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, grad_clip=10.0, cache_budget_mb=512))]
+pub fn csv_sgd_regression(
+    py: Python<'_>,
+    path: String,
+    target: String,
+    features: Option<Vec<String>>,
+    epochs: usize,
+    learning_rate: f64,
+    l2: f64,
+    train_frac: f64,
+    seed: u64,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+    shuffle: bool,
+    grad_clip: f64,
+    cache_budget_mb: usize,
+) -> PyResult<PyObject> {
+    fit_sgd(
+        py,
+        path,
+        target,
+        features,
+        epochs,
+        learning_rate,
+        l2,
+        train_frac,
+        seed,
+        sample_size,
+        delimiter,
+        has_header,
+        shuffle,
+        grad_clip,
+        cache_budget_mb,
+        Loss::Squared,
+        None,
+        false,
+    )
+}
+
+/// Fit a binary logistic classifier by SGD, streaming from CSV.
+///
+/// Identical machinery to [`csv_sgd_regression`] -- same standardization, same
+/// deterministic split, same cached-replay optimisation -- with the squared
+/// loss swapped for log-loss. The target column must contain only 0 and 1.
+///
+/// The reported metrics are the ones a classifier is actually judged on:
+/// held-out accuracy, log-loss, ROC-AUC, and the confusion matrix. R^2 is
+/// returned as well but means little here, so it is not the headline.
+///
+/// `coef` and `intercept` are in the original feature space and parameterise a
+/// logit: `p = sigmoid(intercept + coef . x)`. They are directly comparable
+/// with scikit-learn's `LogisticRegression(penalty=None)` fitted on the same
+/// data, which the differential tests assert.
+///
+/// `class_weight` scales each training row's gradient by its class's weight,
+/// exactly as scikit-learn's `class_weight` does: pass `[w0, w1]`, or set
+/// `class_weight_balanced` for weights inversely proportional to the train
+/// split's class frequencies (`n / (2 * n_c)`), computed from the same rows
+/// the fit trains on. Weighting changes the training objective only; the
+/// held-out metrics stay unweighted, which is how a rebalanced fit's real
+/// effect -- usually trading accuracy for minority-class recall -- stays
+/// visible instead of being averaged away.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (path, target, features=None, epochs=5, learning_rate=0.05, l2=0.0, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, grad_clip=10.0, cache_budget_mb=512, class_weight=None, class_weight_balanced=false))]
+pub fn csv_logistic_regression(
+    py: Python<'_>,
+    path: String,
+    target: String,
+    features: Option<Vec<String>>,
+    epochs: usize,
+    learning_rate: f64,
+    l2: f64,
+    train_frac: f64,
+    seed: u64,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+    shuffle: bool,
+    grad_clip: f64,
+    cache_budget_mb: usize,
+    class_weight: Option<Vec<f64>>,
+    class_weight_balanced: bool,
+) -> PyResult<PyObject> {
+    fit_sgd(
+        py,
+        path,
+        target,
+        features,
+        epochs,
+        learning_rate,
+        l2,
+        train_frac,
+        seed,
+        sample_size,
+        delimiter,
+        has_header,
+        shuffle,
+        grad_clip,
+        cache_budget_mb,
+        Loss::Logistic,
+        class_weight,
+        class_weight_balanced,
+    )
+}
+
+/// The shared body behind every SGD entry point.
+///
+/// Only `loss` differs between regression and classification: the streaming,
+/// splitting, standardization, caching, and divergence checks are the same
+/// code for all of them, which is the whole reason [`Loss`] exists.
+#[allow(clippy::too_many_arguments)]
+fn fit_sgd(
+    py: Python<'_>,
+    path: String,
+    target: String,
+    features: Option<Vec<String>>,
+    epochs: usize,
+    learning_rate: f64,
+    l2: f64,
+    train_frac: f64,
+    seed: u64,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+    shuffle: bool,
+    grad_clip: f64,
+    cache_budget_mb: usize,
+    loss: Loss,
+    class_weight: Option<Vec<f64>>,
+    class_weight_balanced: bool,
+) -> PyResult<PyObject> {
+    if !(0.0 < train_frac && train_frac < 1.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "train_frac must be in (0,1)",
+        ));
+    }
+    if epochs == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "epochs must be >= 1",
+        ));
+    }
+    if !(learning_rate.is_finite() && learning_rate > 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "learning_rate must be positive and finite",
+        ));
+    }
+    // Infinity is a legitimate value here: it disables clipping.
+    if grad_clip.is_nan() || grad_clip <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "grad_clip must be positive (use infinity to disable clipping)",
+        ));
+    }
+    if (class_weight.is_some() || class_weight_balanced) && !loss.is_classification() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "class weights only apply to classification",
+        ));
+    }
+    if class_weight.is_some() && class_weight_balanced {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "pass either explicit class weights or \"balanced\", not both",
+        ));
+    }
+    if let Some(cw) = &class_weight {
+        if cw.len() != 2 || cw.iter().any(|w| !(w.is_finite() && *w > 0.0)) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "class_weight must be two positive finite values [w0, w1]",
+            ));
+        }
+    }
+
+    let delim_byte = delimiter.and_then(|d| d.bytes().next());
+    let path_for_thread = path.clone();
+    let target_for_thread = target.clone();
+
+    let result = py.allow_threads(move || -> Result<SgdOutcome, String> {
+        let target = target_for_thread;
+        let file_data = load_file_data(&path_for_thread).map_err(|e| e.to_string())?;
+        let bytes = file_data.as_bytes();
+        let layout = csv_layout(bytes, delim_byte, has_header)?;
+        let col_names = &layout.col_names;
+
+        let (target_idx, feature_idx) = select_columns(col_names, &target, &features)?;
+        let p = feature_idx.len();
+
+        let data_bytes = &bytes[layout.data_start..];
+        let split_mode = layout.split_mode;
+
+        // Chunk the data once: the same newline-aligned chunks serve the row
+        // count here and the parallel cache fill below. Per-chunk counts
+        // prefix-sum into each chunk's global starting row index, which is
+        // what lets the fill run chunk-parallel while agreeing with the
+        // train/test split about which global row is which -- the same
+        // machinery the closed-form solver uses.
+        let byte_chunks: Vec<&[u8]> =
+            chunk_bytes_aligned(data_bytes, rayon::current_num_threads());
+        let chunk_rows: Vec<usize> = byte_chunks
+            .par_iter()
+            .map(|c| FastLineIter::new(c).count())
+            .collect();
+        let chunk_base: Vec<usize> = {
+            let mut bases = Vec::with_capacity(chunk_rows.len());
+            let mut acc = 0usize;
+            for &r in &chunk_rows {
+                bases.push(acc);
+                acc += r;
+            }
+            bases
+        };
+
+        // Row count, for a split defined against the data rather than the cap.
+        let counted = chunk_rows.iter().sum::<usize>().min(sample_size);
+        let n_rows = counted.max(1);
+        let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
+
+        let is_train_mask: Option<Vec<bool>> = if shuffle {
+            let mut perm: Vec<usize> = (0..n_rows).collect();
+            for i in (1..n_rows).rev() {
+                let r = splitmix64(seed ^ (i as u64));
+                let j = (r % ((i + 1) as u64)) as usize;
+                perm.swap(i, j);
+            }
+            let mut mask = vec![false; n_rows];
+            for &idx in perm.iter().take(train_cut) {
+                mask[idx] = true;
+            }
+            Some(mask)
+        } else {
+            None
+        };
+
+        let is_train = |row_idx: usize| -> bool {
+            match &is_train_mask {
+                Some(mask) => mask[row_idx],
+                None => row_idx < train_cut,
+            }
+        };
+
+        // Weights live in standardized space; O(p) total.
+        let mut w = vec![0.0f64; p];
+        let mut b = 0.0f64;
+        let mut x = vec![0.0f64; p];
+
+        let mut train_n = 0usize;
+        let mut final_mse = 0.0f64;
+
+        // Sequential parsing is the dominant cost of this fit. It used to
+        // happen up to epochs+2 times: a moments pre-pass for standardization,
+        // once per training epoch, and once for evaluation. It now happens
+        // exactly once, in parallel: a single fused pass computes per-feature
+        // Welford moments *and* (when the matrix of all rows fits under the
+        // caller's budget) writes each row's raw features, label, and a
+        // validity flag recording the same skip decisions the streaming path
+        // makes. A second parallel pass over memory standardizes the cache in
+        // place and precomputes each row's sum(x^2) -- constant across
+        // epochs, needed by the gradient clip. Every epoch is then a replay
+        // and the eval pass reads memory.
+        //
+        // Over budget, or with the budget set to 0, only the moments half of
+        // the pass runs and memory stays O(p) -- the bounded-memory behavior
+        // is the caller's to keep. Both paths take their moments from this
+        // same fused pass and compute every standardized value with the
+        // identical expression in identical per-row order, and replay visits
+        // rows in file order exactly as streaming does, so the fitted weights
+        // are bit-identical either way; the tests assert that.
+        let cache_bytes = n_rows.saturating_mul(p + 2).saturating_mul(8);
+        let use_cache =
+            cache_budget_mb > 0 && cache_bytes <= cache_budget_mb.saturating_mul(1024 * 1024);
+
+        let mut cache_x: Vec<f64> = Vec::new();
+        let mut cache_y: Vec<f64> = Vec::new();
+        let mut cache_xx: Vec<f64> = Vec::new();
+        let mut cache_valid: Vec<bool> = Vec::new();
+        if use_cache {
+            cache_x = vec![0.0f64; n_rows * p];
+            cache_y = vec![0.0f64; n_rows];
+            cache_xx = vec![0.0f64; n_rows];
+            cache_valid = vec![false; n_rows];
+        }
+
+        // Carve the flat buffers into per-chunk disjoint slices so the fill
+        // can write in parallel without locks. Each chunk owns the rows
+        // [base, base + rows_here).
+        struct CacheSlices<'a> {
+            x: &'a mut [f64],
+            y: &'a mut [f64],
+            valid: &'a mut [bool],
+        }
+        struct FillJob<'a> {
+            chunk: &'a [u8],
+            base: usize,
+            rows_here: usize,
+            cache: Option<CacheSlices<'a>>,
+        }
+        let mut jobs: Vec<FillJob> = Vec::with_capacity(byte_chunks.len());
+        {
+            let (mut xr, mut yr, mut vr) = (
+                cache_x.as_mut_slice(),
+                cache_y.as_mut_slice(),
+                cache_valid.as_mut_slice(),
+            );
+            for (ci, &chunk) in byte_chunks.iter().enumerate() {
+                let base = chunk_base[ci];
+                let rows_here = chunk_rows[ci].min(n_rows.saturating_sub(base));
+                let cache = if use_cache {
+                    let (x, x_rest) = xr.split_at_mut(rows_here * p);
+                    let (y, y_rest) = yr.split_at_mut(rows_here);
+                    let (valid, v_rest) = vr.split_at_mut(rows_here);
+                    (xr, yr, vr) = (x_rest, y_rest, v_rest);
+                    Some(CacheSlices { x, y, valid })
+                } else {
+                    None
+                };
+                jobs.push(FillJob {
+                    chunk,
+                    base,
+                    rows_here,
+                    cache,
+                });
+            }
+        }
+
+        // Each chunk also counts the usable train rows per class -- the
+        // "balanced" class weights need those counts before training starts,
+        // and this pass is the only one that runs before it.
+        let feature_idx_ref = &feature_idx;
+        let target_ref = &target;
+        let is_train_ref = &is_train;
+        let partials: Vec<(Vec<Mom>, [u64; 2])> = jobs
+            .into_par_iter()
+            .map(|mut job| -> Result<(Vec<Mom>, [u64; 2]), String> {
+                let mut moms = vec![Mom::default(); p];
+                let mut counts = [0u64; 2];
+                let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
+                for (local, line) in FastLineIter::new(job.chunk).enumerate() {
+                    if local >= job.rows_here {
+                        break;
+                    }
+                    fields.clear();
+                    for_each_field(line, split_mode, |_, f| fields.push(f));
+                    let y = if fields.len() > target_idx {
+                        parse_f64_opt(fields[target_idx])
+                    } else {
+                        None
+                    };
+                    // A classifier silently trained on labels of 2 and 7 would
+                    // return a plausible-looking model that means nothing, so
+                    // this is an error rather than a coercion. Rows with an
+                    // unparseable label are skipped like any other bad row; a
+                    // *parseable* label outside {0,1} is a mistake.
+                    if let Some(yv) = y {
+                        if loss.is_classification() && yv != 0.0 && yv != 1.0 {
+                            return Err(format!(
+                                "target column {target_ref:?} must contain only 0 and 1 \
+                                 for classification; found {yv}"
+                            ));
+                        }
+                    }
+                    // Moments take every parseable feature cell, whether or
+                    // not the row as a whole is usable -- the per-cell
+                    // semantics of the profiling pass this fused pass
+                    // replaces.
+                    let mut usable = y.is_some();
+                    match job.cache.as_mut() {
+                        Some(c) => {
+                            let xrow = &mut c.x[local * p..(local + 1) * p];
+                            for (j, &idx) in feature_idx_ref.iter().enumerate() {
+                                match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                                    Some(v) => {
+                                        moms[j].push(v);
+                                        xrow[j] = v;
+                                    }
+                                    None => usable = false,
+                                }
+                            }
+                            if usable {
+                                c.y[local] = y.unwrap_or_default();
+                                c.valid[local] = true;
+                            }
+                        }
+                        None => {
+                            for (j, &idx) in feature_idx_ref.iter().enumerate() {
+                                match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                                    Some(v) => moms[j].push(v),
+                                    None => usable = false,
+                                }
+                            }
+                        }
+                    }
+                    if usable && is_train_ref(job.base + local) {
+                        counts[usize::from(y == Some(1.0))] += 1;
+                    }
+                }
+                Ok((moms, counts))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let mut moms = vec![Mom::default(); p];
+        let mut class_counts = [0u64; 2];
+        for (cm, counts) in &partials {
+            for j in 0..p {
+                moms[j].merge(&cm[j]);
+            }
+            class_counts[0] += counts[0];
+            class_counts[1] += counts[1];
+        }
+
+        // Per-class sample weights. Balanced follows scikit-learn:
+        // n_samples / (n_classes * count_c), from the usable train rows. A
+        // class with no rows gets weight 0, which is never applied.
+        let wclass: [f64; 2] = if class_weight_balanced {
+            let total = (class_counts[0] + class_counts[1]) as f64;
+            let balanced = |c: u64| if c > 0 { total / (2.0 * c as f64) } else { 0.0 };
+            [balanced(class_counts[0]), balanced(class_counts[1])]
+        } else if let Some(cw) = &class_weight {
+            [cw[0], cw[1]]
+        } else {
+            [1.0, 1.0]
+        };
+
+        // Per-feature standardization constants. A feature with no usable
+        // spread is centred but not divided, which leaves it contributing
+        // nothing rather than producing NaN.
+        let mut mean = vec![0.0f64; p];
+        let mut scale = vec![1.0f64; p];
+        for j in 0..p {
+            if moms[j].n > 0 {
+                mean[j] = moms[j].mean;
+                let s = (moms[j].m2 / moms[j].n as f64).sqrt();
+                if s.is_finite() && s > 1e-12 {
+                    scale[j] = s;
+                }
+            }
+        }
+
+        if use_cache {
+            // Standardize the cache in place and precompute each row's
+            // sum(x^2), in parallel over memory. Rows marked invalid hold
+            // whatever was written before their bad cell was found; they are
+            // standardized too (harmlessly) and never read.
+            cache_x
+                .par_chunks_mut(p)
+                .zip(cache_xx.par_iter_mut())
+                .with_min_len(1024)
+                .for_each(|(xrow, xx)| {
+                    for j in 0..p {
+                        xrow[j] = (xrow[j] - mean[j]) / scale[j];
+                    }
+                    *xx = xrow.iter().map(|v| v * v).sum::<f64>();
+                });
+            train_n = (0..n_rows).filter(|&r| is_train(r) && cache_valid[r]).count();
+        }
+
+        let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
+
+        for epoch in 0..epochs {
+            // Decay the step size each epoch so later passes refine rather
+            // than bounce around the optimum.
+            let lr = learning_rate / (1.0 + epoch as f64);
+            let track_loss = epoch + 1 == epochs;
+            let mut sq_err = 0.0f64;
+            let mut weight_sum = 0.0f64;
+
+            if use_cache {
+                for row in 0..n_rows {
+                    if !cache_valid[row] || !is_train(row) {
+                        continue;
+                    }
+                    sgd_step(
+                        &cache_x[row * p..(row + 1) * p],
+                        cache_y[row],
+                        wclass[usize::from(cache_y[row] == 1.0)],
+                        &mut w,
+                        &mut b,
+                        lr,
+                        l2,
+                        grad_clip,
+                        cache_xx[row],
+                        loss,
+                        track_loss,
+                        &mut sq_err,
+                        &mut weight_sum,
+                    );
+                }
+            } else {
+                for (this_row, line) in FastLineIter::new(data_bytes).enumerate() {
+                    if this_row >= n_rows {
+                        break;
+                    }
+                    // Split first: nothing is needed from a test row here, so
+                    // it is not worth splitting into fields.
+                    if !is_train(this_row) {
+                        continue;
+                    }
+
+                    fields.clear();
+                    for_each_field(line, split_mode, |_, f| fields.push(f));
+                    if fields.len() <= target_idx {
+                        continue;
+                    }
+
+                    let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                        continue;
+                    };
+                    // Same error as the fill above; see the comment there.
+                    if loss.is_classification() && y != 0.0 && y != 1.0 {
+                        return Err(format!(
+                            "target column {target:?} must contain only 0 and 1 for \
+                             classification; found {y}"
+                        ));
+                    }
+                    let mut usable = true;
+                    for (j, &idx) in feature_idx.iter().enumerate() {
+                        match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                            Some(v) => x[j] = (v - mean[j]) / scale[j],
+                            None => {
+                                usable = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !usable {
+                        continue;
+                    }
+
+                    let xx = x.iter().map(|v| v * v).sum::<f64>();
+                    sgd_step(
+                        &x,
+                        y,
+                        wclass[usize::from(y == 1.0)],
+                        &mut w,
+                        &mut b,
+                        lr,
+                        l2,
+                        grad_clip,
+                        xx,
+                        loss,
+                        track_loss,
+                        &mut sq_err,
+                        &mut weight_sum,
+                    );
+
+                    if epoch == 0 {
+                        train_n += 1;
+                    }
+                }
+            }
+
+            if weight_sum > 0.0 {
+                final_mse = sq_err / weight_sum;
+            }
+            if !b.is_finite() || w.iter().any(|v| !v.is_finite()) {
+                return Err(format!(
+                    "SGD diverged at epoch {epoch}; lower learning_rate (was {learning_rate})"
+                ));
+            }
+        }
+
+        // Convert weights back to the original feature space so they can be
+        // compared with the closed-form solver:
+        //   y = b + sum_j w_j * (x_j - mean_j) / scale_j
+        //     = (b - sum_j w_j * mean_j / scale_j) + sum_j (w_j / scale_j) x_j
+        let coef: Vec<f64> = (0..p).map(|j| w[j] / scale[j]).collect();
+        let intercept = b - (0..p).map(|j| w[j] * mean[j] / scale[j]).sum::<f64>();
+
+        // Held-out evaluation. Predictions are computed in standardized space
+        // -- `b + w . x_std`, the same expression training uses -- because
+        // that is what the cache holds; algebraically it equals
+        // `intercept + coef . x_raw`, and using one form in both paths is what
+        // keeps their metrics bit-identical. Regression metrics accumulate
+        // for every loss (they cost four adds a row); classification metrics
+        // only when the objective is one.
+        let mut ss_res = 0.0f64;
+        let mut sum_y = 0.0f64;
+        let mut sum_y2 = 0.0f64;
+        let mut test_n = 0usize;
+        let mut eval = loss.is_classification().then(BinaryEval::default);
+
+        let mut score = |pred: f64, y: f64, eval: &mut Option<BinaryEval>| {
+            if let Some(ev) = eval.as_mut() {
+                // `pred` is a logit here; the metrics want a probability.
+                ev.push(sigmoid(pred), y);
+            }
+            let d = y - pred;
+            ss_res += d * d;
+            sum_y += y;
+            sum_y2 += y * y;
+            test_n += 1;
+        };
+
+        if use_cache {
+            for row in 0..n_rows {
+                if !cache_valid[row] || is_train(row) {
+                    continue;
+                }
+                let xrow = &cache_x[row * p..(row + 1) * p];
+                score(b + dot(&w, xrow), cache_y[row], &mut eval);
+            }
+        } else {
+            for (this_row, line) in FastLineIter::new(data_bytes).enumerate() {
+                if this_row >= n_rows {
+                    break;
+                }
+                if is_train(this_row) {
+                    continue;
+                }
+                fields.clear();
+                for_each_field(line, split_mode, |_, f| fields.push(f));
+                if fields.len() <= target_idx {
+                    continue;
+                }
+                let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                    continue;
+                };
+                // The fill validates every row's label; the streaming path
+                // must reject the same files, not just the ones whose bad
+                // label happened to land on the train side.
+                if loss.is_classification() && y != 0.0 && y != 1.0 {
+                    return Err(format!(
+                        "target column {target:?} must contain only 0 and 1 for \
+                         classification; found {y}"
+                    ));
+                }
+                let mut usable = true;
+                for (j, &idx) in feature_idx.iter().enumerate() {
+                    match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                        Some(v) => x[j] = (v - mean[j]) / scale[j],
+                        None => {
+                            usable = false;
+                            break;
+                        }
+                    }
+                }
+                if !usable {
+                    continue;
+                }
+                score(b + dot(&w, &x), y, &mut eval);
+            }
+        }
+
+        let r2 = if test_n > 1 {
+            let mean_y = sum_y / test_n as f64;
+            let ss_tot = sum_y2 - 2.0 * mean_y * sum_y + (test_n as f64) * mean_y * mean_y;
+            if ss_tot > 1e-12 {
+                1.0 - ss_res / ss_tot
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let feature_names: Vec<String> =
+            feature_idx.iter().map(|&i| col_names[i].clone()).collect();
+
+        Ok(SgdOutcome {
+            feature_names,
+            coef,
+            intercept,
+            train_n,
+            test_n,
+            epochs,
+            final_train_loss: final_mse,
+            r2,
+            classification: eval.map(|ev| ev.finish()),
+        })
+    });
+
+    let fit = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+    let out = PyDict::new(py);
+    // The tag `grizzly.models.save_model` / `predict` dispatch on.
+    out.set_item(
+        "model",
+        if loss.is_classification() {
+            "logistic_regression"
+        } else {
+            "sgd_regression"
+        },
+    )?;
+    out.set_item("path", path)?;
+    out.set_item("target", target)?;
+    out.set_item("features", fit.feature_names)?;
+    out.set_item("coef", fit.coef)?;
+    out.set_item("intercept", fit.intercept)?;
+    out.set_item("train_n", fit.train_n)?;
+    out.set_item("test_n", fit.test_n)?;
+    out.set_item("r2", fit.r2)?;
+    out.set_item("epochs", fit.epochs)?;
+    // Kept under its original name for the regression path, whose callers and
+    // README already reference it; for classification it is the mean log-loss,
+    // which is what `final_train_loss` says without lying about the metric.
+    out.set_item("final_train_mse", fit.final_train_loss)?;
+    out.set_item("final_train_loss", fit.final_train_loss)?;
+
+    if let Some(m) = fit.classification {
+        out.set_item("accuracy", m.accuracy)?;
+        out.set_item("log_loss", m.log_loss)?;
+        out.set_item("roc_auc", m.roc_auc)?;
+        out.set_item("positive_rate", m.positive_rate)?;
+        let cm = PyDict::new(py);
+        cm.set_item("tp", m.true_positives)?;
+        cm.set_item("fp", m.false_positives)?;
+        cm.set_item("tn", m.true_negatives)?;
+        cm.set_item("fn", m.false_negatives)?;
+        out.set_item("confusion_matrix", cm)?;
+    }
+    Ok(out.into())
+}
+
+/// Resolve the target and feature columns a fit will use.
+///
+/// Shared by every model entry point so they agree on the rules: an explicit
+/// feature list must match exactly, an omitted one means every column except
+/// the target, and an empty selection is an error rather than a degenerate
+/// fit.
+fn select_columns(
+    col_names: &[String],
+    target: &str,
+    features: &Option<Vec<String>>,
+) -> Result<(usize, Vec<usize>), String> {
+    let target_idx = col_names
+        .iter()
+        .position(|c| c == target)
+        .ok_or_else(|| format!("target column {target:?} not found"))?;
+
+    let feature_idx: Vec<usize> = match features {
+        Some(names) => names
+            .iter()
+            .map(|n| {
+                col_names
+                    .iter()
+                    .position(|c| c == n)
+                    .ok_or_else(|| format!("feature column {n:?} not found"))
+            })
+            .collect::<Result<_, _>>()?,
+        None => (0..col_names.len()).filter(|&i| i != target_idx).collect(),
+    };
+    if feature_idx.is_empty() {
+        return Err("no feature columns selected".to_string());
+    }
+    Ok((target_idx, feature_idx))
+}
+
+/// Score a predictions file: held-out labels and predicted probabilities as
+/// two CSV columns, metrics out.
+///
+/// The fits report metrics on their own held-out split; this is for everything
+/// else -- a model trained elsewhere, an older grizzly model reapplied, a
+/// vendor's scores -- where the predictions exist as a file and the question
+/// is how good they are. One chunk-parallel pass, O(1) memory in the row
+/// count, per-chunk `BinaryEval` partials folded in chunk order so the
+/// numbers are deterministic.
+///
+/// `label` must contain only 0 and 1 where parseable (anything else is an
+/// error, as for the fits). `score` is a probability; rows where either field
+/// is missing or unparseable, or where the score is not finite, are skipped
+/// and counted in `n_skipped` rather than silently dropped. Scores outside
+/// [0, 1] are clamped by the accumulator exactly as the fits' own scores are.
+#[pyfunction]
+#[pyo3(signature = (path, label, score, sample_size=1_000_000, delimiter=None, has_header=None))]
+pub fn csv_classification_metrics(
+    py: Python<'_>,
+    path: String,
+    label: String,
+    score: String,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+) -> PyResult<PyObject> {
+    let delim_byte = delimiter.and_then(|d| d.bytes().next());
+    let path_for_thread = path.clone();
+    let label_col = label.clone();
+    let score_col = score.clone();
+
+    let result = py.allow_threads(
+        move || -> Result<(ClassificationMetrics, usize, usize), String> {
+            let file_data = load_file_data(&path_for_thread).map_err(|e| e.to_string())?;
+            let bytes = file_data.as_bytes();
+            let layout = csv_layout(bytes, delim_byte, has_header)?;
+            let col_names = &layout.col_names;
+
+            let label_idx = col_names
+                .iter()
+                .position(|c| c == &label_col)
+                .ok_or_else(|| format!("label column {label_col:?} not found"))?;
+            let score_idx = col_names
+                .iter()
+                .position(|c| c == &score_col)
+                .ok_or_else(|| format!("score column {score_col:?} not found"))?;
+
+            let data_bytes = &bytes[layout.data_start..];
+            let split_mode = layout.split_mode;
+
+            let byte_chunks: Vec<&[u8]> =
+                chunk_bytes_aligned(data_bytes, rayon::current_num_threads());
+            let chunk_rows: Vec<usize> = byte_chunks
+                .par_iter()
+                .map(|c| FastLineIter::new(c).count())
+                .collect();
+            let chunk_base: Vec<usize> = {
+                let mut bases = Vec::with_capacity(chunk_rows.len());
+                let mut acc = 0usize;
+                for &r in &chunk_rows {
+                    bases.push(acc);
+                    acc += r;
+                }
+                bases
+            };
+            let n_rows = chunk_rows.iter().sum::<usize>().min(sample_size);
+
+            let label_ref = &label_col;
+            let partials: Vec<(BinaryEval, usize)> = byte_chunks
+                .par_iter()
+                .zip(chunk_base.par_iter())
+                .map(|(&chunk, &base)| -> Result<(BinaryEval, usize), String> {
+                    let mut ev = BinaryEval::default();
+                    let mut skipped = 0usize;
+                    let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
+                    for (local, line) in FastLineIter::new(chunk).enumerate() {
+                        if base + local >= n_rows {
+                            break;
+                        }
+                        fields.clear();
+                        for_each_field(line, split_mode, |_, f| fields.push(f));
+                        let y = fields.get(label_idx).and_then(|f| parse_f64_opt(f));
+                        let s = fields.get(score_idx).and_then(|f| parse_f64_opt(f));
+                        match (y, s) {
+                            (Some(y), _) if y != 0.0 && y != 1.0 => {
+                                return Err(format!(
+                                    "label column {label_ref:?} must contain only 0 and 1; \
+                                     found {y}"
+                                ));
+                            }
+                            (Some(y), Some(s)) if s.is_finite() => ev.push(s, y),
+                            _ => skipped += 1,
+                        }
+                    }
+                    Ok((ev, skipped))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+
+            let mut eval = BinaryEval::default();
+            let mut n_skipped = 0usize;
+            for (ev, skipped) in &partials {
+                eval.merge(ev);
+                n_skipped += skipped;
+            }
+            let metrics = eval.finish();
+            let n = (metrics.true_positives
+                + metrics.false_positives
+                + metrics.true_negatives
+                + metrics.false_negatives) as usize;
+            Ok((metrics, n, n_skipped))
+        },
+    );
+
+    let (m, n, n_skipped) = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+    let out = PyDict::new(py);
+    out.set_item("path", path)?;
+    out.set_item("label", label)?;
+    out.set_item("score", score)?;
+    out.set_item("n", n)?;
+    out.set_item("n_skipped", n_skipped)?;
+    out.set_item("accuracy", m.accuracy)?;
+    out.set_item("log_loss", m.log_loss)?;
+    out.set_item("roc_auc", m.roc_auc)?;
+    out.set_item("positive_rate", m.positive_rate)?;
+    let cm = PyDict::new(py);
+    cm.set_item("tp", m.true_positives)?;
+    cm.set_item("fp", m.false_positives)?;
+    cm.set_item("tn", m.true_negatives)?;
+    cm.set_item("fn", m.false_negatives)?;
+    out.set_item("confusion_matrix", cm)?;
+    Ok(out.into())
+}
+
+/// Outcome of a Gaussian Naive Bayes fit, before conversion to a Python dict.
+struct GnbOutcome {
+    feature_names: Vec<String>,
+    class_counts: [u64; 2],
+    priors: [f64; 2],
+    theta: [Vec<f64>; 2],
+    var: [Vec<f64>; 2],
+    train_n: usize,
+    test_n: usize,
+    metrics: ClassificationMetrics,
+}
+
+/// Fit a binary Gaussian Naive Bayes classifier from CSV.
+///
+/// Naive Bayes is the model whose fitted parameters *are* summary statistics:
+/// a class prior and, per (class, feature), a mean and variance. Training is
+/// therefore one chunk-parallel grouped-moments pass -- the same shape as the
+/// closed-form solver's X'X accumulation -- and evaluation is a second
+/// parallel pass that scores the held-out rows. There are no epochs, no
+/// learning rate, and no cache: memory is O(classes x features) regardless of
+/// file size, at full parallel speed. Per-chunk partials fold in chunk order,
+/// so the fit is deterministic for a given thread count.
+///
+/// The target column must contain only 0 and 1, as for
+/// [`csv_logistic_regression`].
+///
+/// `var_smoothing` matches scikit-learn's `GaussianNB` exactly: the largest
+/// per-feature variance of the *pooled* training data, times this factor, is
+/// added to every class variance. That keeps a zero-variance (constant)
+/// feature from putting a division by zero into every score. Variances are
+/// additionally floored at the smallest positive f64 so even the fully
+/// degenerate case (every feature constant, smoothing 0) stays finite.
+///
+/// Returned `theta` (per-class means) and `var` (per-class smoothed
+/// variances) are directly comparable with scikit-learn's `theta_` and
+/// `var_`, which the differential tests assert.
+///
+/// `priors` overrides the class priors learned from the train split,
+/// mirroring scikit-learn's `GaussianNB(priors=...)`: two non-negative values
+/// summing to 1. Use it when the file's class balance is not the deployment
+/// class balance -- the likelihoods stay learned, only the prior belief
+/// changes. `class_counts` still reports what was actually observed.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (path, target, features=None, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, var_smoothing=1e-9, priors=None))]
+pub fn csv_gaussian_nb(
+    py: Python<'_>,
+    path: String,
+    target: String,
+    features: Option<Vec<String>>,
+    train_frac: f64,
+    seed: u64,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+    shuffle: bool,
+    var_smoothing: f64,
+    priors: Option<Vec<f64>>,
+) -> PyResult<PyObject> {
+    if !(0.0 < train_frac && train_frac < 1.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "train_frac must be in (0,1)",
+        ));
+    }
+    if !(var_smoothing.is_finite() && var_smoothing >= 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "var_smoothing must be non-negative and finite",
+        ));
+    }
+    if let Some(pr) = &priors {
+        let valid_shape = pr.len() == 2 && pr.iter().all(|v| v.is_finite() && *v >= 0.0);
+        if !valid_shape || (pr[0] + pr[1] - 1.0).abs() > 1e-6 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "priors must be two non-negative values summing to 1",
+            ));
+        }
+    }
+
+    let delim_byte = delimiter.and_then(|d| d.bytes().next());
+    let path_for_thread = path.clone();
+    let target_for_thread = target.clone();
+
+    let result = py.allow_threads(move || -> Result<GnbOutcome, String> {
+        let target = target_for_thread;
+        let file_data = load_file_data(&path_for_thread).map_err(|e| e.to_string())?;
+        let bytes = file_data.as_bytes();
+        let layout = csv_layout(bytes, delim_byte, has_header)?;
+        let col_names = &layout.col_names;
+
+        let (target_idx, feature_idx) = select_columns(col_names, &target, &features)?;
+        let p = feature_idx.len();
+
+        let data_bytes = &bytes[layout.data_start..];
+        let split_mode = layout.split_mode;
+
+        // Same chunk / prefix-sum machinery as the other fits: each chunk
+        // knows its global starting row, so both passes agree with the split
+        // about which row is which.
+        let byte_chunks: Vec<&[u8]> =
+            chunk_bytes_aligned(data_bytes, rayon::current_num_threads());
+        let chunk_rows: Vec<usize> = byte_chunks
+            .par_iter()
+            .map(|c| FastLineIter::new(c).count())
+            .collect();
+        let chunk_base: Vec<usize> = {
+            let mut bases = Vec::with_capacity(chunk_rows.len());
+            let mut acc = 0usize;
+            for &r in &chunk_rows {
+                bases.push(acc);
+                acc += r;
+            }
+            bases
+        };
+
+        let counted = chunk_rows.iter().sum::<usize>().min(sample_size);
+        let n_rows = counted.max(1);
+        let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
+
+        let is_train_mask: Option<Vec<bool>> = if shuffle {
+            let mut perm: Vec<usize> = (0..n_rows).collect();
+            for i in (1..n_rows).rev() {
+                let r = splitmix64(seed ^ (i as u64));
+                let j = (r % ((i + 1) as u64)) as usize;
+                perm.swap(i, j);
+            }
+            let mut mask = vec![false; n_rows];
+            for &idx in perm.iter().take(train_cut) {
+                mask[idx] = true;
+            }
+            Some(mask)
+        } else {
+            None
+        };
+        let is_train = |row_idx: usize| -> bool {
+            match &is_train_mask {
+                Some(mask) => mask[row_idx],
+                None => row_idx < train_cut,
+            }
+        };
+
+        // PASS 1: grouped moments over the train rows. Labels are validated
+        // for every row -- train and test -- so the same files are rejected
+        // no matter where the bad label lands.
+        struct TrainPartial {
+            moms: Vec<Mom>, // [class0 x p, class1 x p]
+            counts: [u64; 2],
+        }
+        let feature_idx_ref = &feature_idx;
+        let target_ref = &target;
+        let is_train_ref = &is_train;
+        let partials: Vec<TrainPartial> = byte_chunks
+            .par_iter()
+            .zip(chunk_base.par_iter())
+            .map(|(&chunk, &base)| -> Result<TrainPartial, String> {
+                let mut part = TrainPartial {
+                    moms: vec![Mom::default(); 2 * p],
+                    counts: [0, 0],
+                };
+                let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
+                let mut x = vec![0.0f64; p];
+                for (local, line) in FastLineIter::new(chunk).enumerate() {
+                    let row_idx = base + local;
+                    if row_idx >= n_rows {
+                        break;
+                    }
+                    fields.clear();
+                    for_each_field(line, split_mode, |_, f| fields.push(f));
+                    if fields.len() <= target_idx {
+                        continue;
+                    }
+                    let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                        continue;
+                    };
+                    if y != 0.0 && y != 1.0 {
+                        return Err(format!(
+                            "target column {target_ref:?} must contain only 0 and 1 \
+                             for classification; found {y}"
+                        ));
+                    }
+                    if !is_train_ref(row_idx) {
+                        continue;
+                    }
+                    let mut usable = true;
+                    for (j, &idx) in feature_idx_ref.iter().enumerate() {
+                        match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                            Some(v) => x[j] = v,
+                            None => {
+                                usable = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !usable {
+                        continue;
+                    }
+                    let cls = usize::from(y == 1.0);
+                    part.counts[cls] += 1;
+                    for j in 0..p {
+                        part.moms[cls * p + j].push(x[j]);
+                    }
+                }
+                Ok(part)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let mut moms = vec![Mom::default(); 2 * p];
+        let mut counts = [0u64; 2];
+        for part in &partials {
+            for (m, pm) in moms.iter_mut().zip(&part.moms) {
+                m.merge(pm);
+            }
+            counts[0] += part.counts[0];
+            counts[1] += part.counts[1];
+        }
+        let train_n = (counts[0] + counts[1]) as usize;
+
+        // Smoothing epsilon from the pooled variance, exactly as sklearn:
+        // merging the two class accumulators gives the moments of all train
+        // rows without a third accumulation.
+        let mut max_pooled_var = 0.0f64;
+        for j in 0..p {
+            let mut pooled = moms[j];
+            pooled.merge(&moms[p + j]);
+            max_pooled_var = max_pooled_var.max(pooled.var_pop());
+        }
+        let epsilon = var_smoothing * max_pooled_var;
+
+        let mut theta = [vec![0.0f64; p], vec![0.0f64; p]];
+        let mut var = [vec![0.0f64; p], vec![0.0f64; p]];
+        for cls in 0..2 {
+            for j in 0..p {
+                let m = &moms[cls * p + j];
+                theta[cls][j] = m.mean;
+                var[cls][j] = (m.var_pop() + epsilon).max(f64::MIN_POSITIVE);
+            }
+        }
+        // User-supplied priors override the learned frequencies, as sklearn's
+        // GaussianNB(priors=...) does; the likelihoods stay learned.
+        let priors = match &priors {
+            Some(pr) => [pr[0], pr[1]],
+            None => [
+                counts[0] as f64 / (train_n.max(1)) as f64,
+                counts[1] as f64 / (train_n.max(1)) as f64,
+            ],
+        };
+
+        // Per-class scoring constants: ln P(c) - 0.5 sum_j ln(2 pi var_cj).
+        // A class with no training rows has prior 0 and ln -> -inf, which
+        // flows through the sigmoid to a hard 0 or 1 -- finite, and the
+        // honest answer for a class never observed.
+        let mut class_const = [0.0f64; 2];
+        let mut inv2var = [vec![0.0f64; p], vec![0.0f64; p]];
+        for cls in 0..2 {
+            let mut s = 0.0f64;
+            for j in 0..p {
+                s += (2.0 * std::f64::consts::PI * var[cls][j]).ln();
+                inv2var[cls][j] = 0.5 / var[cls][j];
+            }
+            class_const[cls] = priors[cls].ln() - 0.5 * s;
+        }
+
+        // PASS 2: score the held-out rows, chunk-parallel, partials folded in
+        // chunk order (log-loss is the one floating sum in the accumulator).
+        let theta_ref = &theta;
+        let inv2var_ref = &inv2var;
+        let evals: Vec<BinaryEval> = byte_chunks
+            .par_iter()
+            .zip(chunk_base.par_iter())
+            .map(|(&chunk, &base)| {
+                let mut ev = BinaryEval::default();
+                let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
+                let mut x = vec![0.0f64; p];
+                for (local, line) in FastLineIter::new(chunk).enumerate() {
+                    let row_idx = base + local;
+                    if row_idx >= n_rows {
+                        break;
+                    }
+                    if is_train_ref(row_idx) {
+                        continue;
+                    }
+                    fields.clear();
+                    for_each_field(line, split_mode, |_, f| fields.push(f));
+                    if fields.len() <= target_idx {
+                        continue;
+                    }
+                    let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                        continue;
+                    };
+                    let mut usable = true;
+                    for (j, &idx) in feature_idx_ref.iter().enumerate() {
+                        match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                            Some(v) => x[j] = v,
+                            None => {
+                                usable = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !usable {
+                        continue;
+                    }
+                    let mut ll0 = 0.0f64;
+                    let mut ll1 = 0.0f64;
+                    for j in 0..p {
+                        let d0 = x[j] - theta_ref[0][j];
+                        let d1 = x[j] - theta_ref[1][j];
+                        ll0 += d0 * d0 * inv2var_ref[0][j];
+                        ll1 += d1 * d1 * inv2var_ref[1][j];
+                    }
+                    let logit = (class_const[1] - ll1) - (class_const[0] - ll0);
+                    ev.push(sigmoid(logit), y);
+                }
+                ev
+            })
+            .collect();
+
+        let mut eval = BinaryEval::default();
+        for ev in &evals {
+            eval.merge(ev);
+        }
+        let metrics = eval.finish();
+        let test_n = (metrics.true_positives
+            + metrics.false_positives
+            + metrics.true_negatives
+            + metrics.false_negatives) as usize;
+
+        let feature_names: Vec<String> =
+            feature_idx.iter().map(|&i| col_names[i].clone()).collect();
+
+        Ok(GnbOutcome {
+            feature_names,
+            class_counts: counts,
+            priors,
+            theta,
+            var,
+            train_n,
+            test_n,
+            metrics,
+        })
+    });
+
+    let fit = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+    let out = PyDict::new(py);
+    // The tag `grizzly.models.save_model` / `predict` dispatch on.
+    out.set_item("model", "gaussian_nb")?;
+    out.set_item("path", path)?;
+    out.set_item("target", target)?;
+    out.set_item("features", fit.feature_names)?;
+    out.set_item("train_n", fit.train_n)?;
+    out.set_item("test_n", fit.test_n)?;
+    out.set_item("class_counts", vec![fit.class_counts[0], fit.class_counts[1]])?;
+    out.set_item("priors", vec![fit.priors[0], fit.priors[1]])?;
+    let [theta0, theta1] = fit.theta;
+    out.set_item("theta", vec![theta0, theta1])?;
+    let [var0, var1] = fit.var;
+    out.set_item("var", vec![var0, var1])?;
+    out.set_item("var_smoothing", var_smoothing)?;
+
+    let m = fit.metrics;
+    out.set_item("accuracy", m.accuracy)?;
+    out.set_item("log_loss", m.log_loss)?;
+    out.set_item("roc_auc", m.roc_auc)?;
+    out.set_item("positive_rate", m.positive_rate)?;
+    let cm = PyDict::new(py);
+    cm.set_item("tp", m.true_positives)?;
+    cm.set_item("fp", m.false_positives)?;
+    cm.set_item("tn", m.true_negatives)?;
+    cm.set_item("fn", m.false_negatives)?;
+    out.set_item("confusion_matrix", cm)?;
+    Ok(out.into())
+}
+
+#[inline(always)]
+pub fn splitmix64(mut x: u64) -> u64 {
+    // Deterministic pseudo-random hash (fast, decent quality)
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+#[inline(always)]
+pub fn parse_f64_opt(bytes: &[u8]) -> Option<f64> {
+    let t = trim_bytes(bytes);
+    if t.is_empty() {
+        return None;
+    }
+    fast_float::parse::<f64, _>(t).ok()
+}
+
+pub fn gaussian_solve(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
+    // Solve Ax=b with partial pivoting. a is row-major n*n.
+    for i in 0..n {
+        // Pivot row
+        let mut piv = i;
+        let mut piv_val = a[i * n + i].abs();
+        for r in (i + 1)..n {
+            let v = a[r * n + i].abs();
+            if v > piv_val {
+                piv_val = v;
+                piv = r;
+            }
+        }
+        if piv_val == 0.0 || !piv_val.is_finite() {
+            return None;
+        }
+        if piv != i {
+            // swap rows in A
+            for c in 0..n {
+                a.swap(i * n + c, piv * n + c);
+            }
+            b.swap(i, piv);
+        }
+
+        // Eliminate below
+        let diag = a[i * n + i];
+        for r in (i + 1)..n {
+            let f = a[r * n + i] / diag;
+            if f == 0.0 {
+                continue;
+            }
+            a[r * n + i] = 0.0;
+            for c in (i + 1)..n {
+                a[r * n + c] -= f * a[i * n + c];
+            }
+            b[r] -= f * b[i];
+        }
+    }
+
+    // Back substitution
+    let mut x = vec![0.0f64; n];
+    for i_rev in 0..n {
+        let i = n - 1 - i_rev;
+        let mut s = b[i];
+        for c in (i + 1)..n {
+            s -= a[i * n + c] * x[c];
+        }
+        let diag = a[i * n + i];
+        if diag == 0.0 || !diag.is_finite() {
+            return None;
+        }
+        x[i] = s / diag;
+    }
+    Some(x)
+}
+
+// Argument count mirrors the public Python signature (see csv_profile above).
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (path, target, features=None, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, fast_csv=true, shuffle=true, ridge_lambda=0.0, return_debug=false))]
+pub fn csv_linear_regression(
+    py: Python<'_>,
+    path: String,
+    target: String,
+    features: Option<Vec<String>>,
+    train_frac: f64,
+    seed: u64,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+    fast_csv: bool,
+    shuffle: bool,
+    ridge_lambda: f64,
+    return_debug: bool,
+) -> PyResult<PyObject> {
+    if !(0.0 < train_frac && train_frac < 1.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "train_frac must be in (0,1)",
+        ));
+    }
+
+    let result = py
+        .allow_threads(|| -> Result<RegressionFit, String> {
+            let file_data = load_file_data(&path).map_err(|e| e.to_string())?;
+            let bytes = file_data.as_bytes();
+            if bytes.is_empty() {
+                return Err("Empty file".to_string());
+            }
+
+            // Determine split mode
+            let first_newline = memchr(b'\n', bytes).unwrap_or(bytes.len());
+            let first_line = &bytes[..first_newline];
+            let split_mode = if let Some(d) = delimiter.and_then(|d| d.bytes().next()) {
+                SplitMode::Delim(d)
+            } else {
+                match sniff_delimiter_simd(first_line) {
+                    Some(d) => SplitMode::Delim(d),
+                    None => SplitMode::Whitespace,
+                }
+            };
+            let delim_byte_for_detection = match split_mode {
+                SplitMode::Delim(d) => d,
+                SplitMode::Whitespace => b' ',
+            };
+            let has_header_actual = has_header
+                .unwrap_or_else(|| detect_header_smart(bytes, delim_byte_for_detection, 5));
+
+            // Column names
+            let first_line_clean = if first_line.ends_with(b"\r") {
+                &first_line[..first_line.len() - 1]
+            } else {
+                first_line
+            };
+            let first_fields = get_fields(first_line_clean, split_mode);
+            let ncols = first_fields.len();
+            if ncols == 0 {
+                return Err("No columns detected".to_string());
+            }
+            let col_names: Vec<String> = if has_header_actual {
+                first_fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let t = trim_bytes(f);
+                        if t.is_empty() {
+                            format!("col_{i}")
+                        } else {
+                            String::from_utf8_lossy(t).into_owned()
+                        }
+                    })
+                    .collect()
+            } else {
+                (0..ncols).map(|i| format!("col_{i}")).collect()
+            };
+
+            let target_idx = col_names
+                .iter()
+                .position(|c| c == &target)
+                .ok_or_else(|| format!("target not found: {target}. Available: {:?}", col_names))?;
+
+            let feature_names: Vec<String> = if let Some(fs) = features {
+                fs.into_iter().filter(|c| c != &target).collect()
+            } else {
+                col_names
+                    .iter()
+                    .filter(|c| *c != &target)
+                    .cloned()
+                    .collect()
+            };
+            if feature_names.is_empty() {
+                return Err("No feature columns selected".to_string());
+            }
+            let mut feature_idx: Vec<usize> = Vec::with_capacity(feature_names.len());
+            for f in &feature_names {
+                let idx = col_names
+                    .iter()
+                    .position(|c| c == f)
+                    .ok_or_else(|| format!("feature not found: {f}. Available: {:?}", col_names))?;
+                feature_idx.push(idx);
+            }
+
+            let p = feature_idx.len();
+            let dim = p + 1; // + intercept
+                             // XtX is symmetric, so only the upper triangle (row-major, r <= c)
+                             // is accumulated: dim*(dim+1)/2 slots instead of dim^2, which also
+                             // halves the multiply-adds per row in the hot loop. Mirrored into a
+                             // full matrix just before the solve.
+            let tri = dim * (dim + 1) / 2;
+            let mut xtx_tri = vec![0.0f64; tri];
+            let mut xty = vec![0.0f64; dim];
+
+            // Two passes over the mmapped bytes: accumulate on train, then
+            // evaluate on test with the solved coefficients.
+
+            // Helper to iterate rows (fast path) – reuse existing FastRowIter
+            let data_start = if has_header_actual {
+                first_newline + 1
+            } else {
+                0
+            };
+            let data_bytes = &bytes[data_start..];
+
+            // Build a stable split that is consistent across both passes.
+            // If shuffle=true, use a Fisher–Yates permutation (parity with Python rng.permutation).
+            // If shuffle=false, use a simple sequential split (first train_cut rows).
+            // Pre-count the rows actually present, capped at sample_size.
+            //
+            // This must happen for both split strategies. Deriving n_rows from
+            // sample_size instead (as the sequential branch previously did)
+            // makes train_cut a fraction of the *requested* cap rather than of
+            // the data: with the default sample_size of 1,000,000, every file
+            // under 800,000 rows put every row on the train side, leaving the
+            // test set empty and reporting r2 = 0.0 for a perfectly good model.
+            // Chunk the data once; the same chunks serve the row count, the
+            // training pass, and the evaluation pass. Counting is a parallel
+            // newline scan per chunk, and the per-chunk counts prefix-sum into
+            // each chunk's global starting row index — which is what lets the
+            // accumulation passes run chunk-parallel while agreeing with the
+            // split about which global row is which.
+            let num_threads = rayon::current_num_threads();
+            let byte_chunks: Vec<&[u8]> = if fast_csv {
+                chunk_bytes_aligned(data_bytes, num_threads)
+            } else {
+                Vec::new()
+            };
+            let chunk_rows: Vec<usize> = byte_chunks
+                .par_iter()
+                .map(|c| FastLineIter::new(c).count())
+                .collect();
+            let chunk_base: Vec<usize> = {
+                let mut bases = Vec::with_capacity(chunk_rows.len());
+                let mut acc = 0usize;
+                for &r in &chunk_rows {
+                    bases.push(acc);
+                    acc += r;
+                }
+                bases
+            };
+
+            let counted = if fast_csv {
+                chunk_rows.iter().sum::<usize>().min(sample_size)
+            } else {
+                let mut reader = ReaderBuilder::new()
+                    .has_headers(has_header_actual)
+                    .delimiter(delim_byte_for_detection)
+                    .flexible(true)
+                    .from_reader(bytes);
+                reader.byte_records().take(sample_size).count()
+            };
+            let n_rows = counted.max(1);
+            let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
+
+            let mut is_train_mask: Option<Vec<bool>> = None;
+            if shuffle {
+                let mut perm: Vec<usize> = (0..n_rows).collect();
+                // Fisher–Yates using splitmix64
+                for i in (1..n_rows).rev() {
+                    let r = splitmix64(seed ^ (i as u64));
+                    let j = (r % ((i + 1) as u64)) as usize;
+                    perm.swap(i, j);
+                }
+                let mut mask = vec![false; n_rows];
+                for &idx in perm.iter().take(train_cut) {
+                    mask[idx] = true;
+                }
+                is_train_mask = Some(mask);
+            }
+
+            let mut train_n = 0usize;
+            let mut test_assigned = 0usize;
+
+            // PASS 1: accumulate XtX/Xty on TRAIN
+            if fast_csv {
+                // Chunk-parallel. Each chunk accumulates its own triangle and
+                // counters; partials are folded in chunk order afterwards, so
+                // the summation order — and therefore the result — is
+                // deterministic for a given thread count.
+                struct TrainPartial {
+                    xtx_tri: Vec<f64>,
+                    xty: Vec<f64>,
+                    train_n: usize,
+                    test_assigned: usize,
+                }
+
+                let partials: Vec<TrainPartial> = byte_chunks
+                    .par_iter()
+                    .zip(chunk_base.par_iter())
+                    .map(|(&chunk, &base)| {
+                        let mut part = TrainPartial {
+                            xtx_tri: vec![0.0f64; tri],
+                            xty: vec![0.0f64; dim],
+                            train_n: 0,
+                            test_assigned: 0,
+                        };
+                        if base >= n_rows {
+                            return part;
+                        }
+                        // Scratch reused across rows: no per-row allocation.
+                        let mut fields: Vec<&[u8]> = Vec::with_capacity(ncols);
+                        let mut x = vec![0.0f64; dim];
+
+                        for (local, line) in FastLineIter::new(chunk).enumerate() {
+                            let row_idx = base + local;
+                            if row_idx >= n_rows {
+                                break;
+                            }
+                            // Split assignment first: pass 1 needs nothing
+                            // from a test row, so it is not worth parsing.
+                            let is_train = if let Some(mask) = &is_train_mask {
+                                mask[row_idx]
+                            } else {
+                                row_idx < train_cut
+                            };
+                            if !is_train {
+                                part.test_assigned += 1;
+                                continue;
+                            }
+
+                            fields.clear();
+                            for_each_field(line, split_mode, |_, f| fields.push(f));
+                            if fields.len() < ncols {
+                                continue;
+                            }
+
+                            let yv = match parse_f64_opt(fields[target_idx]) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            let mut ok = true;
+                            for (j, &idx) in feature_idx.iter().enumerate() {
+                                match parse_f64_opt(fields[idx]) {
+                                    Some(v) => x[j] = v,
+                                    None => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !ok {
+                                continue;
+                            }
+                            x[p] = 1.0; // intercept
+
+                            // Upper triangle only: xtx[r][c] for r <= c.
+                            let mut k = 0usize;
+                            for r in 0..dim {
+                                let xr = x[r];
+                                part.xty[r] += xr * yv;
+                                for &xc in &x[r..dim] {
+                                    part.xtx_tri[k] += xr * xc;
+                                    k += 1;
+                                }
+                            }
+                            part.train_n += 1;
+                        }
+                        part
+                    })
+                    .collect();
+
+                for part in partials {
+                    for (a, b) in xtx_tri.iter_mut().zip(&part.xtx_tri) {
+                        *a += b;
+                    }
+                    for (a, b) in xty.iter_mut().zip(&part.xty) {
+                        *a += b;
+                    }
+                    train_n += part.train_n;
+                    test_assigned += part.test_assigned;
+                }
+            } else {
+                let mut rows_seen = 0usize;
+                let mut x_scratch = vec![0.0f64; dim];
+                // Safe path: fall back to csv crate parsing (quoted newlines, etc.)
+                let mut reader = ReaderBuilder::new()
+                    .has_headers(has_header_actual)
+                    .delimiter(delim_byte_for_detection)
+                    .flexible(true)
+                    .from_reader(bytes);
+
+                for result in reader.byte_records().take(n_rows) {
+                    let record = match result {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let row_idx = rows_seen;
+                    rows_seen += 1;
+                    // Same shape as the fast path: split first, parse only
+                    // train rows, accumulate the upper triangle.
+                    let is_train = if let Some(mask) = &is_train_mask {
+                        mask[row_idx]
+                    } else {
+                        row_idx < train_cut
+                    };
+                    if !is_train {
+                        test_assigned += 1;
+                        continue;
+                    }
+                    if record.len() < ncols {
+                        continue;
+                    }
+
+                    let yv = match parse_f64_opt(record.get(target_idx).unwrap_or(&[])) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let mut ok = true;
+                    for (j, &idx) in feature_idx.iter().enumerate() {
+                        match record.get(idx).and_then(parse_f64_opt) {
+                            Some(v) => x_scratch[j] = v,
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    x_scratch[p] = 1.0;
+                    let mut k = 0usize;
+                    for r in 0..dim {
+                        let xr = x_scratch[r];
+                        xty[r] += xr * yv;
+                        for &xc in &x_scratch[r..dim] {
+                            xtx_tri[k] += xr * xc;
+                            k += 1;
+                        }
+                    }
+                    train_n += 1;
+                }
+            }
+
+            if train_n < dim {
+                return Err(format!(
+                    "Not enough training rows to fit model (train_n={train_n}, params={dim})"
+                ));
+            }
+
+            // Mirror the accumulated upper triangle into the full symmetric
+            // matrix the solver expects.
+            let mut xtx = vec![0.0f64; dim * dim];
+            {
+                let mut k = 0usize;
+                for r in 0..dim {
+                    for c in r..dim {
+                        xtx[r * dim + c] = xtx_tri[k];
+                        xtx[c * dim + r] = xtx_tri[k];
+                        k += 1;
+                    }
+                }
+            }
+
+            // Optional ridge for stability: XtX += λI
+            if ridge_lambda > 0.0 {
+                for i in 0..dim {
+                    xtx[i * dim + i] += ridge_lambda;
+                }
+            }
+
+            let w = gaussian_solve(xtx.clone(), xty.clone(), dim).ok_or_else(|| {
+                "Failed to solve linear system (singular/ill-conditioned)".to_string()
+            })?;
+            let coef = w[..p].to_vec();
+            let intercept = w[p];
+
+            // PASS 2: compute test R^2
+            let mut ss_res = 0.0f64;
+            let mut sum_y = 0.0f64;
+            let mut sum_y2 = 0.0f64;
+            let mut test_used = 0usize;
+
+            if fast_csv {
+                // Same chunk-parallel shape as pass 1, same deterministic
+                // in-order fold of the partial sums.
+                #[derive(Default)]
+                struct EvalPartial {
+                    ss_res: f64,
+                    sum_y: f64,
+                    sum_y2: f64,
+                    test_used: usize,
+                }
+
+                let partials: Vec<EvalPartial> = byte_chunks
+                    .par_iter()
+                    .zip(chunk_base.par_iter())
+                    .map(|(&chunk, &base)| {
+                        let mut part = EvalPartial::default();
+                        if base >= n_rows {
+                            return part;
+                        }
+                        let mut fields: Vec<&[u8]> = Vec::with_capacity(ncols);
+
+                        for (local, line) in FastLineIter::new(chunk).enumerate() {
+                            let row_idx = base + local;
+                            if row_idx >= n_rows {
+                                break;
+                            }
+                            let is_train = if let Some(mask) = &is_train_mask {
+                                mask[row_idx]
+                            } else {
+                                row_idx < train_cut
+                            };
+                            if is_train {
+                                continue;
+                            }
+
+                            fields.clear();
+                            for_each_field(line, split_mode, |_, f| fields.push(f));
+                            if fields.len() < ncols {
+                                continue;
+                            }
+
+                            let yv = match parse_f64_opt(fields[target_idx]) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            let mut pred = intercept;
+                            for (j, &idx) in feature_idx.iter().enumerate() {
+                                let xv = match parse_f64_opt(fields[idx]) {
+                                    Some(v) => v,
+                                    None => {
+                                        pred = f64::NAN;
+                                        break;
+                                    }
+                                };
+                                pred += coef[j] * xv;
+                            }
+                            if !pred.is_finite() {
+                                continue;
+                            }
+                            let r = yv - pred;
+                            part.ss_res += r * r;
+                            part.sum_y += yv;
+                            part.sum_y2 += yv * yv;
+                            part.test_used += 1;
+                        }
+                        part
+                    })
+                    .collect();
+
+                for part in partials {
+                    ss_res += part.ss_res;
+                    sum_y += part.sum_y;
+                    sum_y2 += part.sum_y2;
+                    test_used += part.test_used;
+                }
+            } else {
+                let mut rows_seen2 = 0usize;
+                let mut reader = ReaderBuilder::new()
+                    .has_headers(has_header_actual)
+                    .delimiter(delim_byte_for_detection)
+                    .flexible(true)
+                    .from_reader(bytes);
+                for result in reader.byte_records().take(n_rows) {
+                    let record = match result {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let row_idx = rows_seen2;
+                    rows_seen2 += 1;
+                    if record.len() < ncols {
+                        continue;
+                    }
+                    let is_train = if let Some(mask) = &is_train_mask {
+                        mask[row_idx]
+                    } else {
+                        row_idx < train_cut
+                    };
+                    if is_train {
+                        continue;
+                    }
+                    let yv = match record.get(target_idx).and_then(parse_f64_opt) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let mut pred = intercept;
+                    for (j, &idx) in feature_idx.iter().enumerate() {
+                        let xv = match record.get(idx).and_then(parse_f64_opt) {
+                            Some(v) => v,
+                            None => {
+                                pred = f64::NAN;
+                                break;
+                            }
+                        };
+                        pred += coef[j] * xv;
+                    }
+                    if !pred.is_finite() {
+                        continue;
+                    }
+                    let r = yv - pred;
+                    ss_res += r * r;
+                    sum_y += yv;
+                    sum_y2 += yv * yv;
+                    test_used += 1;
+                }
+            }
+
+            // IMPORTANT: R^2 must be computed on the same set of rows that were actually scored.
+            // Using the split-assigned `test_n` while skipping parse-failed rows corrupts mean_y/ss_tot.
+            let n = test_used.max(1) as f64;
+            let mean_y = sum_y / n;
+            let ss_tot = sum_y2 - n * mean_y * mean_y;
+            let r2 = if ss_tot > 0.0 {
+                1.0 - (ss_res / ss_tot)
+            } else {
+                0.0
+            };
+
+            // Return test_used to reflect actual evaluated rows
+            // Return debug-friendly counts
+            if return_debug {
+                Ok((
+                    feature_names,
+                    coef,
+                    intercept,
+                    train_n,
+                    test_used,
+                    r2,
+                    test_assigned,
+                    ss_res,
+                    ss_tot,
+                    mean_y,
+                ))
+            } else {
+                // Keep tuple shape stable even when not returning debug fields
+                Ok((
+                    feature_names,
+                    coef,
+                    intercept,
+                    train_n,
+                    test_used,
+                    r2,
+                    0usize,
+                    0.0f64,
+                    0.0f64,
+                    0.0f64,
+                ))
+            }
+        })
+        .map_err(pyo3::exceptions::PyIOError::new_err)?;
+
+    let (
+        feature_names,
+        coef,
+        intercept,
+        train_n,
+        test_n,
+        r2,
+        test_assigned,
+        ss_res,
+        ss_tot,
+        mean_y,
+    ) = result;
+    let out = PyDict::new(py);
+    // The tag `grizzly.models.save_model` / `predict` dispatch on.
+    out.set_item("model", "linear_regression")?;
+    out.set_item("path", path)?;
+    out.set_item("target", target)?;
+    out.set_item("features", feature_names)?;
+    out.set_item("coef", coef)?;
+    out.set_item("intercept", intercept)?;
+    out.set_item("train_n", train_n)?;
+    out.set_item("test_n", test_n)?;
+    out.set_item("r2", r2)?;
+    if return_debug {
+        out.set_item("test_n_assigned", test_assigned)?;
+        out.set_item("ss_res", ss_res)?;
+        out.set_item("ss_tot", ss_tot)?;
+        out.set_item("y_mean_test", mean_y)?;
+    }
+    Ok(out.into())
+}

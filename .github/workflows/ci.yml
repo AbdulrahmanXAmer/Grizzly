@@ -272,6 +272,17 @@ jobs:
             --strict \
             --out /tmp/smoke-fit.json
 
+      # And for classification, where the gate is on held-out metrics rather
+      # than coefficients -- logistic regression has no closed form, so two
+      # correct implementations legitimately disagree on the weights.
+      - name: Run classification benchmark (small, strict)
+        run: |
+          python -m benches.bench_classify \
+            --rows 20000 \
+            --repetitions 2 \
+            --strict \
+            --out /tmp/smoke-classify.json
+
       - name: Upload smoke results
         if: always()
         uses: actions/upload-artifact@v4
