@@ -1048,3 +1048,57 @@ fn log_loss_is_clamped_against_saturated_probabilities() {
     let good = eval_of(&[(1.0 - 1e-9, 1.0), (1e-9, 0.0)]);
     assert!(good.log_loss < 1e-6, "log-loss of a correct fit: {}", good.log_loss);
 }
+
+// ---------------------------------------------------------------------------
+// grouped moments (Gaussian Naive Bayes machinery)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mom_matches_numstats_moments_bitwise() {
+    // `Mom` documents itself as the same arithmetic as NumStats::push_moments
+    // and NumStats::merge. This makes that claim load-bearing: if either side
+    // changes its update or merge formula, the fit's standardization and the
+    // profiler's reported moments would quietly disagree.
+    let values: Vec<f64> = (0..500)
+        .map(|i| ((i * 37 + 11) % 101) as f64 * 0.7 - 30.0)
+        .collect();
+
+    let mut ns_a = NumStats::default();
+    let mut ns_b = NumStats::default();
+    let mut mom_a = Mom::default();
+    let mut mom_b = Mom::default();
+    for (i, &v) in values.iter().enumerate() {
+        if i < 313 {
+            ns_a.push_moments(v);
+            mom_a.push(v);
+        } else {
+            ns_b.push_moments(v);
+            mom_b.push(v);
+        }
+    }
+    assert_eq!(mom_a.mean.to_bits(), ns_a.mean.to_bits());
+    assert_eq!(mom_a.m2.to_bits(), ns_a.m2.to_bits());
+
+    ns_a.merge(&mut ns_b);
+    mom_a.merge(&mom_b);
+    assert_eq!(mom_a.n, ns_a.n);
+    assert_eq!(mom_a.mean.to_bits(), ns_a.mean.to_bits());
+    assert_eq!(mom_a.m2.to_bits(), ns_a.m2.to_bits());
+}
+
+#[test]
+fn mom_population_variance_matches_the_definition() {
+    let values = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+    let mut m = Mom::default();
+    for v in values {
+        m.push(v);
+    }
+    // Textbook example: mean 5, population variance 4.
+    assert_close(m.mean, 5.0, 1e-12, "mean");
+    assert_close(m.var_pop(), 4.0, 1e-12, "population variance");
+
+    // Merging in an empty accumulator changes nothing, bitwise.
+    let before = (m.mean.to_bits(), m.m2.to_bits(), m.n);
+    m.merge(&Mom::default());
+    assert_eq!(before, (m.mean.to_bits(), m.m2.to_bits(), m.n));
+}

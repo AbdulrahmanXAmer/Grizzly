@@ -49,6 +49,9 @@ CLASSIFY_METHOD_LABELS = {
     "pandas_sklearn": "pandas → sklearn `LogisticRegression`",
     "polars_sklearn": "polars → sklearn `LogisticRegression`",
     "pandas_sgd": "pandas → sklearn `SGDClassifier` (10 epochs)",
+    "grizzly_gnb": "**Grizzly** Gaussian Naive Bayes",
+    "pandas_gnb": "pandas → sklearn `GaussianNB`",
+    "polars_gnb": "polars → sklearn `GaussianNB`",
 }
 
 HIGHLIGHTS_START_MARKER = "<!-- HIGHLIGHTS:START -->"
@@ -490,15 +493,31 @@ def render_fit(report: dict[str, Any]) -> str:
 
 
 def render_classify(report: dict[str, Any]) -> str:
-    """Render the classification benchmark: CSV on disk to a scored classifier."""
-    dataset = report["dataset"]
-    by_method = {r["method"]: r for r in report["results"]}
-    baseline_ms = by_method["grizzly_logistic"]["timing"]["median_ms"]
+    """Render the classification benchmark: CSV on disk to a scored classifier.
 
-    def row(method: str) -> str:
-        r = by_method[method]
+    Rows are grouped by model family, and the "vs Grizzly" column compares
+    against the grizzly method of the same family -- logistic against
+    logistic, Naive Bayes against Naive Bayes -- because comparing across
+    model families would be comparing modelling choices, not implementations.
+    """
+    dataset = report["dataset"]
+    results = report["results"]
+
+    families: list[str] = []
+    for r in results:
+        fam = r.get("family", "logistic")
+        if fam not in families:
+            families.append(fam)
+
+    def family_members(fam: str) -> list[dict[str, Any]]:
+        return [r for r in results if r.get("family", "logistic") == fam]
+
+    def family_baseline(fam: str) -> dict[str, Any]:
+        return next(r for r in family_members(fam) if r["method"].startswith("grizzly"))
+
+    def row(r: dict[str, Any], baseline_ms: float) -> str:
         ms = r["timing"]["median_ms"]
-        if method.startswith("grizzly"):
+        if r["method"].startswith("grizzly"):
             versus = "—"
         elif ms >= baseline_ms:
             versus = f"{ms / baseline_ms:.1f}x slower"
@@ -508,7 +527,7 @@ def render_classify(report: dict[str, Any]) -> str:
         # is not a measurement, and saying so is better than printing it clean.
         marker = " ⚠️" if _is_noisy(r) else ""
         return (
-            f"| {CLASSIFY_METHOD_LABELS[method]} | {ms:.1f} ms{marker} | {versus} | "
+            f"| {CLASSIFY_METHOD_LABELS[r['method']]} | {ms:.1f} ms{marker} | {versus} | "
             f"{r['accuracy']:.4f} | {r['roc_auc']:.4f} | "
             f"{_human_bytes(r['peak_rss_bytes'])} |"
         )
@@ -524,46 +543,56 @@ def render_classify(report: dict[str, Any]) -> str:
         f"({_human_bytes(dataset['bytes'])}). Labels are *sampled* from "
         "`Bernoulli(sigmoid(w·x + b))` rather than thresholded, so the classes "
         "overlap — on perfectly separable data the logistic likelihood has no "
-        "finite maximum and every implementation ‘agrees’ only in diverging.",
+        "finite maximum and every implementation ‘agrees’ only in diverging. "
+        "`vs Grizzly` compares within a model family: logistic against "
+        "logistic, Naive Bayes against Naive Bayes.",
         "",
         "| Method | Time | vs Grizzly | Accuracy | ROC-AUC | Peak memory |",
         "|--------|-----:|-----------|---------:|--------:|------------:|",
-        row("grizzly_logistic"),
-        row("pandas_sklearn"),
-        row("polars_sklearn"),
-        row("pandas_sgd"),
     ]
+    for fam in families:
+        baseline_ms = family_baseline(fam)["timing"]["median_ms"]
+        for r in family_members(fam):
+            lines.append(row(r, baseline_ms))
 
-    # State plainly where grizzly stands, computed rather than asserted, so it
-    # cannot quietly go stale into a claim the numbers no longer support.
-    grizzly = by_method["grizzly_logistic"]
-    rivals = [r for r in report["results"] if not r["method"].startswith("grizzly")]
-    fastest = min(rivals, key=lambda r: r["timing"]["median_ms"])
-    if fastest["timing"]["median_ms"] < baseline_ms:
-        ratio = baseline_ms / fastest["timing"]["median_ms"]
-        mem = fastest["peak_rss_bytes"] / grizzly["peak_rss_bytes"]
-        lines += [
-            "",
-            f"**Grizzly does not win this one on wall-clock.** "
-            f"{CLASSIFY_METHOD_LABELS[fastest['method']]} fits {ratio:.1f}x "
-            f"faster, because a logistic epoch is real arithmetic per row — an "
-            f"`exp` and a `ln` — where the regression path accumulates a matrix "
-            f"once and solves it. What grizzly keeps is the memory profile: "
-            f"{mem:.1f}x less peak RSS, bounded by the feature count rather "
-            f"than the file, which is what decides whether the job runs at all "
-            f"on a file larger than memory.",
-        ]
+    # State plainly where grizzly stands in each family, computed rather than
+    # asserted, so it cannot quietly go stale into a claim the numbers no
+    # longer support.
+    for fam in families:
+        grizzly = family_baseline(fam)
+        rivals = [r for r in family_members(fam) if not r["method"].startswith("grizzly")]
+        if not rivals:
+            continue
+        fastest = min(rivals, key=lambda r: r["timing"]["median_ms"])
+        if fastest["timing"]["median_ms"] < grizzly["timing"]["median_ms"]:
+            ratio = grizzly["timing"]["median_ms"] / fastest["timing"]["median_ms"]
+            mem = fastest["peak_rss_bytes"] / grizzly["peak_rss_bytes"]
+            lines += [
+                "",
+                f"**Grizzly does not win the {fam} race on wall-clock.** "
+                f"{CLASSIFY_METHOD_LABELS[fastest['method']]} fits {ratio:.1f}x "
+                f"faster. What grizzly keeps is the memory profile: "
+                f"{mem:.1f}x less peak RSS, bounded by the feature count rather "
+                f"than the file, which is what decides whether the job runs at "
+                f"all on a file larger than memory.",
+            ]
 
     agreement = report.get("agreement", {})
     if agreement.get("status") == "ok":
-        acc = [r["accuracy"] for r in report["results"]]
-        auc = [r["roc_auc"] for r in report["results"]]
+        spread_bits = []
+        for fam in families:
+            members = family_members(fam)
+            acc = [r["accuracy"] for r in members]
+            auc = [r["roc_auc"] for r in members]
+            spread_bits.append(
+                f"{fam}: accuracy within {max(acc) - min(acc):.4f}, "
+                f"ROC-AUC within {max(auc) - min(auc):.4f}"
+            )
         lines += [
             "",
-            f"Held-out metrics agree across every method (accuracy within "
-            f"{max(acc) - min(acc):.4f}, ROC-AUC within {max(auc) - min(auc):.4f}), "
-            "so these are timings of equally good classifiers rather than four "
-            "different ones.",
+            f"Held-out metrics agree across every method of each family "
+            f"({'; '.join(spread_bits)}), so these are timings of equally good "
+            "classifiers rather than accidentally different ones.",
             "",
             "Unlike the regression table above, the gate is on metrics rather "
             "than coefficients — logistic regression has no closed form, so a "

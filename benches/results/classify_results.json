@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "environment": {
-    "timestamp_utc": "2026-07-25T00:29:00+00:00",
+    "timestamp_utc": "2026-07-25T00:45:04+00:00",
     "cpu": "Apple M1",
     "cpu_count": 8,
     "memory_bytes": 8589934592,
@@ -12,7 +12,7 @@
     "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
     "cargo_profile": "release (lto=true, codegen-units=1, opt-level=3)",
     "git": {
-      "commit": "9f2b72016fc6fae32a70e8db7f08b1cfa794565b",
+      "commit": "fa5d9b0f9126300c1e612caf85657d3bdbe9fd06",
       "branch": "track-a-reproducible-benchmarks",
       "dirty": true
     }
@@ -30,7 +30,7 @@
     "repetitions": 5,
     "headline_statistic": "median",
     "process_isolation": "one fresh interpreter per repetition",
-    "agreement_gate": "held-out metrics must agree across methods within 0.02 accuracy / 0.02 ROC-AUC / 0.05 log-loss; coefficients are not gated because logistic regression has no closed form and a converged L-BFGS fit legitimately differs from a ten-epoch SGD one"
+    "agreement_gate": "held-out metrics must agree across methods of the same model family within 0.02 accuracy / 0.02 ROC-AUC / 0.05 log-loss; families are gated separately because different models legitimately score differently, and coefficients are not gated because logistic regression has no closed form and a converged L-BFGS fit legitimately differs from a ten-epoch SGD one"
   },
   "agreement": {
     "status": "ok",
@@ -39,14 +39,15 @@
   "results": [
     {
       "method": "grizzly_logistic",
+      "family": "logistic",
       "repetitions": 5,
       "timing": {
-        "median_ms": 251.75358301203232,
-        "min_ms": 250.73879199044313,
-        "max_ms": 254.61524999991525,
-        "stdev_ms": 1.6490974242100707
+        "median_ms": 245.324540999718,
+        "min_ms": 242.52866599999834,
+        "max_ms": 262.4349169927882,
+        "stdev_ms": 8.100332524100546
       },
-      "peak_rss_bytes": 209518592,
+      "peak_rss_bytes": 210337792,
       "accuracy": 0.8556,
       "roc_auc": 0.9356598064728117,
       "log_loss": 0.32258466207745873,
@@ -75,14 +76,15 @@
     },
     {
       "method": "pandas_sklearn",
+      "family": "logistic",
       "repetitions": 5,
       "timing": {
-        "median_ms": 771.5505000087433,
-        "min_ms": 747.9439160088077,
-        "max_ms": 820.1596250000875,
-        "stdev_ms": 27.846772113121816
+        "median_ms": 759.9702919978881,
+        "min_ms": 755.1102079887642,
+        "max_ms": 772.4886659998447,
+        "stdev_ms": 8.074760757550743
       },
-      "peak_rss_bytes": 538361856,
+      "peak_rss_bytes": 553435136,
       "accuracy": 0.85886,
       "roc_auc": 0.9379575681844676,
       "log_loss": 0.3164516058589834,
@@ -111,14 +113,15 @@
     },
     {
       "method": "polars_sklearn",
+      "family": "logistic",
       "repetitions": 5,
       "timing": {
-        "median_ms": 281.86187500250526,
-        "min_ms": 280.78416700009257,
-        "max_ms": 293.12637499242555,
-        "stdev_ms": 5.145703329927064
+        "median_ms": 281.26508300192654,
+        "min_ms": 277.0218749938067,
+        "max_ms": 290.3870000009192,
+        "stdev_ms": 5.950913222596409
       },
-      "peak_rss_bytes": 527237120,
+      "peak_rss_bytes": 525828096,
       "accuracy": 0.85886,
       "roc_auc": 0.9379575681844676,
       "log_loss": 0.3164516058589834,
@@ -147,14 +150,15 @@
     },
     {
       "method": "pandas_sgd",
+      "family": "logistic",
       "repetitions": 5,
       "timing": {
-        "median_ms": 1481.246374998591,
-        "min_ms": 1425.4257919965312,
-        "max_ms": 1573.4075410000514,
-        "stdev_ms": 57.3144435680987
+        "median_ms": 1451.9752910127863,
+        "min_ms": 1417.9021250020014,
+        "max_ms": 1506.3992089999374,
+        "stdev_ms": 38.67764483723939
       },
-      "peak_rss_bytes": 631144448,
+      "peak_rss_bytes": 599883776,
       "accuracy": 0.85871,
       "roc_auc": 0.9373412957458914,
       "log_loss": 0.3180381369083553,
@@ -179,6 +183,117 @@
         1.4479323690454018,
         0.9408361038007813,
         1.186734037492687
+      ]
+    },
+    {
+      "method": "grizzly_gnb",
+      "family": "gnb",
+      "repetitions": 5,
+      "timing": {
+        "median_ms": 54.758333004429005,
+        "min_ms": 53.82354199537076,
+        "max_ms": 55.44045798887964,
+        "stdev_ms": 0.6144681159962876
+      },
+      "peak_rss_bytes": 133136384,
+      "accuracy": 0.85643,
+      "roc_auc": 0.9364174723964186,
+      "log_loss": 0.38880500355172876,
+      "coef": [
+        0.21898941064801075,
+        0.1606801302788492,
+        -0.04876724060048618,
+        -0.15147075847817137,
+        0.008189148549536465,
+        -0.05818978359906512,
+        0.17861155370072518,
+        -0.12148638453290024,
+        -0.016293967216869414,
+        0.05751966995643141,
+        0.2556444463461229,
+        0.0032174692963963534,
+        -0.1328460550775333,
+        0.16160200074436143,
+        0.0747262004466168,
+        -0.15416860900208737,
+        0.2613950584557885,
+        0.30200353894363136,
+        0.19362947411132114,
+        0.25452914417706446
+      ]
+    },
+    {
+      "method": "pandas_gnb",
+      "family": "gnb",
+      "repetitions": 5,
+      "timing": {
+        "median_ms": 722.896999999648,
+        "min_ms": 719.1469999961555,
+        "max_ms": 742.7634999912698,
+        "stdev_ms": 11.344341364646302
+      },
+      "peak_rss_bytes": 674070528,
+      "accuracy": 0.85838,
+      "roc_auc": 0.9376953580443047,
+      "log_loss": 0.3872331916191312,
+      "coef": [
+        0.21659624548466005,
+        0.16147181663017832,
+        -0.04891953013952941,
+        -0.15413389073738074,
+        0.006287908590714902,
+        -0.05769952956747506,
+        0.17710041203605079,
+        -0.12081864644363433,
+        -0.018383827582441083,
+        0.05633875572185532,
+        0.25695393831160596,
+        0.006025868005970192,
+        -0.13499764778536338,
+        0.15914185946674064,
+        0.07361775240393321,
+        -0.15300235907930282,
+        0.2624838627534602,
+        0.3019754293485281,
+        0.19483845981309209,
+        0.2537254003349073
+      ]
+    },
+    {
+      "method": "polars_gnb",
+      "family": "gnb",
+      "repetitions": 5,
+      "timing": {
+        "median_ms": 259.3096670025261,
+        "min_ms": 254.17116699100006,
+        "max_ms": 279.3059579998953,
+        "stdev_ms": 10.009385087215762
+      },
+      "peak_rss_bytes": 631259136,
+      "accuracy": 0.85838,
+      "roc_auc": 0.9376953580443047,
+      "log_loss": 0.3872331916191312,
+      "coef": [
+        0.21659624548466005,
+        0.16147181663017832,
+        -0.04891953013952941,
+        -0.15413389073738074,
+        0.006287908590714902,
+        -0.05769952956747506,
+        0.17710041203605079,
+        -0.12081864644363433,
+        -0.018383827582441083,
+        0.05633875572185532,
+        0.25695393831160596,
+        0.006025868005970192,
+        -0.13499764778536338,
+        0.15914185946674064,
+        0.07361775240393321,
+        -0.15300235907930282,
+        0.2624838627534602,
+        0.3019754293485281,
+        0.19483845981309209,
+        0.2537254003349073
       ]
     }
   ]

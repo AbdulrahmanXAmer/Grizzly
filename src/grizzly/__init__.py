@@ -5,6 +5,7 @@ from importlib.metadata import version as _version
 
 from . import drift
 from .api import (
+    csv_gaussian_nb,
     csv_linear_regression,
     csv_logistic_regression,
     csv_minmax_params,
@@ -39,6 +40,7 @@ __all__ = [
     "csv_linear_regression",
     "csv_sgd_regression",
     "csv_logistic_regression",
+    "csv_gaussian_nb",
     "drift",
     "detect_drift",
     "compare_profiles",

@@ -227,6 +227,25 @@ impl BinaryEval {
         }
     }
 
+    /// Fold another accumulator in. Counts add exactly; the only floating
+    /// sum is `log_loss_sum`, so callers merging chunk partials must fold in
+    /// chunk order to keep the metric deterministic.
+    pub fn merge(&mut self, other: &BinaryEval) {
+        for (a, b) in self.pos_bins.iter_mut().zip(&other.pos_bins) {
+            *a += b;
+        }
+        for (a, b) in self.neg_bins.iter_mut().zip(&other.neg_bins) {
+            *a += b;
+        }
+        self.correct += other.correct;
+        self.total += other.total;
+        self.log_loss_sum += other.log_loss_sum;
+        self.tp += other.tp;
+        self.fp += other.fp;
+        self.tn += other.tn;
+        self.r#fn += other.r#fn;
+    }
+
     /// Mann-Whitney U over the binned scores.
     ///
     /// Walking bins in ascending score order, each positive outranks every
@@ -266,6 +285,57 @@ impl BinaryEval {
             true_negatives: self.tn,
             false_negatives: self.r#fn,
             positive_rate: (self.tp + self.r#fn) as f64 / total,
+        }
+    }
+}
+
+/// Streaming mean/variance accumulator: the same arithmetic as
+/// `NumStats::push_moments` / `NumStats::merge`, without the digest machinery
+/// the model paths never use.
+///
+/// This is the shared statistic under two different jobs. The SGD fit
+/// accumulates one per feature for standardization; Gaussian Naive Bayes
+/// accumulates one per (class, feature), because its fitted parameters *are*
+/// grouped moments. In both, per-chunk partials are folded in chunk order, so
+/// the result is deterministic for a given thread count.
+#[derive(Clone, Copy, Default)]
+pub struct Mom {
+    pub n: u64,
+    pub mean: f64,
+    pub m2: f64,
+}
+
+impl Mom {
+    #[inline(always)]
+    pub fn push(&mut self, x: f64) {
+        self.n += 1;
+        let delta = x - self.mean;
+        self.mean += delta / (self.n as f64);
+        self.m2 += delta * (x - self.mean);
+    }
+
+    pub fn merge(&mut self, o: &Mom) {
+        if o.n == 0 {
+            return;
+        }
+        if self.n == 0 {
+            *self = *o;
+            return;
+        }
+        let n_combined = self.n + o.n;
+        let delta = o.mean - self.mean;
+        self.mean += delta * (o.n as f64 / n_combined as f64);
+        self.m2 += o.m2 + delta * delta * (self.n as f64) * (o.n as f64) / (n_combined as f64);
+        self.n = n_combined;
+    }
+
+    /// Population variance, `m2 / n` -- the convention scikit-learn's
+    /// `GaussianNB` and `np.var` use, which the differential tests rely on.
+    pub fn var_pop(&self) -> f64 {
+        if self.n == 0 {
+            0.0
+        } else {
+            self.m2 / self.n as f64
         }
     }
 }
@@ -598,27 +668,7 @@ fn fit_sgd(
         let layout = csv_layout(bytes, delim_byte, has_header)?;
         let col_names = &layout.col_names;
 
-        let target_idx = col_names
-            .iter()
-            .position(|c| c == &target)
-            .ok_or_else(|| format!("target column {target:?} not found"))?;
-
-        let feature_idx: Vec<usize> = match &features {
-            Some(names) => names
-                .iter()
-                .map(|n| {
-                    col_names
-                        .iter()
-                        .position(|c| c == n)
-                        .ok_or_else(|| format!("feature column {n:?} not found"))
-                })
-                .collect::<Result<_, _>>()?,
-            None => (0..col_names.len()).filter(|&i| i != target_idx).collect(),
-        };
-        if feature_idx.is_empty() {
-            return Err("no feature columns selected".to_string());
-        }
-
+        let (target_idx, feature_idx) = select_columns(col_names, &target, &features)?;
         let p = feature_idx.len();
 
         let data_bytes = &bytes[layout.data_start..];
@@ -714,42 +764,6 @@ fn fit_sgd(
             cache_y = vec![0.0f64; n_rows];
             cache_xx = vec![0.0f64; n_rows];
             cache_valid = vec![false; n_rows];
-        }
-
-        // Same arithmetic as `NumStats::push_moments` / `NumStats::merge`,
-        // without the digest machinery this path never uses. Partials are
-        // folded in chunk order, so the moments are deterministic for a given
-        // thread count -- and identical whether or not the cache is in use,
-        // which the cross-budget bit-identity depends on.
-        #[derive(Clone, Copy, Default)]
-        struct Mom {
-            n: u64,
-            mean: f64,
-            m2: f64,
-        }
-        impl Mom {
-            #[inline(always)]
-            fn push(&mut self, x: f64) {
-                self.n += 1;
-                let delta = x - self.mean;
-                self.mean += delta / (self.n as f64);
-                self.m2 += delta * (x - self.mean);
-            }
-            fn merge(&mut self, o: &Mom) {
-                if o.n == 0 {
-                    return;
-                }
-                if self.n == 0 {
-                    *self = *o;
-                    return;
-                }
-                let n_combined = self.n + o.n;
-                let delta = o.mean - self.mean;
-                self.mean += delta * (o.n as f64 / n_combined as f64);
-                self.m2 +=
-                    o.m2 + delta * delta * (self.n as f64) * (o.n as f64) / (n_combined as f64);
-                self.n = n_combined;
-            }
         }
 
         // Carve the flat buffers into per-chunk disjoint slices so the fill
@@ -1141,6 +1155,391 @@ fn fit_sgd(
         cm.set_item("fn", m.false_negatives)?;
         out.set_item("confusion_matrix", cm)?;
     }
+    Ok(out.into())
+}
+
+/// Resolve the target and feature columns a fit will use.
+///
+/// Shared by every model entry point so they agree on the rules: an explicit
+/// feature list must match exactly, an omitted one means every column except
+/// the target, and an empty selection is an error rather than a degenerate
+/// fit.
+fn select_columns(
+    col_names: &[String],
+    target: &str,
+    features: &Option<Vec<String>>,
+) -> Result<(usize, Vec<usize>), String> {
+    let target_idx = col_names
+        .iter()
+        .position(|c| c == target)
+        .ok_or_else(|| format!("target column {target:?} not found"))?;
+
+    let feature_idx: Vec<usize> = match features {
+        Some(names) => names
+            .iter()
+            .map(|n| {
+                col_names
+                    .iter()
+                    .position(|c| c == n)
+                    .ok_or_else(|| format!("feature column {n:?} not found"))
+            })
+            .collect::<Result<_, _>>()?,
+        None => (0..col_names.len()).filter(|&i| i != target_idx).collect(),
+    };
+    if feature_idx.is_empty() {
+        return Err("no feature columns selected".to_string());
+    }
+    Ok((target_idx, feature_idx))
+}
+
+/// Outcome of a Gaussian Naive Bayes fit, before conversion to a Python dict.
+struct GnbOutcome {
+    feature_names: Vec<String>,
+    class_counts: [u64; 2],
+    priors: [f64; 2],
+    theta: [Vec<f64>; 2],
+    var: [Vec<f64>; 2],
+    train_n: usize,
+    test_n: usize,
+    metrics: ClassificationMetrics,
+}
+
+/// Fit a binary Gaussian Naive Bayes classifier from CSV.
+///
+/// Naive Bayes is the model whose fitted parameters *are* summary statistics:
+/// a class prior and, per (class, feature), a mean and variance. Training is
+/// therefore one chunk-parallel grouped-moments pass -- the same shape as the
+/// closed-form solver's X'X accumulation -- and evaluation is a second
+/// parallel pass that scores the held-out rows. There are no epochs, no
+/// learning rate, and no cache: memory is O(classes x features) regardless of
+/// file size, at full parallel speed. Per-chunk partials fold in chunk order,
+/// so the fit is deterministic for a given thread count.
+///
+/// The target column must contain only 0 and 1, as for
+/// [`csv_logistic_regression`].
+///
+/// `var_smoothing` matches scikit-learn's `GaussianNB` exactly: the largest
+/// per-feature variance of the *pooled* training data, times this factor, is
+/// added to every class variance. That keeps a zero-variance (constant)
+/// feature from putting a division by zero into every score. Variances are
+/// additionally floored at the smallest positive f64 so even the fully
+/// degenerate case (every feature constant, smoothing 0) stays finite.
+///
+/// Returned `theta` (per-class means) and `var` (per-class smoothed
+/// variances) are directly comparable with scikit-learn's `theta_` and
+/// `var_`, which the differential tests assert.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (path, target, features=None, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, var_smoothing=1e-9))]
+pub fn csv_gaussian_nb(
+    py: Python<'_>,
+    path: String,
+    target: String,
+    features: Option<Vec<String>>,
+    train_frac: f64,
+    seed: u64,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+    shuffle: bool,
+    var_smoothing: f64,
+) -> PyResult<PyObject> {
+    if !(0.0 < train_frac && train_frac < 1.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "train_frac must be in (0,1)",
+        ));
+    }
+    if !(var_smoothing.is_finite() && var_smoothing >= 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "var_smoothing must be non-negative and finite",
+        ));
+    }
+
+    let delim_byte = delimiter.and_then(|d| d.bytes().next());
+    let path_for_thread = path.clone();
+    let target_for_thread = target.clone();
+
+    let result = py.allow_threads(move || -> Result<GnbOutcome, String> {
+        let target = target_for_thread;
+        let file_data = load_file_data(&path_for_thread).map_err(|e| e.to_string())?;
+        let bytes = file_data.as_bytes();
+        let layout = csv_layout(bytes, delim_byte, has_header)?;
+        let col_names = &layout.col_names;
+
+        let (target_idx, feature_idx) = select_columns(col_names, &target, &features)?;
+        let p = feature_idx.len();
+
+        let data_bytes = &bytes[layout.data_start..];
+        let split_mode = layout.split_mode;
+
+        // Same chunk / prefix-sum machinery as the other fits: each chunk
+        // knows its global starting row, so both passes agree with the split
+        // about which row is which.
+        let byte_chunks: Vec<&[u8]> =
+            chunk_bytes_aligned(data_bytes, rayon::current_num_threads());
+        let chunk_rows: Vec<usize> = byte_chunks
+            .par_iter()
+            .map(|c| FastLineIter::new(c).count())
+            .collect();
+        let chunk_base: Vec<usize> = {
+            let mut bases = Vec::with_capacity(chunk_rows.len());
+            let mut acc = 0usize;
+            for &r in &chunk_rows {
+                bases.push(acc);
+                acc += r;
+            }
+            bases
+        };
+
+        let counted = chunk_rows.iter().sum::<usize>().min(sample_size);
+        let n_rows = counted.max(1);
+        let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
+
+        let is_train_mask: Option<Vec<bool>> = if shuffle {
+            let mut perm: Vec<usize> = (0..n_rows).collect();
+            for i in (1..n_rows).rev() {
+                let r = splitmix64(seed ^ (i as u64));
+                let j = (r % ((i + 1) as u64)) as usize;
+                perm.swap(i, j);
+            }
+            let mut mask = vec![false; n_rows];
+            for &idx in perm.iter().take(train_cut) {
+                mask[idx] = true;
+            }
+            Some(mask)
+        } else {
+            None
+        };
+        let is_train = |row_idx: usize| -> bool {
+            match &is_train_mask {
+                Some(mask) => mask[row_idx],
+                None => row_idx < train_cut,
+            }
+        };
+
+        // PASS 1: grouped moments over the train rows. Labels are validated
+        // for every row -- train and test -- so the same files are rejected
+        // no matter where the bad label lands.
+        struct TrainPartial {
+            moms: Vec<Mom>, // [class0 x p, class1 x p]
+            counts: [u64; 2],
+        }
+        let feature_idx_ref = &feature_idx;
+        let target_ref = &target;
+        let is_train_ref = &is_train;
+        let partials: Vec<TrainPartial> = byte_chunks
+            .par_iter()
+            .zip(chunk_base.par_iter())
+            .map(|(&chunk, &base)| -> Result<TrainPartial, String> {
+                let mut part = TrainPartial {
+                    moms: vec![Mom::default(); 2 * p],
+                    counts: [0, 0],
+                };
+                let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
+                let mut x = vec![0.0f64; p];
+                for (local, line) in FastLineIter::new(chunk).enumerate() {
+                    let row_idx = base + local;
+                    if row_idx >= n_rows {
+                        break;
+                    }
+                    fields.clear();
+                    for_each_field(line, split_mode, |_, f| fields.push(f));
+                    if fields.len() <= target_idx {
+                        continue;
+                    }
+                    let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                        continue;
+                    };
+                    if y != 0.0 && y != 1.0 {
+                        return Err(format!(
+                            "target column {target_ref:?} must contain only 0 and 1 \
+                             for classification; found {y}"
+                        ));
+                    }
+                    if !is_train_ref(row_idx) {
+                        continue;
+                    }
+                    let mut usable = true;
+                    for (j, &idx) in feature_idx_ref.iter().enumerate() {
+                        match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                            Some(v) => x[j] = v,
+                            None => {
+                                usable = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !usable {
+                        continue;
+                    }
+                    let cls = usize::from(y == 1.0);
+                    part.counts[cls] += 1;
+                    for j in 0..p {
+                        part.moms[cls * p + j].push(x[j]);
+                    }
+                }
+                Ok(part)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let mut moms = vec![Mom::default(); 2 * p];
+        let mut counts = [0u64; 2];
+        for part in &partials {
+            for (m, pm) in moms.iter_mut().zip(&part.moms) {
+                m.merge(pm);
+            }
+            counts[0] += part.counts[0];
+            counts[1] += part.counts[1];
+        }
+        let train_n = (counts[0] + counts[1]) as usize;
+
+        // Smoothing epsilon from the pooled variance, exactly as sklearn:
+        // merging the two class accumulators gives the moments of all train
+        // rows without a third accumulation.
+        let mut max_pooled_var = 0.0f64;
+        for j in 0..p {
+            let mut pooled = moms[j];
+            pooled.merge(&moms[p + j]);
+            max_pooled_var = max_pooled_var.max(pooled.var_pop());
+        }
+        let epsilon = var_smoothing * max_pooled_var;
+
+        let mut theta = [vec![0.0f64; p], vec![0.0f64; p]];
+        let mut var = [vec![0.0f64; p], vec![0.0f64; p]];
+        for cls in 0..2 {
+            for j in 0..p {
+                let m = &moms[cls * p + j];
+                theta[cls][j] = m.mean;
+                var[cls][j] = (m.var_pop() + epsilon).max(f64::MIN_POSITIVE);
+            }
+        }
+        let priors = [
+            counts[0] as f64 / (train_n.max(1)) as f64,
+            counts[1] as f64 / (train_n.max(1)) as f64,
+        ];
+
+        // Per-class scoring constants: ln P(c) - 0.5 sum_j ln(2 pi var_cj).
+        // A class with no training rows has prior 0 and ln -> -inf, which
+        // flows through the sigmoid to a hard 0 or 1 -- finite, and the
+        // honest answer for a class never observed.
+        let mut class_const = [0.0f64; 2];
+        let mut inv2var = [vec![0.0f64; p], vec![0.0f64; p]];
+        for cls in 0..2 {
+            let mut s = 0.0f64;
+            for j in 0..p {
+                s += (2.0 * std::f64::consts::PI * var[cls][j]).ln();
+                inv2var[cls][j] = 0.5 / var[cls][j];
+            }
+            class_const[cls] = priors[cls].ln() - 0.5 * s;
+        }
+
+        // PASS 2: score the held-out rows, chunk-parallel, partials folded in
+        // chunk order (log-loss is the one floating sum in the accumulator).
+        let theta_ref = &theta;
+        let inv2var_ref = &inv2var;
+        let evals: Vec<BinaryEval> = byte_chunks
+            .par_iter()
+            .zip(chunk_base.par_iter())
+            .map(|(&chunk, &base)| {
+                let mut ev = BinaryEval::default();
+                let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
+                let mut x = vec![0.0f64; p];
+                for (local, line) in FastLineIter::new(chunk).enumerate() {
+                    let row_idx = base + local;
+                    if row_idx >= n_rows {
+                        break;
+                    }
+                    if is_train_ref(row_idx) {
+                        continue;
+                    }
+                    fields.clear();
+                    for_each_field(line, split_mode, |_, f| fields.push(f));
+                    if fields.len() <= target_idx {
+                        continue;
+                    }
+                    let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                        continue;
+                    };
+                    let mut usable = true;
+                    for (j, &idx) in feature_idx_ref.iter().enumerate() {
+                        match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                            Some(v) => x[j] = v,
+                            None => {
+                                usable = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !usable {
+                        continue;
+                    }
+                    let mut ll0 = 0.0f64;
+                    let mut ll1 = 0.0f64;
+                    for j in 0..p {
+                        let d0 = x[j] - theta_ref[0][j];
+                        let d1 = x[j] - theta_ref[1][j];
+                        ll0 += d0 * d0 * inv2var_ref[0][j];
+                        ll1 += d1 * d1 * inv2var_ref[1][j];
+                    }
+                    let logit = (class_const[1] - ll1) - (class_const[0] - ll0);
+                    ev.push(sigmoid(logit), y);
+                }
+                ev
+            })
+            .collect();
+
+        let mut eval = BinaryEval::default();
+        for ev in &evals {
+            eval.merge(ev);
+        }
+        let metrics = eval.finish();
+        let test_n = (metrics.true_positives
+            + metrics.false_positives
+            + metrics.true_negatives
+            + metrics.false_negatives) as usize;
+
+        let feature_names: Vec<String> =
+            feature_idx.iter().map(|&i| col_names[i].clone()).collect();
+
+        Ok(GnbOutcome {
+            feature_names,
+            class_counts: counts,
+            priors,
+            theta,
+            var,
+            train_n,
+            test_n,
+            metrics,
+        })
+    });
+
+    let fit = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+    let out = PyDict::new(py);
+    out.set_item("path", path)?;
+    out.set_item("target", target)?;
+    out.set_item("features", fit.feature_names)?;
+    out.set_item("train_n", fit.train_n)?;
+    out.set_item("test_n", fit.test_n)?;
+    out.set_item("class_counts", vec![fit.class_counts[0], fit.class_counts[1]])?;
+    out.set_item("priors", vec![fit.priors[0], fit.priors[1]])?;
+    let [theta0, theta1] = fit.theta;
+    out.set_item("theta", vec![theta0, theta1])?;
+    let [var0, var1] = fit.var;
+    out.set_item("var", vec![var0, var1])?;
+    out.set_item("var_smoothing", var_smoothing)?;
+
+    let m = fit.metrics;
+    out.set_item("accuracy", m.accuracy)?;
+    out.set_item("log_loss", m.log_loss)?;
+    out.set_item("roc_auc", m.roc_auc)?;
+    out.set_item("positive_rate", m.positive_rate)?;
+    let cm = PyDict::new(py);
+    cm.set_item("tp", m.true_positives)?;
+    cm.set_item("fp", m.false_positives)?;
+    cm.set_item("tn", m.true_negatives)?;
+    cm.set_item("fn", m.false_negatives)?;
+    out.set_item("confusion_matrix", cm)?;
     Ok(out.into())
 }
 

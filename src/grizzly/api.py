@@ -378,6 +378,66 @@ def csv_logistic_regression(
     )
 
 
+def csv_gaussian_nb(
+    path: str,
+    *,
+    target: str,
+    features: list[str] | None = None,
+    train_frac: float = 0.8,
+    seed: int = 0,
+    sample_size: int = 1_000_000,
+    delimiter: str | None = None,
+    has_header: bool | None = None,
+    shuffle: bool = True,
+    var_smoothing: float = 1e-9,
+) -> dict[str, Any]:
+    """Fit a binary Gaussian Naive Bayes classifier from CSV.
+
+    Naive Bayes is the model whose fitted parameters *are* summary statistics:
+    a class prior and a per-(class, feature) mean and variance. Training is one
+    chunk-parallel grouped-moments pass over the file and evaluation a second,
+    so there are no epochs, no learning rate, and no cache — memory is
+    O(classes × features) regardless of file size, at full parallel speed.
+    This is the strongest bounded-memory guarantee of any model here: even
+    `cache_budget_mb` does not exist because nothing needs caching.
+
+    The target column must contain only 0 and 1, as for
+    :func:`csv_logistic_regression`; a parseable label outside that set raises.
+
+    `var_smoothing` matches scikit-learn's ``GaussianNB`` exactly — the largest
+    per-feature variance of the pooled training data, times this factor, is
+    added to every class variance so a constant feature cannot inject a
+    division by zero.
+
+    Returns a dict with `priors`, `theta` (per-class means), `var` (per-class
+    smoothed variances) — directly comparable with scikit-learn's ``theta_``
+    and ``var_`` — plus `class_counts`, `train_n`, `test_n`, and held-out
+    `accuracy`, `log_loss`, `roc_auc`, `positive_rate`, and
+    `confusion_matrix`.
+
+    Raises:
+        ValueError: if the target contains a parseable label outside {0, 1}.
+    """
+    native = _load_native()
+    if native is None:
+        raise RuntimeError(
+            "csv_gaussian_nb requires the native Rust extension; "
+            "build with `maturin develop`."
+        )
+    return native.csv_gaussian_nb(
+        path,
+        target=target,
+        features=features,
+        train_frac=train_frac,
+        seed=seed,
+        sample_size=sample_size,
+        delimiter=delimiter,
+        has_header=has_header,
+        shuffle=shuffle,
+        var_smoothing=var_smoothing,
+    )
+
+
 def csv_linear_regression(
     path: str,
     *,

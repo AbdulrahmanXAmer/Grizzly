@@ -68,6 +68,27 @@ def fit_grizzly_logistic(path: str, target: str) -> tuple[float, list[float], di
     return elapsed, list(result["coef"]), metrics
 
 
+def fit_grizzly_gnb(path: str, target: str) -> tuple[float, list[float], dict[str, float]]:
+    import grizzly
+
+    start = time.perf_counter()
+    result = grizzly.csv_gaussian_nb(
+        path,
+        target=target,
+        train_frac=TRAIN_FRAC,
+        seed=SEED,
+        sample_size=100_000_000,
+    )
+    elapsed = time.perf_counter() - start
+    metrics = {
+        "accuracy": float(result["accuracy"]),
+        "roc_auc": float(result["roc_auc"]),
+        "log_loss": float(result["log_loss"]),
+    }
+    # GNB has no coefficient vector; class-1 means fill the comparison slot.
+    return elapsed, [float(v) for v in result["theta"][1]], metrics
+
+
 # ---------------------------------------------------------------------------
 # pandas / polars + scikit-learn
 # ---------------------------------------------------------------------------
@@ -175,11 +196,57 @@ def fit_pandas_sgd(path: str, target: str) -> tuple[float, list[float], dict[str
     return elapsed, [float(c) for c in coef], metrics
 
 
+def _sklearn_gnb(X, y) -> tuple[list[float], dict[str, float]]:
+    """scikit-learn GaussianNB; defaults match grizzly's (var_smoothing 1e-9)."""
+    from sklearn.model_selection import train_test_split
+    from sklearn.naive_bayes import GaussianNB
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, train_size=TRAIN_FRAC, random_state=SEED
+    )
+    model = GaussianNB().fit(X_train, y_train)
+    coef = [float(v) for v in model.theta_[1]]
+    return coef, _sklearn_metrics(model, X_test, y_test)
+
+
+def fit_pandas_gnb(path: str, target: str) -> tuple[float, list[float], dict[str, float]]:
+    import pandas as pd
+    import sklearn.metrics  # noqa: F401  (pre-import, see _sklearn_lbfgs)
+    import sklearn.model_selection  # noqa: F401
+    import sklearn.naive_bayes  # noqa: F401
+
+    start = time.perf_counter()
+    df = pd.read_csv(path)
+    y = df.pop(target).to_numpy()
+    X = df.to_numpy()
+    coef, metrics = _sklearn_gnb(X, y)
+    elapsed = time.perf_counter() - start
+    return elapsed, coef, metrics
+
+
+def fit_polars_gnb(path: str, target: str) -> tuple[float, list[float], dict[str, float]]:
+    import polars as pl
+    import sklearn.metrics  # noqa: F401  (pre-import, see _sklearn_lbfgs)
+    import sklearn.model_selection  # noqa: F401
+    import sklearn.naive_bayes  # noqa: F401
+
+    start = time.perf_counter()
+    df = pl.read_csv(path)
+    y = df.get_column(target).to_numpy()
+    X = df.drop(target).to_numpy()
+    coef, metrics = _sklearn_gnb(X, y)
+    elapsed = time.perf_counter() - start
+    return elapsed, coef, metrics
+
+
 METHODS = {
     "grizzly_logistic": fit_grizzly_logistic,
     "pandas_sklearn": fit_pandas_sklearn,
     "polars_sklearn": fit_polars_sklearn,
     "pandas_sgd": fit_pandas_sgd,
+    "grizzly_gnb": fit_grizzly_gnb,
+    "pandas_gnb": fit_pandas_gnb,
+    "polars_gnb": fit_polars_gnb,
 }
 
 

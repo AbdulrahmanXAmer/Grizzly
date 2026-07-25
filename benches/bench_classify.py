@@ -5,16 +5,25 @@ per method is the full practitioner journey -- read the file, make an 80/20
 split, fit, score on the held-out set -- because "how fast is training" only
 means something with the loading included.
 
-Methods compared, each through its own idiomatic path:
+Methods compared, each through its own idiomatic path, in two model families:
 
     grizzly_logistic  csv_logistic_regression, 10 epochs, cached replay
     pandas_sklearn    pandas.read_csv -> sklearn LogisticRegression (L-BFGS)
     polars_sklearn    polars.read_csv -> sklearn LogisticRegression (L-BFGS)
     pandas_sgd        pandas.read_csv -> StandardScaler -> SGDClassifier(10)
 
+    grizzly_gnb       csv_gaussian_nb (one grouped-moments pass, no cache)
+    pandas_gnb        pandas.read_csv -> sklearn GaussianNB
+    polars_gnb        polars.read_csv -> sklearn GaussianNB
+
 Same discipline as the other suites: one cold process per repetition, first
 repetition discarded as warmup, median reported, peak RSS alongside time, and a
 correctness gate.
+
+The gate compares within a family only. Logistic regression and Naive Bayes
+are different models that legitimately reach different held-out numbers on the
+same data; cross-family agreement would gate on modelling philosophy, not
+correctness.
 
 The gate is on the *metrics*, not the coefficients, and that is deliberate.
 `bench_fit` gates on coefficients because for least squares every method is
@@ -47,7 +56,12 @@ from benches.gen_data import dataset_path, ensure_datasets, sha256
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-ALL_METHODS = ("grizzly_logistic", "pandas_sklearn", "polars_sklearn", "pandas_sgd")
+FAMILIES = {
+    "logistic": ("grizzly_logistic", "pandas_sklearn", "polars_sklearn", "pandas_sgd"),
+    "gnb": ("grizzly_gnb", "pandas_gnb", "polars_gnb"),
+}
+ALL_METHODS = tuple(m for methods in FAMILIES.values() for m in methods)
+FAMILY_OF = {m: fam for fam, methods in FAMILIES.items() for m in methods}
 
 # Spread allowed across methods on the held-out set. Two fits on equally sized
 # but different splits move these by well under a point; anything larger is a
@@ -109,6 +123,7 @@ def measure(method: str, path: Path, repetitions: int, verbose: bool) -> dict[st
     ordered = sorted(seconds)
     result = {
         "method": method,
+        "family": FAMILY_OF[method],
         "repetitions": repetitions,
         "timing": {
             "median_ms": statistics.median(ordered) * 1000,
@@ -133,21 +148,24 @@ def measure(method: str, path: Path, repetitions: int, verbose: bool) -> dict[st
 
 
 def check_agreement(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """Every method must land on an equally good classifier.
+    """Every method must land on an equally good classifier *within its family*.
 
     Compared as a spread across methods rather than against a designated
     reference: there is no privileged "correct" answer to defer to here, and any
-    one method drifting shows up in the spread either way.
+    one method drifting shows up in the spread either way. Families are gated
+    separately because different models legitimately score differently.
     """
     problems: list[str] = []
-    for metric, tolerance in GATED_METRICS.items():
-        values = [r[metric] for r in results]
-        spread = max(values) - min(values)
-        if spread > tolerance:
-            problems.append(
-                f"{metric} spread {spread:.4f} exceeds {tolerance}: "
-                + ", ".join(f"{r['method']}={r[metric]:.4f}" for r in results)
-            )
+    for family in FAMILIES:
+        members = [r for r in results if r["family"] == family]
+        for metric, tolerance in GATED_METRICS.items():
+            values = [r[metric] for r in members]
+            spread = max(values) - min(values)
+            if spread > tolerance:
+                problems.append(
+                    f"[{family}] {metric} spread {spread:.4f} exceeds {tolerance}: "
+                    + ", ".join(f"{r['method']}={r[metric]:.4f}" for r in members)
+                )
 
     return {"status": "ok" if not problems else "mismatch", "problems": problems}
 
@@ -213,12 +231,14 @@ def main() -> int:
             "headline_statistic": "median",
             "process_isolation": "one fresh interpreter per repetition",
             "agreement_gate": (
-                "held-out metrics must agree across methods within "
-                f"{ACCURACY_ABS_TOL} accuracy / {ROC_AUC_ABS_TOL} ROC-AUC / "
-                f"{LOG_LOSS_ABS_TOL} log-loss; coefficients are not gated "
-                "because logistic regression has no closed form and a "
-                "converged L-BFGS fit legitimately differs from a "
-                "ten-epoch SGD one"
+                "held-out metrics must agree across methods of the same model "
+                f"family within {ACCURACY_ABS_TOL} accuracy / "
+                f"{ROC_AUC_ABS_TOL} ROC-AUC / {LOG_LOSS_ABS_TOL} log-loss; "
+                "families are gated separately because different models "
+                "legitimately score differently, and coefficients are not "
+                "gated because logistic regression has no closed form and a "
+                "converged L-BFGS fit legitimately differs from a ten-epoch "
+                "SGD one"
             ),
         },
         "agreement": agreement,
