@@ -73,7 +73,7 @@ def binary_csv(tmp_path):
 
 def test_reports_every_documented_metric(binary_csv):
     result = grizzly.csv_logistic_regression(
-        binary_csv, target="target", epochs=20, learning_rate=0.5, sample_size=FULL_COVERAGE
+        binary_csv, target="target", epochs=20, learning_rate=0.05, sample_size=FULL_COVERAGE
     )
 
     for key in (
@@ -114,7 +114,7 @@ def test_uses_every_row_across_the_split(binary_csv):
 
 def test_learns_something_better_than_guessing(binary_csv):
     result = grizzly.csv_logistic_regression(
-        binary_csv, target="target", epochs=20, learning_rate=0.5, sample_size=FULL_COVERAGE
+        binary_csv, target="target", epochs=20, learning_rate=0.05, sample_size=FULL_COVERAGE
     )
     # The generating model is noisy, so perfect accuracy is impossible; the
     # point is that it lands well clear of the majority-class baseline.
@@ -132,7 +132,7 @@ def test_recovers_the_generating_weights(tmp_path):
         tmp_path / "recover.csv", n_rows=40_000, n_features=5, seed=7
     )
     result = grizzly.csv_logistic_regression(
-        path, target="target", epochs=60, learning_rate=0.5, sample_size=FULL_COVERAGE
+        path, target="target", epochs=60, learning_rate=0.05, sample_size=FULL_COVERAGE
     )
     scale = max(abs(w) for w in weights)
     for name, got, want in zip(result["features"], result["coef"], weights):
@@ -140,7 +140,7 @@ def test_recovers_the_generating_weights(tmp_path):
 
 
 def test_is_deterministic_for_a_given_seed(binary_csv):
-    kwargs = dict(target="target", epochs=10, learning_rate=0.4, seed=42, sample_size=FULL_COVERAGE)
+    kwargs = dict(target="target", epochs=10, learning_rate=0.04, seed=42, sample_size=FULL_COVERAGE)
     first = grizzly.csv_logistic_regression(binary_csv, **kwargs)
     second = grizzly.csv_logistic_regression(binary_csv, **kwargs)
     assert first["coef"] == second["coef"]
@@ -154,7 +154,7 @@ def test_caching_does_not_change_the_answer(binary_csv):
     The cache exists only to avoid re-parsing; if it changed the arithmetic it
     would be a silently different model depending on available memory.
     """
-    kwargs = dict(target="target", epochs=8, learning_rate=0.4, sample_size=FULL_COVERAGE)
+    kwargs = dict(target="target", epochs=8, learning_rate=0.04, sample_size=FULL_COVERAGE)
     cached = grizzly.csv_logistic_regression(binary_csv, cache_budget_mb=512, **kwargs)
     streamed = grizzly.csv_logistic_regression(binary_csv, cache_budget_mb=0, **kwargs)
     assert cached["coef"] == streamed["coef"]
@@ -243,7 +243,7 @@ def test_metrics_match_sklearn_exactly_on_identical_rows(binary_csv):
     from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 
     result = grizzly.csv_logistic_regression(
-        binary_csv, target="target", epochs=20, learning_rate=0.5, sample_size=FULL_COVERAGE
+        binary_csv, target="target", epochs=20, learning_rate=0.05, sample_size=FULL_COVERAGE
     )
 
     with open(binary_csv, newline="") as fh:
@@ -279,7 +279,7 @@ def test_metrics_agree_with_sklearns_own_fit(binary_csv):
     from sklearn.model_selection import train_test_split
 
     result = grizzly.csv_logistic_regression(
-        binary_csv, target="target", epochs=40, learning_rate=0.5, sample_size=FULL_COVERAGE
+        binary_csv, target="target", epochs=40, learning_rate=0.05, sample_size=FULL_COVERAGE
     )
 
     with open(binary_csv, newline="") as fh:
@@ -307,6 +307,12 @@ def test_coefficients_converge_toward_the_sklearn_optimum(binary_csv):
     the wrong place", so this asserts the *direction* as well: deviation from
     sklearn's optimum shrinks as epochs increase. That is the property which
     distinguishes optimizer error from a bug in the gradient.
+
+    It shrinks to a floor, not to zero: the two sides train on different rows,
+    so their maximum-likelihood coefficients genuinely differ, and past a few
+    tens of epochs the remaining gap is that sampling difference rather than
+    anything more training can remove. Hence the wide epoch gap below -- closer
+    together, this would be measuring noise around the floor and would flake.
     """
     import numpy as np
     from sklearn.linear_model import LogisticRegression
@@ -329,11 +335,11 @@ def test_coefficients_converge_toward_the_sklearn_optimum(binary_csv):
             binary_csv,
             target="target",
             epochs=epochs,
-            learning_rate=0.5,
+            learning_rate=0.05,
             sample_size=FULL_COVERAGE,
         )
         return float(np.max(np.abs(np.asarray(fit["coef"]) - reference))) / scale
 
-    few, many = deviation(10), deviation(120)
+    few, many = deviation(5), deviation(120)
     assert many < few, f"more epochs did not help: {few:.4f} -> {many:.4f}"
-    assert many < 0.20, f"coefficients {many:.4f} of scale away from the optimum"
+    assert many < 0.10, f"coefficients {many:.4f} of scale away from the optimum"

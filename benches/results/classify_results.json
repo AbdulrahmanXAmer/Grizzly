@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "timestamp_utc": "2026-07-25T00:02:08+00:00",
+    "cpu": "Apple M1",
+    "cpu_count": 8,
+    "memory_bytes": 8589934592,
+    "platform": "macOS-15.7.7-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "python": "3.14.6",
+    "python_implementation": "CPython",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo_profile": "release (lto=true, codegen-units=1, opt-level=3)",
+    "git": {
+      "commit": "a68114c2e042b8a58b5eb6a91bf609c5072c207c",
+      "branch": "track-a-reproducible-benchmarks",
+      "dirty": true
+    }
+  },
+  "dataset": {
+    "rows": 500000,
+    "feature_columns": 20,
+    "bytes": 95999562,
+    "sha256": "25e8a3eae5c4191c18e95112a9778b05b1e4e26c0e49d74cf71a1cb26a2d0ddc",
+    "generator": "labels sampled from Bernoulli(sigmoid(w.x + b)) rather than thresholded, so the classes overlap and the logistic likelihood has a finite maximum"
+  },
+  "methodology": {
+    "workload": "read CSV from disk, 80/20 train/test split, fit a binary classifier, score accuracy / ROC-AUC / log-loss on the held-out set; scaling inside the timed region where the method requires it",
+    "sgd_epochs": 10,
+    "repetitions": 5,
+    "headline_statistic": "median",
+    "process_isolation": "one fresh interpreter per repetition",
+    "agreement_gate": "held-out metrics must agree across methods within 0.02 accuracy / 0.02 ROC-AUC / 0.05 log-loss; coefficients are not gated because logistic regression has no closed form and a converged L-BFGS fit legitimately differs from a ten-epoch SGD one"
+  },
+  "agreement": {
+    "status": "ok",
+    "problems": []
+  },
+  "results": [
+    {
+      "method": "grizzly_logistic",
+      "repetitions": 5,
+      "timing": {
+        "median_ms": 543.3585410064552,
+        "min_ms": 535.427458002232,
+        "max_ms": 597.2806670033606,
+        "stdev_ms": 25.493706213010363
+      },
+      "peak_rss_bytes": 197984256,
+      "accuracy": 0.8556,
+      "roc_auc": 0.9356598064728117,
+      "log_loss": 0.3225846620774586,
+      "coef": [
+        1.1164096636029603,
+        0.7587319499225068,
+        -0.3808825318272121,
+        -0.7011536480998896,
+        0.06222855425537583,
+        -0.3168187886906991,
+        0.841153670847229,
+        -0.6078725952854472,
+        -0.10661303846410805,
+        0.20510251868237933,
+        1.2343393541299985,
+        0.052584452995388574,
+        -0.7192584999110206,
+        0.8069224767411455,
+        0.35109004340711003,
+        -0.7271723478711057,
+        1.238333880975811,
+        1.3971287703937754,
+        0.9654469179670383,
+        1.245173263578882
+      ]
+    },
+    {
+      "method": "pandas_sklearn",
+      "repetitions": 5,
+      "timing": {
+        "median_ms": 777.7388329996029,
+        "min_ms": 752.7441249985714,
+        "max_ms": 788.9193749870174,
+        "stdev_ms": 14.498023021159236
+      },
+      "peak_rss_bytes": 556023808,
+      "accuracy": 0.85886,
+      "roc_auc": 0.9379575681844676,
+      "log_loss": 0.3164516058589834,
+      "coef": [
+        1.0367507486394223,
+        0.7769471029703834,
+        -0.244712925333069,
+        -0.7223946611765165,
+        0.027583711356202335,
+        -0.28114135146130115,
+        0.854792744003761,
+        -0.594204914667292,
+        -0.0733843966591592,
+        0.24798474867688466,
+        1.2258176071314986,
+        0.012925121242343674,
+        -0.6460441608398768,
+        0.7649843582601735,
+        0.3576642622024897,
+        -0.7531417882769809,
+        1.2384091435076254,
+        1.451854220763473,
+        0.933620830218157,
+        1.2161320345269724
+      ]
+    },
+    {
+      "method": "polars_sklearn",
+      "repetitions": 5,
+      "timing": {
+        "median_ms": 284.6859169949312,
+        "min_ms": 281.48758300812915,
+        "max_ms": 296.82395899726544,
+        "stdev_ms": 6.88591768921084
+      },
+      "peak_rss_bytes": 528859136,
+      "accuracy": 0.85886,
+      "roc_auc": 0.9379575681844676,
+      "log_loss": 0.3164516058589834,
+      "coef": [
+        1.0367507486394223,
+        0.7769471029703834,
+        -0.244712925333069,
+        -0.7223946611765165,
+        0.027583711356202335,
+        -0.28114135146130115,
+        0.854792744003761,
+        -0.594204914667292,
+        -0.0733843966591592,
+        0.24798474867688466,
+        1.2258176071314986,
+        0.012925121242343674,
+        -0.6460441608398768,
+        0.7649843582601735,
+        0.3576642622024897,
+        -0.7531417882769809,
+        1.2384091435076254,
+        1.451854220763473,
+        0.933620830218157,
+        1.2161320345269724
+      ]
+    },
+    {
+      "method": "pandas_sgd",
+      "repetitions": 5,
+      "timing": {
+        "median_ms": 1462.3495419946266,
+        "min_ms": 1443.1597500079079,
+        "max_ms": 1854.2159579956206,
+        "stdev_ms": 183.75852870800804
+      },
+      "peak_rss_bytes": 597917696,
+      "accuracy": 0.85871,
+      "roc_auc": 0.9373412957458914,
+      "log_loss": 0.3180381369083553,
+      "coef": [
+        1.0159746224714252,
+        0.8350479970157464,
+        -0.28291186353875825,
+        -0.7659689412654624,
+        0.012548432448596021,
+        -0.19901358269799188,
+        0.894814914800474,
+        -0.590962930346566,
+        -0.074462218776435,
+        0.23180993226357596,
+        1.1373792894895949,
+        0.001920782565505713,
+        -0.6055190640057403,
+        0.7686910170254962,
+        0.3739545877193954,
+        -0.8561848971427172,
+        1.1884815102156907,
+        1.4479323690454018,
+        0.9408361038007813,
+        1.186734037492687
+      ]
+    }
+  ]
+}
