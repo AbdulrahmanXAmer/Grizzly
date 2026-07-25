@@ -243,8 +243,9 @@ def csv_sgd_regression(
     memory and O(n p^2) time; this holds only the weight vector, so memory is
     O(p) and each epoch is O(n p). It never builds a design matrix.
 
-    Features are standardized on the fly from a prior profiling pass, because a
-    single global learning rate cannot suit features on very different scales.
+    Features are standardized on the fly, from moments computed in the same
+    parallel pass that reads the data, because a single global learning rate
+    cannot suit features on very different scales.
     Coefficients are returned in the original feature space, so they are
     directly comparable with the closed-form solver's.
 
@@ -263,13 +264,15 @@ def csv_sgd_regression(
     a property of z-score scaling rather than of SGD; winsorize such columns
     before fitting.
 
-    `cache_budget_mb` trades memory for epoch speed. Parsing is most of an
-    epoch's cost, so when the standardized training matrix fits under the
-    budget, epoch 0 fills a cache while it streams and later epochs replay
-    from memory — parse once, train N times. The fitted weights are
-    bit-identical either way, because replay feeds the exact values streaming
-    would have recomputed through the same update. Set 0 to always stream;
-    over-budget data falls back to streaming on its own.
+    `cache_budget_mb` trades memory for speed. Parsing is most of the cost of
+    a fit, and it otherwise happens once per epoch plus once for evaluation;
+    when the standardized matrix fits under the budget, the file is parsed
+    exactly once instead — in parallel, into a cache that every epoch and the
+    evaluation pass then replay from memory. The fitted weights are
+    bit-identical either way, because the fill computes the exact values
+    streaming would have recomputed, in the same per-row order, through the
+    same update. Set 0 to always stream in O(p) memory; over-budget data
+    falls back to streaming on its own.
 
     Returns a dict with `coef`, `intercept`, `r2` (test set), `train_n`,
     `test_n`, `epochs`, and `final_train_mse`.

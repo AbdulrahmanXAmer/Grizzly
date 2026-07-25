@@ -20,7 +20,6 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use ahash::AHashMap;
 use csv::ReaderBuilder;
 use memchr::memchr;
 use rayon::prelude::*;
@@ -29,7 +28,7 @@ use crate::parse::{
     chunk_bytes_aligned, detect_header_smart, for_each_field, get_fields, sniff_delimiter_simd,
     trim_bytes, FastLineIter, SplitMode,
 };
-use crate::{csv_standardize_params, load_file_data};
+use crate::load_file_data;
 
 /// Result of fitting a linear model, before conversion into a Python dict:
 /// (feature names, coefficients, intercept, train rows, test rows used, r2,
@@ -341,6 +340,36 @@ impl Loss {
     }
 }
 
+/// Dot product with four independent accumulators.
+///
+/// The naive loop is a strict sequential chain of floating-point adds --
+/// each one waits ~4 cycles on the previous -- which makes it the single
+/// hottest dependency in the training epoch. Splitting across four
+/// accumulators lets the CPU overlap them, at the cost of a different (but
+/// fixed and deterministic) summation order than left-to-right. Every
+/// prediction in this module -- training and evaluation, cached and streamed
+/// -- goes through this one function, which is what keeps those paths
+/// bit-identical to each other.
+#[inline(always)]
+pub fn dot(w: &[f64], x: &[f64]) -> f64 {
+    let p = w.len().min(x.len());
+    let (mut a0, mut a1, mut a2, mut a3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut j = 0;
+    while j + 4 <= p {
+        a0 += w[j] * x[j];
+        a1 += w[j + 1] * x[j + 1];
+        a2 += w[j + 2] * x[j + 2];
+        a3 += w[j + 3] * x[j + 3];
+        j += 4;
+    }
+    let mut tail = 0.0f64;
+    while j < p {
+        tail += w[j] * x[j];
+        j += 1;
+    }
+    (a0 + a2) + (a1 + a3) + tail
+}
+
 /// One SGD update, shared verbatim by the streaming and replay paths.
 ///
 /// Kept as a single function so the cached-epoch replay cannot drift from the
@@ -348,6 +377,13 @@ impl Loss {
 /// makes the two paths bit-identical, and the tests assert exactly that. The
 /// `loss` parameter is what lets regression and classification share it:
 /// only the scalar residual differs.
+///
+/// `xx` is the row's precomputed `sum(x_j^2)`, hoisted to the caller because
+/// it is constant across epochs: the cached path computes it once at fill time
+/// instead of on every one of N epochs, and the streaming path computes it
+/// per row exactly as this function used to. `track_loss` gates the loss-value
+/// accumulation, which never feeds the weights -- only the final epoch's value
+/// is ever reported, so the other epochs need not pay the `ln` per row.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub fn sgd_step(
@@ -358,17 +394,18 @@ pub fn sgd_step(
     lr: f64,
     l2: f64,
     grad_clip: f64,
+    xx: f64,
     loss: Loss,
+    track_loss: bool,
     sq_err: &mut f64,
     seen: &mut usize,
 ) {
     let p = w.len();
-    let mut pred = *b;
-    for j in 0..p {
-        pred += w[j] * x[j];
-    }
+    let pred = *b + dot(w, x);
     let err = loss.residual(pred, y);
-    *sq_err += loss.loss(pred, y);
+    if track_loss {
+        *sq_err += loss.loss(pred, y);
+    }
     *seen += 1;
 
     // Clip the per-sample gradient. Real data has outliers that survive
@@ -377,7 +414,7 @@ pub fn sgd_step(
     // step large enough to diverge the fit. Clipping bounds any one row's
     // influence without the caller hand-tuning the learning rate per dataset.
     // intercept gradient is err * 1, hence the leading 1.0
-    let grad_sq = 1.0 + x.iter().map(|v| v * v).sum::<f64>();
+    let grad_sq = 1.0 + xx;
     let grad_norm = err.abs() * grad_sq.sqrt();
     let step = if grad_norm > grad_clip && grad_norm > 0.0 {
         lr * (grad_clip / grad_norm)
@@ -399,12 +436,12 @@ pub fn sgd_step(
 /// training sets. This path holds only the weight vector, so memory is O(p)
 /// and each epoch is O(n p), and it never materialises a design matrix.
 ///
-/// Features are standardized on the fly using the mean and standard deviation
-/// from a prior profiling pass. That is not cosmetic: raw features on wildly
-/// different scales make a single global learning rate either diverge on the
-/// large ones or crawl on the small ones. Coefficients are converted back to
-/// the original feature space before returning, so they are directly
-/// comparable with the closed-form solver's.
+/// Features are standardized on the fly, using mean and standard deviation
+/// computed in the same parallel pass that reads the data. That is not
+/// cosmetic: raw features on wildly different scales make a single global
+/// learning rate either diverge on the large ones or crawl on the small ones.
+/// Coefficients are converted back to the original feature space before
+/// returning, so they are directly comparable with the closed-form solver's.
 ///
 /// Rows are visited in file order within each epoch. Shuffling a stream would
 /// mean buffering it, which would give up the bounded memory that is the point
@@ -550,28 +587,6 @@ fn fit_sgd(
         ));
     }
 
-    // Standardization statistics, from one profiling pass over the same file.
-    let stats_obj = csv_standardize_params(py, path.clone(), sample_size)?;
-    let stats_dict = stats_obj.bind(py).downcast::<PyDict>()?.clone();
-    let params_any = stats_dict
-        .get_item("params")?
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing params"))?;
-    let params = params_any.downcast::<PyDict>()?;
-    let mut moments: AHashMap<String, (f64, f64)> = AHashMap::new();
-    for (k, v) in params.iter() {
-        let name: String = k.extract()?;
-        let d = v.downcast::<PyDict>()?;
-        let mean: f64 = d
-            .get_item("mean")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing mean"))?
-            .extract()?;
-        let std: f64 = d
-            .get_item("std")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("missing std"))?
-            .extract()?;
-        moments.insert(name, (mean, std));
-    }
-
     let delim_byte = delimiter.and_then(|d| d.bytes().next());
     let path_for_thread = path.clone();
     let target_for_thread = target.clone();
@@ -604,26 +619,35 @@ fn fit_sgd(
             return Err("no feature columns selected".to_string());
         }
 
-        // Per-feature standardization constants. A feature with no usable
-        // spread is centred but not divided, which leaves it contributing
-        // nothing rather than producing NaN.
         let p = feature_idx.len();
-        let mut mean = vec![0.0f64; p];
-        let mut scale = vec![1.0f64; p];
-        for (j, &idx) in feature_idx.iter().enumerate() {
-            if let Some((m, s)) = moments.get(&col_names[idx]) {
-                mean[j] = *m;
-                if s.is_finite() && *s > 1e-12 {
-                    scale[j] = *s;
-                }
-            }
-        }
 
         let data_bytes = &bytes[layout.data_start..];
         let split_mode = layout.split_mode;
 
+        // Chunk the data once: the same newline-aligned chunks serve the row
+        // count here and the parallel cache fill below. Per-chunk counts
+        // prefix-sum into each chunk's global starting row index, which is
+        // what lets the fill run chunk-parallel while agreeing with the
+        // train/test split about which global row is which -- the same
+        // machinery the closed-form solver uses.
+        let byte_chunks: Vec<&[u8]> =
+            chunk_bytes_aligned(data_bytes, rayon::current_num_threads());
+        let chunk_rows: Vec<usize> = byte_chunks
+            .par_iter()
+            .map(|c| FastLineIter::new(c).count())
+            .collect();
+        let chunk_base: Vec<usize> = {
+            let mut bases = Vec::with_capacity(chunk_rows.len());
+            let mut acc = 0usize;
+            for &r in &chunk_rows {
+                bases.push(acc);
+                acc += r;
+            }
+            bases
+        };
+
         // Row count, for a split defined against the data rather than the cap.
-        let counted = FastLineIter::new(data_bytes).take(sample_size).count();
+        let counted = chunk_rows.iter().sum::<usize>().min(sample_size);
         let n_rows = counted.max(1);
         let train_cut = ((n_rows as f64) * train_frac).floor() as usize;
 
@@ -658,26 +682,220 @@ fn fit_sgd(
         let mut train_n = 0usize;
         let mut final_mse = 0.0f64;
 
-        // Multi-epoch training re-reads the file per epoch, and parsing is
-        // most of an epoch's cost. When the standardized training matrix fits
-        // under the caller's budget, epoch 0 fills a cache while it streams
-        // and later epochs replay from memory: parse once, train N times.
+        // Sequential parsing is the dominant cost of this fit. It used to
+        // happen up to epochs+2 times: a moments pre-pass for standardization,
+        // once per training epoch, and once for evaluation. It now happens
+        // exactly once, in parallel: a single fused pass computes per-feature
+        // Welford moments *and* (when the matrix of all rows fits under the
+        // caller's budget) writes each row's raw features, label, and a
+        // validity flag recording the same skip decisions the streaming path
+        // makes. A second parallel pass over memory standardizes the cache in
+        // place and precomputes each row's sum(x^2) -- constant across
+        // epochs, needed by the gradient clip. Every epoch is then a replay
+        // and the eval pass reads memory.
         //
-        // The budget decision uses train_cut (an upper bound on train rows),
-        // so it is made before any parsing. Over budget, or with the budget
-        // set to 0, every epoch streams — the bounded-memory behavior is the
-        // caller's to keep. Replay feeds the exact f64s streaming would have
-        // recomputed through the same sgd_step, so the fitted weights are
-        // bit-identical either way; the tests assert that.
-        let cache_bytes = train_cut.saturating_mul(p + 1).saturating_mul(8);
-        let use_cache = epochs > 1
-            && cache_budget_mb > 0
-            && cache_bytes <= cache_budget_mb.saturating_mul(1024 * 1024);
+        // Over budget, or with the budget set to 0, only the moments half of
+        // the pass runs and memory stays O(p) -- the bounded-memory behavior
+        // is the caller's to keep. Both paths take their moments from this
+        // same fused pass and compute every standardized value with the
+        // identical expression in identical per-row order, and replay visits
+        // rows in file order exactly as streaming does, so the fitted weights
+        // are bit-identical either way; the tests assert that.
+        let cache_bytes = n_rows.saturating_mul(p + 2).saturating_mul(8);
+        let use_cache =
+            cache_budget_mb > 0 && cache_bytes <= cache_budget_mb.saturating_mul(1024 * 1024);
+
         let mut cache_x: Vec<f64> = Vec::new();
         let mut cache_y: Vec<f64> = Vec::new();
+        let mut cache_xx: Vec<f64> = Vec::new();
+        let mut cache_valid: Vec<bool> = Vec::new();
         if use_cache {
-            cache_x.reserve_exact(train_cut.saturating_mul(p));
-            cache_y.reserve_exact(train_cut);
+            cache_x = vec![0.0f64; n_rows * p];
+            cache_y = vec![0.0f64; n_rows];
+            cache_xx = vec![0.0f64; n_rows];
+            cache_valid = vec![false; n_rows];
+        }
+
+        // Same arithmetic as `NumStats::push_moments` / `NumStats::merge`,
+        // without the digest machinery this path never uses. Partials are
+        // folded in chunk order, so the moments are deterministic for a given
+        // thread count -- and identical whether or not the cache is in use,
+        // which the cross-budget bit-identity depends on.
+        #[derive(Clone, Copy, Default)]
+        struct Mom {
+            n: u64,
+            mean: f64,
+            m2: f64,
+        }
+        impl Mom {
+            #[inline(always)]
+            fn push(&mut self, x: f64) {
+                self.n += 1;
+                let delta = x - self.mean;
+                self.mean += delta / (self.n as f64);
+                self.m2 += delta * (x - self.mean);
+            }
+            fn merge(&mut self, o: &Mom) {
+                if o.n == 0 {
+                    return;
+                }
+                if self.n == 0 {
+                    *self = *o;
+                    return;
+                }
+                let n_combined = self.n + o.n;
+                let delta = o.mean - self.mean;
+                self.mean += delta * (o.n as f64 / n_combined as f64);
+                self.m2 +=
+                    o.m2 + delta * delta * (self.n as f64) * (o.n as f64) / (n_combined as f64);
+                self.n = n_combined;
+            }
+        }
+
+        // Carve the flat buffers into per-chunk disjoint slices so the fill
+        // can write in parallel without locks. Each chunk owns the rows
+        // [base, base + rows_here).
+        struct CacheSlices<'a> {
+            x: &'a mut [f64],
+            y: &'a mut [f64],
+            valid: &'a mut [bool],
+        }
+        struct FillJob<'a> {
+            chunk: &'a [u8],
+            rows_here: usize,
+            cache: Option<CacheSlices<'a>>,
+        }
+        let mut jobs: Vec<FillJob> = Vec::with_capacity(byte_chunks.len());
+        {
+            let (mut xr, mut yr, mut vr) = (
+                cache_x.as_mut_slice(),
+                cache_y.as_mut_slice(),
+                cache_valid.as_mut_slice(),
+            );
+            for (ci, &chunk) in byte_chunks.iter().enumerate() {
+                let base = chunk_base[ci];
+                let rows_here = chunk_rows[ci].min(n_rows.saturating_sub(base));
+                let cache = if use_cache {
+                    let (x, x_rest) = xr.split_at_mut(rows_here * p);
+                    let (y, y_rest) = yr.split_at_mut(rows_here);
+                    let (valid, v_rest) = vr.split_at_mut(rows_here);
+                    (xr, yr, vr) = (x_rest, y_rest, v_rest);
+                    Some(CacheSlices { x, y, valid })
+                } else {
+                    None
+                };
+                jobs.push(FillJob {
+                    chunk,
+                    rows_here,
+                    cache,
+                });
+            }
+        }
+
+        let feature_idx_ref = &feature_idx;
+        let target_ref = &target;
+        let chunk_moms: Vec<Vec<Mom>> = jobs
+            .into_par_iter()
+            .map(|mut job| -> Result<Vec<Mom>, String> {
+                let mut moms = vec![Mom::default(); p];
+                let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
+                for (local, line) in FastLineIter::new(job.chunk).enumerate() {
+                    if local >= job.rows_here {
+                        break;
+                    }
+                    fields.clear();
+                    for_each_field(line, split_mode, |_, f| fields.push(f));
+                    let y = if fields.len() > target_idx {
+                        parse_f64_opt(fields[target_idx])
+                    } else {
+                        None
+                    };
+                    // A classifier silently trained on labels of 2 and 7 would
+                    // return a plausible-looking model that means nothing, so
+                    // this is an error rather than a coercion. Rows with an
+                    // unparseable label are skipped like any other bad row; a
+                    // *parseable* label outside {0,1} is a mistake.
+                    if let Some(yv) = y {
+                        if loss.is_classification() && yv != 0.0 && yv != 1.0 {
+                            return Err(format!(
+                                "target column {target_ref:?} must contain only 0 and 1 \
+                                 for classification; found {yv}"
+                            ));
+                        }
+                    }
+                    // Moments take every parseable feature cell, whether or
+                    // not the row as a whole is usable -- the per-cell
+                    // semantics of the profiling pass this fused pass
+                    // replaces.
+                    match job.cache.as_mut() {
+                        Some(c) => {
+                            let xrow = &mut c.x[local * p..(local + 1) * p];
+                            let mut usable = y.is_some();
+                            for (j, &idx) in feature_idx_ref.iter().enumerate() {
+                                match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                                    Some(v) => {
+                                        moms[j].push(v);
+                                        xrow[j] = v;
+                                    }
+                                    None => usable = false,
+                                }
+                            }
+                            if usable {
+                                c.y[local] = y.unwrap_or_default();
+                                c.valid[local] = true;
+                            }
+                        }
+                        None => {
+                            for (j, &idx) in feature_idx_ref.iter().enumerate() {
+                                if let Some(v) = fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                                    moms[j].push(v);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(moms)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let mut moms = vec![Mom::default(); p];
+        for cm in &chunk_moms {
+            for j in 0..p {
+                moms[j].merge(&cm[j]);
+            }
+        }
+
+        // Per-feature standardization constants. A feature with no usable
+        // spread is centred but not divided, which leaves it contributing
+        // nothing rather than producing NaN.
+        let mut mean = vec![0.0f64; p];
+        let mut scale = vec![1.0f64; p];
+        for j in 0..p {
+            if moms[j].n > 0 {
+                mean[j] = moms[j].mean;
+                let s = (moms[j].m2 / moms[j].n as f64).sqrt();
+                if s.is_finite() && s > 1e-12 {
+                    scale[j] = s;
+                }
+            }
+        }
+
+        if use_cache {
+            // Standardize the cache in place and precompute each row's
+            // sum(x^2), in parallel over memory. Rows marked invalid hold
+            // whatever was written before their bad cell was found; they are
+            // standardized too (harmlessly) and never read.
+            cache_x
+                .par_chunks_mut(p)
+                .zip(cache_xx.par_iter_mut())
+                .with_min_len(1024)
+                .for_each(|(xrow, xx)| {
+                    for j in 0..p {
+                        xrow[j] = (xrow[j] - mean[j]) / scale[j];
+                    }
+                    *xx = xrow.iter().map(|v| v * v).sum::<f64>();
+                });
+            train_n = (0..n_rows).filter(|&r| is_train(r) && cache_valid[r]).count();
         }
 
         let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
@@ -686,21 +904,26 @@ fn fit_sgd(
             // Decay the step size each epoch so later passes refine rather
             // than bounce around the optimum.
             let lr = learning_rate / (1.0 + epoch as f64);
+            let track_loss = epoch + 1 == epochs;
             let mut sq_err = 0.0f64;
             let mut seen = 0usize;
 
-            if epoch > 0 && use_cache {
-                // Replay from the cache filled during epoch 0.
-                for (xrow, &y) in cache_x.chunks_exact(p).zip(cache_y.iter()) {
+            if use_cache {
+                for row in 0..n_rows {
+                    if !cache_valid[row] || !is_train(row) {
+                        continue;
+                    }
                     sgd_step(
-                        xrow,
-                        y,
+                        &cache_x[row * p..(row + 1) * p],
+                        cache_y[row],
                         &mut w,
                         &mut b,
                         lr,
                         l2,
                         grad_clip,
+                        cache_xx[row],
                         loss,
+                        track_loss,
                         &mut sq_err,
                         &mut seen,
                     );
@@ -725,11 +948,7 @@ fn fit_sgd(
                     let Some(y) = parse_f64_opt(fields[target_idx]) else {
                         continue;
                     };
-                    // A classifier silently trained on labels of 2 and 7 would
-                    // return a plausible-looking model that means nothing, so
-                    // this is an error rather than a coercion. Rows with an
-                    // unparseable label are skipped above like any other bad
-                    // row; a *parseable* label outside {0,1} is a mistake.
+                    // Same error as the fill above; see the comment there.
                     if loss.is_classification() && y != 0.0 && y != 1.0 {
                         return Err(format!(
                             "target column {target:?} must contain only 0 and 1 for \
@@ -750,6 +969,7 @@ fn fit_sgd(
                         continue;
                     }
 
+                    let xx = x.iter().map(|v| v * v).sum::<f64>();
                     sgd_step(
                         &x,
                         y,
@@ -758,17 +978,15 @@ fn fit_sgd(
                         lr,
                         l2,
                         grad_clip,
+                        xx,
                         loss,
+                        track_loss,
                         &mut sq_err,
                         &mut seen,
                     );
 
                     if epoch == 0 {
                         train_n += 1;
-                        if use_cache {
-                            cache_x.extend_from_slice(&x);
-                            cache_y.push(y);
-                        }
                     }
                 }
             }
@@ -790,43 +1008,20 @@ fn fit_sgd(
         let coef: Vec<f64> = (0..p).map(|j| w[j] / scale[j]).collect();
         let intercept = b - (0..p).map(|j| w[j] * mean[j] / scale[j]).sum::<f64>();
 
-        // Held-out evaluation, in the original feature space. Regression
-        // metrics accumulate for every loss (they cost four adds a row);
-        // classification metrics only when the objective is one.
+        // Held-out evaluation. Predictions are computed in standardized space
+        // -- `b + w . x_std`, the same expression training uses -- because
+        // that is what the cache holds; algebraically it equals
+        // `intercept + coef . x_raw`, and using one form in both paths is what
+        // keeps their metrics bit-identical. Regression metrics accumulate
+        // for every loss (they cost four adds a row); classification metrics
+        // only when the objective is one.
         let mut ss_res = 0.0f64;
         let mut sum_y = 0.0f64;
         let mut sum_y2 = 0.0f64;
         let mut test_n = 0usize;
         let mut eval = loss.is_classification().then(BinaryEval::default);
-        for (this_row, line) in FastLineIter::new(data_bytes).enumerate() {
-            if this_row >= n_rows {
-                break;
-            }
-            if is_train(this_row) {
-                continue;
-            }
-            fields.clear();
-            for_each_field(line, split_mode, |_, f| fields.push(f));
-            if fields.len() <= target_idx {
-                continue;
-            }
-            let Some(y) = parse_f64_opt(fields[target_idx]) else {
-                continue;
-            };
-            let mut pred = intercept;
-            let mut usable = true;
-            for (j, &idx) in feature_idx.iter().enumerate() {
-                match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
-                    Some(v) => pred += coef[j] * v,
-                    None => {
-                        usable = false;
-                        break;
-                    }
-                }
-            }
-            if !usable {
-                continue;
-            }
+
+        let mut score = |pred: f64, y: f64, eval: &mut Option<BinaryEval>| {
             if let Some(ev) = eval.as_mut() {
                 // `pred` is a logit here; the metrics want a probability.
                 ev.push(sigmoid(pred), y);
@@ -836,6 +1031,56 @@ fn fit_sgd(
             sum_y += y;
             sum_y2 += y * y;
             test_n += 1;
+        };
+
+        if use_cache {
+            for row in 0..n_rows {
+                if !cache_valid[row] || is_train(row) {
+                    continue;
+                }
+                let xrow = &cache_x[row * p..(row + 1) * p];
+                score(b + dot(&w, xrow), cache_y[row], &mut eval);
+            }
+        } else {
+            for (this_row, line) in FastLineIter::new(data_bytes).enumerate() {
+                if this_row >= n_rows {
+                    break;
+                }
+                if is_train(this_row) {
+                    continue;
+                }
+                fields.clear();
+                for_each_field(line, split_mode, |_, f| fields.push(f));
+                if fields.len() <= target_idx {
+                    continue;
+                }
+                let Some(y) = parse_f64_opt(fields[target_idx]) else {
+                    continue;
+                };
+                // The fill validates every row's label; the streaming path
+                // must reject the same files, not just the ones whose bad
+                // label happened to land on the train side.
+                if loss.is_classification() && y != 0.0 && y != 1.0 {
+                    return Err(format!(
+                        "target column {target:?} must contain only 0 and 1 for \
+                         classification; found {y}"
+                    ));
+                }
+                let mut usable = true;
+                for (j, &idx) in feature_idx.iter().enumerate() {
+                    match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                        Some(v) => x[j] = (v - mean[j]) / scale[j],
+                        None => {
+                            usable = false;
+                            break;
+                        }
+                    }
+                }
+                if !usable {
+                    continue;
+                }
+                score(b + dot(&w, &x), y, &mut eval);
+            }
         }
 
         let r2 = if test_n > 1 {

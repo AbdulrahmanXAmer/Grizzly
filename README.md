@@ -44,7 +44,7 @@
 <tr>
 <td align="center"><h3>2.0×</h3><sub>faster profiling<br>than polars</sub></td>
 <td align="center"><h3>2.1–3.9×</h3><sub>less peak memory<br>than polars</sub></td>
-<td align="center"><h3>9×</h3><sub>faster model fits than<br>pandas + sklearn</sub></td>
+<td align="center"><h3>13×</h3><sub>faster model fits than<br>pandas + sklearn</sub></td>
 <td align="center"><h3>599 MB in 250m</h3><sub>transforms where polars<br>is OOM-killed</sub></td>
 </tr>
 </table>
@@ -581,11 +581,11 @@ Workload: **CSV on disk → 80/20 split → fitted model → held-out R²**, on 
 
 | Method | Time | vs Grizzly | R² | Peak memory |
 |--------|-----:|-----------|---:|------------:|
-| **Grizzly** closed-form | 142.0 ms | — | 0.9996 | 117.1 MB |
-| pandas → sklearn `LinearRegression` | 1264.2 ms | 8.9x slower | 0.9996 | 574.5 MB |
-| polars → sklearn `LinearRegression` | 786.8 ms | 5.5x slower | 0.9996 | 620.7 MB |
-| **Grizzly** SGD (10 epochs) | 910.6 ms | — | 0.9995 | 178.1 MB |
-| pandas → sklearn `SGDRegressor` (10 epochs) | 1594.5 ms | 1.8x slower | 0.9996 | 509.3 MB |
+| **Grizzly** closed-form | 57.7 ms | — | 0.9996 | 123.2 MB |
+| pandas → sklearn `LinearRegression` | 730.6 ms | 12.7x slower | 0.9996 | 642.8 MB |
+| polars → sklearn `LinearRegression` | 224.7 ms | 3.9x slower | 0.9996 | 607.1 MB |
+| **Grizzly** SGD (10 epochs) | 155.9 ms | — | 0.9995 | 203.8 MB |
+| pandas → sklearn `SGDRegressor` (10 epochs) | 1241.1 ms | 8.0x slower | 0.9996 | 580.0 MB |
 
 Every method's coefficients agree with the exact-OLS consensus (worst deviation 0.43% of the coefficient scale), so these are timings of the same model, not five different ones.
 
@@ -607,12 +607,10 @@ Workload: **CSV on disk → 80/20 split → fitted classifier → held-out metri
 
 | Method | Time | vs Grizzly | Accuracy | ROC-AUC | Peak memory |
 |--------|-----:|-----------|---------:|--------:|------------:|
-| **Grizzly** logistic SGD (10 epochs) | 543.4 ms | — | 0.8556 | 0.9357 | 188.8 MB |
-| pandas → sklearn `LogisticRegression` | 777.7 ms | 1.4x slower | 0.8589 | 0.9380 | 530.3 MB |
-| polars → sklearn `LogisticRegression` | 284.7 ms | 1.9x faster | 0.8589 | 0.9380 | 504.4 MB |
-| pandas → sklearn `SGDClassifier` (10 epochs) | 1462.3 ms | 2.7x slower | 0.8587 | 0.9373 | 570.2 MB |
-
-**Grizzly does not win this one on wall-clock.** polars → sklearn `LogisticRegression` fits 1.9x faster, because a logistic epoch is real arithmetic per row — an `exp` and a `ln` — where the regression path accumulates a matrix once and solves it. What grizzly keeps is the memory profile: 2.7x less peak RSS, bounded by the feature count rather than the file, which is what decides whether the job runs at all on a file larger than memory.
+| **Grizzly** logistic SGD (10 epochs) | 251.8 ms | — | 0.8556 | 0.9357 | 199.8 MB |
+| pandas → sklearn `LogisticRegression` | 771.6 ms | 3.1x slower | 0.8589 | 0.9380 | 513.4 MB |
+| polars → sklearn `LogisticRegression` | 281.9 ms | 1.1x slower | 0.8589 | 0.9380 | 502.8 MB |
+| pandas → sklearn `SGDClassifier` (10 epochs) | 1481.2 ms | 5.9x slower | 0.8587 | 0.9373 | 601.9 MB |
 
 Held-out metrics agree across every method (accuracy within 0.0033, ROC-AUC within 0.0023), so these are timings of equally good classifiers rather than four different ones.
 
