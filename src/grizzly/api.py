@@ -438,6 +438,53 @@ def csv_gaussian_nb(
     )
 
 
+def csv_classification_metrics(
+    path: str,
+    *,
+    label: str,
+    score: str,
+    sample_size: int = 1_000_000,
+    delimiter: str | None = None,
+    has_header: bool | None = None,
+) -> dict[str, Any]:
+    """Score a predictions file: labels and probabilities in, metrics out.
+
+    The fits report metrics on their own held-out split; this covers everything
+    else — a model trained elsewhere, an older grizzly model reapplied, a
+    vendor's scores — where the predictions already exist as two CSV columns
+    and the question is how good they are. One chunk-parallel pass in O(1)
+    memory per row, same accumulator the fits use, so the numbers are
+    directly comparable with theirs.
+
+    `label` must contain only 0 and 1 where parseable; a parseable value
+    outside that set raises. Rows where either column is missing, unparseable,
+    or the score is not finite are skipped and counted in `n_skipped` — never
+    silently dropped. ROC-AUC uses the same 4096-bin streaming estimate as the
+    fits (agrees with scikit-learn to ~1e-3); accuracy and log-loss are exact.
+
+    Returns a dict with `n`, `n_skipped`, `accuracy`, `log_loss`, `roc_auc`,
+    `positive_rate`, and `confusion_matrix`.
+
+    Raises:
+        ValueError: if the label column contains a parseable value outside
+            {0, 1}, or a named column does not exist.
+    """
+    native = _load_native()
+    if native is None:
+        raise RuntimeError(
+            "csv_classification_metrics requires the native Rust extension; "
+            "build with `maturin develop`."
+        )
+    return native.csv_classification_metrics(
+        path,
+        label=label,
+        score=score,
+        sample_size=sample_size,
+        delimiter=delimiter,
+        has_header=has_header,
+    )
+
+
 def csv_linear_regression(
     path: str,
     *,

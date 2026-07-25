@@ -1192,6 +1192,140 @@ fn select_columns(
     Ok((target_idx, feature_idx))
 }
 
+/// Score a predictions file: held-out labels and predicted probabilities as
+/// two CSV columns, metrics out.
+///
+/// The fits report metrics on their own held-out split; this is for everything
+/// else -- a model trained elsewhere, an older grizzly model reapplied, a
+/// vendor's scores -- where the predictions exist as a file and the question
+/// is how good they are. One chunk-parallel pass, O(1) memory in the row
+/// count, per-chunk `BinaryEval` partials folded in chunk order so the
+/// numbers are deterministic.
+///
+/// `label` must contain only 0 and 1 where parseable (anything else is an
+/// error, as for the fits). `score` is a probability; rows where either field
+/// is missing or unparseable, or where the score is not finite, are skipped
+/// and counted in `n_skipped` rather than silently dropped. Scores outside
+/// [0, 1] are clamped by the accumulator exactly as the fits' own scores are.
+#[pyfunction]
+#[pyo3(signature = (path, label, score, sample_size=1_000_000, delimiter=None, has_header=None))]
+pub fn csv_classification_metrics(
+    py: Python<'_>,
+    path: String,
+    label: String,
+    score: String,
+    sample_size: usize,
+    delimiter: Option<String>,
+    has_header: Option<bool>,
+) -> PyResult<PyObject> {
+    let delim_byte = delimiter.and_then(|d| d.bytes().next());
+    let path_for_thread = path.clone();
+    let label_col = label.clone();
+    let score_col = score.clone();
+
+    let result = py.allow_threads(
+        move || -> Result<(ClassificationMetrics, usize, usize), String> {
+            let file_data = load_file_data(&path_for_thread).map_err(|e| e.to_string())?;
+            let bytes = file_data.as_bytes();
+            let layout = csv_layout(bytes, delim_byte, has_header)?;
+            let col_names = &layout.col_names;
+
+            let label_idx = col_names
+                .iter()
+                .position(|c| c == &label_col)
+                .ok_or_else(|| format!("label column {label_col:?} not found"))?;
+            let score_idx = col_names
+                .iter()
+                .position(|c| c == &score_col)
+                .ok_or_else(|| format!("score column {score_col:?} not found"))?;
+
+            let data_bytes = &bytes[layout.data_start..];
+            let split_mode = layout.split_mode;
+
+            let byte_chunks: Vec<&[u8]> =
+                chunk_bytes_aligned(data_bytes, rayon::current_num_threads());
+            let chunk_rows: Vec<usize> = byte_chunks
+                .par_iter()
+                .map(|c| FastLineIter::new(c).count())
+                .collect();
+            let chunk_base: Vec<usize> = {
+                let mut bases = Vec::with_capacity(chunk_rows.len());
+                let mut acc = 0usize;
+                for &r in &chunk_rows {
+                    bases.push(acc);
+                    acc += r;
+                }
+                bases
+            };
+            let n_rows = chunk_rows.iter().sum::<usize>().min(sample_size);
+
+            let label_ref = &label_col;
+            let partials: Vec<(BinaryEval, usize)> = byte_chunks
+                .par_iter()
+                .zip(chunk_base.par_iter())
+                .map(|(&chunk, &base)| -> Result<(BinaryEval, usize), String> {
+                    let mut ev = BinaryEval::default();
+                    let mut skipped = 0usize;
+                    let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
+                    for (local, line) in FastLineIter::new(chunk).enumerate() {
+                        if base + local >= n_rows {
+                            break;
+                        }
+                        fields.clear();
+                        for_each_field(line, split_mode, |_, f| fields.push(f));
+                        let y = fields.get(label_idx).and_then(|f| parse_f64_opt(f));
+                        let s = fields.get(score_idx).and_then(|f| parse_f64_opt(f));
+                        match (y, s) {
+                            (Some(y), _) if y != 0.0 && y != 1.0 => {
+                                return Err(format!(
+                                    "label column {label_ref:?} must contain only 0 and 1; \
+                                     found {y}"
+                                ));
+                            }
+                            (Some(y), Some(s)) if s.is_finite() => ev.push(s, y),
+                            _ => skipped += 1,
+                        }
+                    }
+                    Ok((ev, skipped))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+
+            let mut eval = BinaryEval::default();
+            let mut n_skipped = 0usize;
+            for (ev, skipped) in &partials {
+                eval.merge(ev);
+                n_skipped += skipped;
+            }
+            let metrics = eval.finish();
+            let n = (metrics.true_positives
+                + metrics.false_positives
+                + metrics.true_negatives
+                + metrics.false_negatives) as usize;
+            Ok((metrics, n, n_skipped))
+        },
+    );
+
+    let (m, n, n_skipped) = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+    let out = PyDict::new(py);
+    out.set_item("path", path)?;
+    out.set_item("label", label)?;
+    out.set_item("score", score)?;
+    out.set_item("n", n)?;
+    out.set_item("n_skipped", n_skipped)?;
+    out.set_item("accuracy", m.accuracy)?;
+    out.set_item("log_loss", m.log_loss)?;
+    out.set_item("roc_auc", m.roc_auc)?;
+    out.set_item("positive_rate", m.positive_rate)?;
+    let cm = PyDict::new(py);
+    cm.set_item("tp", m.true_positives)?;
+    cm.set_item("fp", m.false_positives)?;
+    cm.set_item("tn", m.true_negatives)?;
+    cm.set_item("fn", m.false_negatives)?;
+    out.set_item("confusion_matrix", cm)?;
+    Ok(out.into())
+}
+
 /// Outcome of a Gaussian Naive Bayes fit, before conversion to a Python dict.
 struct GnbOutcome {
     feature_names: Vec<String>,
