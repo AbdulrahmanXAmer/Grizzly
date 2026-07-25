@@ -320,6 +320,7 @@ def csv_logistic_regression(
     shuffle: bool = True,
     grad_clip: float = 10.0,
     cache_budget_mb: int = 512,
+    class_weight: str | dict[int, float] | list[float] | tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Fit a binary logistic classifier by SGD, streaming from CSV.
 
@@ -339,6 +340,14 @@ def csv_logistic_regression(
 
     See :func:`csv_sgd_regression` for `grad_clip`, `cache_budget_mb`, and the
     row-order caveat, which behave identically here.
+
+    `class_weight` rebalances training on skewed labels, as scikit-learn's
+    parameter of the same name does: ``"balanced"`` weighs each class
+    inversely to its train-split frequency, or pass explicit weights as
+    ``{0: w0, 1: w1}`` or ``[w0, w1]``. Weighting changes the training
+    objective only — held-out metrics stay unweighted, so the usual trade
+    (accuracy down, minority-class recall up) is visible in the confusion
+    matrix rather than averaged away.
 
     Returns a dict with `coef`, `intercept`, `train_n`, `test_n`, `epochs`,
     `final_train_loss` (mean training log-loss), and held-out `accuracy`,
@@ -360,6 +369,24 @@ def csv_logistic_regression(
             "csv_logistic_regression requires the native Rust extension; "
             "build with `maturin develop`."
         )
+
+    balanced = False
+    weights: list[float] | None = None
+    if class_weight is not None:
+        if class_weight == "balanced":
+            balanced = True
+        elif isinstance(class_weight, str):
+            raise ValueError(
+                f"class_weight must be 'balanced', a mapping, or a pair; got {class_weight!r}"
+            )
+        elif isinstance(class_weight, dict):
+            try:
+                weights = [float(class_weight[0]), float(class_weight[1])]
+            except KeyError as exc:
+                raise ValueError("class_weight dict must have keys 0 and 1") from exc
+        else:
+            weights = [float(v) for v in class_weight]
+
     return native.csv_logistic_regression(
         path,
         target=target,
@@ -375,6 +402,8 @@ def csv_logistic_regression(
         shuffle=shuffle,
         grad_clip=grad_clip,
         cache_budget_mb=cache_budget_mb,
+        class_weight=weights,
+        class_weight_balanced=balanced,
     )
 
 
@@ -390,6 +419,7 @@ def csv_gaussian_nb(
     has_header: bool | None = None,
     shuffle: bool = True,
     var_smoothing: float = 1e-9,
+    priors: list[float] | tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Fit a binary Gaussian Naive Bayes classifier from CSV.
 
@@ -408,6 +438,11 @@ def csv_gaussian_nb(
     per-feature variance of the pooled training data, times this factor, is
     added to every class variance so a constant feature cannot inject a
     division by zero.
+
+    `priors` overrides the class priors learned from the train split, as
+    scikit-learn's ``GaussianNB(priors=...)`` does: two non-negative values
+    summing to 1. Use it when the file's class balance is not the deployment
+    class balance — likelihoods stay learned, only the prior belief changes.
 
     Returns a dict with `priors`, `theta` (per-class means), `var` (per-class
     smoothed variances) — directly comparable with scikit-learn's ``theta_``
@@ -435,6 +470,7 @@ def csv_gaussian_nb(
         has_header=has_header,
         shuffle=shuffle,
         var_smoothing=var_smoothing,
+        priors=[float(v) for v in priors] if priors is not None else None,
     )
 
 

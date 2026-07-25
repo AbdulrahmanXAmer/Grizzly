@@ -454,11 +454,20 @@ pub fn dot(w: &[f64], x: &[f64]) -> f64 {
 /// per row exactly as this function used to. `track_loss` gates the loss-value
 /// accumulation, which never feeds the weights -- only the final epoch's value
 /// is ever reported, so the other epochs need not pay the `ln` per row.
+///
+/// `weight` is the row's sample weight: it scales the gradient and the loss
+/// contribution, exactly as scikit-learn applies class weights. The clip then
+/// bounds the *weighted* gradient, so a heavily weighted outlier still cannot
+/// take an unbounded step. The reported loss divides by the weight sum, so it
+/// stays a weighted mean. An unweighted fit passes 1.0, and multiplying by
+/// 1.0 is exact -- which is why adding this parameter changed no unweighted
+/// result anywhere.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub fn sgd_step(
     x: &[f64],
     y: f64,
+    weight: f64,
     w: &mut [f64],
     b: &mut f64,
     lr: f64,
@@ -468,15 +477,15 @@ pub fn sgd_step(
     loss: Loss,
     track_loss: bool,
     sq_err: &mut f64,
-    seen: &mut usize,
+    weight_sum: &mut f64,
 ) {
     let p = w.len();
     let pred = *b + dot(w, x);
-    let err = loss.residual(pred, y);
+    let err = weight * loss.residual(pred, y);
     if track_loss {
-        *sq_err += loss.loss(pred, y);
+        *sq_err += weight * loss.loss(pred, y);
     }
-    *seen += 1;
+    *weight_sum += weight;
 
     // Clip the per-sample gradient. Real data has outliers that survive
     // standardization -- a mis-metered taxi trip of 100,000 miles sits a
@@ -554,6 +563,8 @@ pub fn csv_sgd_regression(
         grad_clip,
         cache_budget_mb,
         Loss::Squared,
+        None,
+        false,
     )
 }
 
@@ -571,9 +582,18 @@ pub fn csv_sgd_regression(
 /// logit: `p = sigmoid(intercept + coef . x)`. They are directly comparable
 /// with scikit-learn's `LogisticRegression(penalty=None)` fitted on the same
 /// data, which the differential tests assert.
+///
+/// `class_weight` scales each training row's gradient by its class's weight,
+/// exactly as scikit-learn's `class_weight` does: pass `[w0, w1]`, or set
+/// `class_weight_balanced` for weights inversely proportional to the train
+/// split's class frequencies (`n / (2 * n_c)`), computed from the same rows
+/// the fit trains on. Weighting changes the training objective only; the
+/// held-out metrics stay unweighted, which is how a rebalanced fit's real
+/// effect -- usually trading accuracy for minority-class recall -- stays
+/// visible instead of being averaged away.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (path, target, features=None, epochs=5, learning_rate=0.05, l2=0.0, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, grad_clip=10.0, cache_budget_mb=512))]
+#[pyo3(signature = (path, target, features=None, epochs=5, learning_rate=0.05, l2=0.0, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, grad_clip=10.0, cache_budget_mb=512, class_weight=None, class_weight_balanced=false))]
 pub fn csv_logistic_regression(
     py: Python<'_>,
     path: String,
@@ -590,6 +610,8 @@ pub fn csv_logistic_regression(
     shuffle: bool,
     grad_clip: f64,
     cache_budget_mb: usize,
+    class_weight: Option<Vec<f64>>,
+    class_weight_balanced: bool,
 ) -> PyResult<PyObject> {
     fit_sgd(
         py,
@@ -608,6 +630,8 @@ pub fn csv_logistic_regression(
         grad_clip,
         cache_budget_mb,
         Loss::Logistic,
+        class_weight,
+        class_weight_balanced,
     )
 }
 
@@ -634,6 +658,8 @@ fn fit_sgd(
     grad_clip: f64,
     cache_budget_mb: usize,
     loss: Loss,
+    class_weight: Option<Vec<f64>>,
+    class_weight_balanced: bool,
 ) -> PyResult<PyObject> {
     if !(0.0 < train_frac && train_frac < 1.0) {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -655,6 +681,23 @@ fn fit_sgd(
         return Err(pyo3::exceptions::PyValueError::new_err(
             "grad_clip must be positive (use infinity to disable clipping)",
         ));
+    }
+    if (class_weight.is_some() || class_weight_balanced) && !loss.is_classification() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "class weights only apply to classification",
+        ));
+    }
+    if class_weight.is_some() && class_weight_balanced {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "pass either explicit class weights or \"balanced\", not both",
+        ));
+    }
+    if let Some(cw) = &class_weight {
+        if cw.len() != 2 || cw.iter().any(|w| !(w.is_finite() && *w > 0.0)) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "class_weight must be two positive finite values [w0, w1]",
+            ));
+        }
     }
 
     let delim_byte = delimiter.and_then(|d| d.bytes().next());
@@ -776,6 +819,7 @@ fn fit_sgd(
         }
         struct FillJob<'a> {
             chunk: &'a [u8],
+            base: usize,
             rows_here: usize,
             cache: Option<CacheSlices<'a>>,
         }
@@ -800,18 +844,24 @@ fn fit_sgd(
                 };
                 jobs.push(FillJob {
                     chunk,
+                    base,
                     rows_here,
                     cache,
                 });
             }
         }
 
+        // Each chunk also counts the usable train rows per class -- the
+        // "balanced" class weights need those counts before training starts,
+        // and this pass is the only one that runs before it.
         let feature_idx_ref = &feature_idx;
         let target_ref = &target;
-        let chunk_moms: Vec<Vec<Mom>> = jobs
+        let is_train_ref = &is_train;
+        let partials: Vec<(Vec<Mom>, [u64; 2])> = jobs
             .into_par_iter()
-            .map(|mut job| -> Result<Vec<Mom>, String> {
+            .map(|mut job| -> Result<(Vec<Mom>, [u64; 2]), String> {
                 let mut moms = vec![Mom::default(); p];
+                let mut counts = [0u64; 2];
                 let mut fields: Vec<&[u8]> = Vec::with_capacity(col_names.len());
                 for (local, line) in FastLineIter::new(job.chunk).enumerate() {
                     if local >= job.rows_here {
@@ -841,10 +891,10 @@ fn fit_sgd(
                     // not the row as a whole is usable -- the per-cell
                     // semantics of the profiling pass this fused pass
                     // replaces.
+                    let mut usable = y.is_some();
                     match job.cache.as_mut() {
                         Some(c) => {
                             let xrow = &mut c.x[local * p..(local + 1) * p];
-                            let mut usable = y.is_some();
                             for (j, &idx) in feature_idx_ref.iter().enumerate() {
                                 match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
                                     Some(v) => {
@@ -861,23 +911,43 @@ fn fit_sgd(
                         }
                         None => {
                             for (j, &idx) in feature_idx_ref.iter().enumerate() {
-                                if let Some(v) = fields.get(idx).and_then(|f| parse_f64_opt(f)) {
-                                    moms[j].push(v);
+                                match fields.get(idx).and_then(|f| parse_f64_opt(f)) {
+                                    Some(v) => moms[j].push(v),
+                                    None => usable = false,
                                 }
                             }
                         }
                     }
+                    if usable && is_train_ref(job.base + local) {
+                        counts[usize::from(y == Some(1.0))] += 1;
+                    }
                 }
-                Ok(moms)
+                Ok((moms, counts))
             })
             .collect::<Result<Vec<_>, String>>()?;
 
         let mut moms = vec![Mom::default(); p];
-        for cm in &chunk_moms {
+        let mut class_counts = [0u64; 2];
+        for (cm, counts) in &partials {
             for j in 0..p {
                 moms[j].merge(&cm[j]);
             }
+            class_counts[0] += counts[0];
+            class_counts[1] += counts[1];
         }
+
+        // Per-class sample weights. Balanced follows scikit-learn:
+        // n_samples / (n_classes * count_c), from the usable train rows. A
+        // class with no rows gets weight 0, which is never applied.
+        let wclass: [f64; 2] = if class_weight_balanced {
+            let total = (class_counts[0] + class_counts[1]) as f64;
+            let balanced = |c: u64| if c > 0 { total / (2.0 * c as f64) } else { 0.0 };
+            [balanced(class_counts[0]), balanced(class_counts[1])]
+        } else if let Some(cw) = &class_weight {
+            [cw[0], cw[1]]
+        } else {
+            [1.0, 1.0]
+        };
 
         // Per-feature standardization constants. A feature with no usable
         // spread is centred but not divided, which leaves it contributing
@@ -920,7 +990,7 @@ fn fit_sgd(
             let lr = learning_rate / (1.0 + epoch as f64);
             let track_loss = epoch + 1 == epochs;
             let mut sq_err = 0.0f64;
-            let mut seen = 0usize;
+            let mut weight_sum = 0.0f64;
 
             if use_cache {
                 for row in 0..n_rows {
@@ -930,6 +1000,7 @@ fn fit_sgd(
                     sgd_step(
                         &cache_x[row * p..(row + 1) * p],
                         cache_y[row],
+                        wclass[usize::from(cache_y[row] == 1.0)],
                         &mut w,
                         &mut b,
                         lr,
@@ -939,7 +1010,7 @@ fn fit_sgd(
                         loss,
                         track_loss,
                         &mut sq_err,
-                        &mut seen,
+                        &mut weight_sum,
                     );
                 }
             } else {
@@ -987,6 +1058,7 @@ fn fit_sgd(
                     sgd_step(
                         &x,
                         y,
+                        wclass[usize::from(y == 1.0)],
                         &mut w,
                         &mut b,
                         lr,
@@ -996,7 +1068,7 @@ fn fit_sgd(
                         loss,
                         track_loss,
                         &mut sq_err,
-                        &mut seen,
+                        &mut weight_sum,
                     );
 
                     if epoch == 0 {
@@ -1005,8 +1077,8 @@ fn fit_sgd(
                 }
             }
 
-            if seen > 0 {
-                final_mse = sq_err / seen as f64;
+            if weight_sum > 0.0 {
+                final_mse = sq_err / weight_sum;
             }
             if !b.is_finite() || w.iter().any(|v| !v.is_finite()) {
                 return Err(format!(
@@ -1371,9 +1443,15 @@ struct GnbOutcome {
 /// Returned `theta` (per-class means) and `var` (per-class smoothed
 /// variances) are directly comparable with scikit-learn's `theta_` and
 /// `var_`, which the differential tests assert.
+///
+/// `priors` overrides the class priors learned from the train split,
+/// mirroring scikit-learn's `GaussianNB(priors=...)`: two non-negative values
+/// summing to 1. Use it when the file's class balance is not the deployment
+/// class balance -- the likelihoods stay learned, only the prior belief
+/// changes. `class_counts` still reports what was actually observed.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (path, target, features=None, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, var_smoothing=1e-9))]
+#[pyo3(signature = (path, target, features=None, train_frac=0.8, seed=0_u64, sample_size=1_000_000, delimiter=None, has_header=None, shuffle=true, var_smoothing=1e-9, priors=None))]
 pub fn csv_gaussian_nb(
     py: Python<'_>,
     path: String,
@@ -1386,6 +1464,7 @@ pub fn csv_gaussian_nb(
     has_header: Option<bool>,
     shuffle: bool,
     var_smoothing: f64,
+    priors: Option<Vec<f64>>,
 ) -> PyResult<PyObject> {
     if !(0.0 < train_frac && train_frac < 1.0) {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1396,6 +1475,14 @@ pub fn csv_gaussian_nb(
         return Err(pyo3::exceptions::PyValueError::new_err(
             "var_smoothing must be non-negative and finite",
         ));
+    }
+    if let Some(pr) = &priors {
+        let valid_shape = pr.len() == 2 && pr.iter().all(|v| v.is_finite() && *v >= 0.0);
+        if !valid_shape || (pr[0] + pr[1] - 1.0).abs() > 1e-6 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "priors must be two non-negative values summing to 1",
+            ));
+        }
     }
 
     let delim_byte = delimiter.and_then(|d| d.bytes().next());
@@ -1556,10 +1643,15 @@ pub fn csv_gaussian_nb(
                 var[cls][j] = (m.var_pop() + epsilon).max(f64::MIN_POSITIVE);
             }
         }
-        let priors = [
-            counts[0] as f64 / (train_n.max(1)) as f64,
-            counts[1] as f64 / (train_n.max(1)) as f64,
-        ];
+        // User-supplied priors override the learned frequencies, as sklearn's
+        // GaussianNB(priors=...) does; the likelihoods stay learned.
+        let priors = match &priors {
+            Some(pr) => [pr[0], pr[1]],
+            None => [
+                counts[0] as f64 / (train_n.max(1)) as f64,
+                counts[1] as f64 / (train_n.max(1)) as f64,
+            ],
+        };
 
         // Per-class scoring constants: ln P(c) - 0.5 sum_j ln(2 pi var_cj).
         // A class with no training rows has prior 0 and ln -> -inf, which
