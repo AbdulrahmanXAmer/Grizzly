@@ -1128,6 +1128,15 @@ fn fit_sgd(
     let fit = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     let out = PyDict::new(py);
+    // The tag `grizzly.models.save_model` / `predict` dispatch on.
+    out.set_item(
+        "model",
+        if loss.is_classification() {
+            "logistic_regression"
+        } else {
+            "sgd_regression"
+        },
+    )?;
     out.set_item("path", path)?;
     out.set_item("target", target)?;
     out.set_item("features", fit.feature_names)?;
@@ -1650,6 +1659,8 @@ pub fn csv_gaussian_nb(
     let fit = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     let out = PyDict::new(py);
+    // The tag `grizzly.models.save_model` / `predict` dispatch on.
+    out.set_item("model", "gaussian_nb")?;
     out.set_item("path", path)?;
     out.set_item("target", target)?;
     out.set_item("features", fit.feature_names)?;
@@ -2330,6 +2341,8 @@ pub fn csv_linear_regression(
         mean_y,
     ) = result;
     let out = PyDict::new(py);
+    // The tag `grizzly.models.save_model` / `predict` dispatch on.
+    out.set_item("model", "linear_regression")?;
     out.set_item("path", path)?;
     out.set_item("target", target)?;
     out.set_item("features", feature_names)?;

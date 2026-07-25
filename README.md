@@ -175,6 +175,7 @@ Drift verdict: SIGNIFICANT  (1 significant, 0 moderate, 5 stable)
 | **Classify** by streaming logistic SGD | `csv_logistic_regression` | **O(p)** |
 | **Classify** by Gaussian Naive Bayes | `csv_gaussian_nb` | **O(p)** — no cache at all |
 | **Score** a predictions file — accuracy, log-loss, AUC | `csv_classification_metrics` | O(1) per row |
+| **Persist** a fitted model as plain JSON, reload, predict | `save_model` / `load_model` / `predict` | — |
 | **Detect drift** against a saved profile | `grizzly.drift` | profile-only |
 
 The two *regression* paths return coefficients in the same space, so they are
